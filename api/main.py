@@ -5,15 +5,13 @@ FastAPI Backend v1.0 — Prompt 3
 Main application entry point.
 Namespaced routes: /kjle/v1/...
 """
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import logging
-
 from .config import settings
 from .database import init_db
-from .routes import leads, segments, pipeline, costs, health
+from .routes import leads, segments, pipeline, costs, health, pain
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("kjle")
@@ -46,7 +44,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Route registration ────────────────────────────────────────
+# — Route registration ————————————————————————————
 PREFIX = "/kjle/v1"
 
 app.include_router(health.router,    prefix=PREFIX, tags=["Health"])
@@ -54,3 +52,4 @@ app.include_router(leads.router,     prefix=PREFIX, tags=["Leads"])
 app.include_router(segments.router,  prefix=PREFIX, tags=["Segments"])
 app.include_router(pipeline.router,  prefix=PREFIX, tags=["Pipeline"])
 app.include_router(costs.router,     prefix=PREFIX, tags=["Costs"])
+app.include_router(pain.router,      prefix=PREFIX, tags=["Pain Intelligence"])
