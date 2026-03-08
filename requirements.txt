@@ -1,5 +1,5 @@
 # KJLE — King James Lead Empire
-# Requirements — Prompt 4
+# Requirements — Prompt 6
 # Pinned for Python 3.11 compatibility
 
 # API Framework
@@ -18,6 +18,9 @@ phonenumbers==8.13.50
 rapidfuzz==3.10.1
 tqdm==4.67.1
 
+# Enrichment
+httpx==0.27.0
+beautifulsoup4==4.12.3
+
 # Utilities
 python-dotenv==1.0.1
-httpx==0.27.0
