@@ -47,10 +47,10 @@ app.add_middleware(
 # — Route registration ————————————————————————————
 PREFIX = "/kjle/v1"
 
-app.include_router(health.router,      prefix=PREFIX, tags=["Health"])
-app.include_router(leads.router,       prefix=PREFIX, tags=["Leads"])
-app.include_router(segments.router,    prefix=PREFIX, tags=["Segments"])
-app.include_router(pipeline.router,    prefix=PREFIX, tags=["Pipeline"])
-app.include_router(costs.router,       prefix=PREFIX, tags=["Costs"])
-app.include_router(pain.router,        prefix=PREFIX, tags=["Pain Intelligence"])
-app.include_router(enrichment.router,  prefix=PREFIX, tags=["Enrichment"])
+app.include_router(health.router,      prefix=PREFIX,                tags=["Health"])
+app.include_router(leads.router,       prefix=PREFIX,                tags=["Leads"])
+app.include_router(segments.router,    prefix=PREFIX,                tags=["Segments"])
+app.include_router(pipeline.router,    prefix=PREFIX,                tags=["Pipeline"])
+app.include_router(costs.router,       prefix=PREFIX,                tags=["Costs"])
+app.include_router(pain.router,        prefix=PREFIX,                tags=["Pain Intelligence"])
+app.include_router(enrichment.router,  prefix=f"{PREFIX}/enrichment", tags=["Enrichment"])
