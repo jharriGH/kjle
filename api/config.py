@@ -9,7 +9,7 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # ── Supabase ──────────────────────────────────────────────────────────────
+    # ── Supabase (KJLE) ───────────────────────────────────────────────────────
     SUPABASE_URL: str
     SUPABASE_SERVICE_KEY: str
 
@@ -20,24 +20,28 @@ class Settings(BaseSettings):
     CORS_ORIGINS: List[str] = ["*"]
 
     # ── External APIs ─────────────────────────────────────────────────────────
-    # Yelp Fusion — free tier, get key at https://fusion.yelp.com
+    # Yelp Fusion — free tier, https://fusion.yelp.com
     YELP_API_KEY: str = ""
 
     # Google API key — optional, increases PageSpeed rate limits
     GOOGLE_API_KEY: str = ""
 
     # Outscraper — $0.002/record, Stage 3 enrichment
-    # https://app.outscraper.com/profile
     OUTSCRAPER_API_KEY: str = ""
 
     # Firecrawl — $0.005/record, Stage 4 deep enrichment
-    # https://firecrawl.dev
     FIRECRAWL_API_KEY: str = ""
 
-    # ReachInbox — email outreach export destination
-    # https://app.reachinbox.ai → Settings → API Keys
-    # Set via Render env var: REACHINBOX_API_KEY=your_key_here
+    # ReachInbox — email outreach export
     REACHINBOX_API_KEY: str = ""
+
+    # ── DemoEnginez Push ──────────────────────────────────────────────────────
+    # Both KJLE and DemoEnginez share one Supabase project (consolidated infra).
+    # If these are left empty, the push integration falls back to the shared
+    # KJLE Supabase client and writes directly to public.leads in the same project.
+    # Only set these if DemoEnginez is moved to a separate Supabase project later.
+    DEMOENGINEZ_SUPABASE_URL: str = ""
+    DEMOENGINEZ_SUPABASE_KEY: str = ""
 
     class Config:
         env_file = ".env"
