@@ -31,8 +31,13 @@ class Settings(BaseSettings):
     # Outscraper — $0.002/record, required for Stage 3 enrichment
     # Get key at https://app.outscraper.com/profile
     # Set via Render env var: OUTSCRAPER_API_KEY=your_key_here
-    # Stage 3 enrichment will warn and return null fields if empty.
     OUTSCRAPER_API_KEY: str = ""
+
+    # Firecrawl — $0.005/record, required for Stage 4 deep enrichment
+    # Get key at https://firecrawl.dev
+    # Set via Render env var: FIRECRAWL_API_KEY=your_key_here
+    # Stage 4 pain-gated at 75 — only highest-value leads reach this stage.
+    FIRECRAWL_API_KEY: str = ""
 
     class Config:
         env_file = ".env"
