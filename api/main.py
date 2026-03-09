@@ -1,6 +1,6 @@
 """
 KJLE — King James Lead Empire
-FastAPI Backend v1.0 — Prompt 6
+FastAPI Backend v1.0 — Prompt 7
 ================================
 Main application entry point.
 Namespaced routes: /kjle/v1/...
@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 import logging
 from .config import settings
 from .database import init_db
-from .routes import leads, segments, pipeline, costs, health, pain, enrichment
+from .routes import leads, segments, pipeline, costs, health, pain, enrichment, enrichment_stage2
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("kjle")
@@ -47,10 +47,11 @@ app.add_middleware(
 # — Route registration ————————————————————————————
 PREFIX = "/kjle/v1"
 
-app.include_router(health.router,      prefix=PREFIX,                tags=["Health"])
-app.include_router(leads.router,       prefix=PREFIX,                tags=["Leads"])
-app.include_router(segments.router,    prefix=PREFIX,                tags=["Segments"])
-app.include_router(pipeline.router,    prefix=PREFIX,                tags=["Pipeline"])
-app.include_router(costs.router,       prefix=PREFIX,                tags=["Costs"])
-app.include_router(pain.router,        prefix=PREFIX,                tags=["Pain Intelligence"])
-app.include_router(enrichment.router,  prefix=f"{PREFIX}/enrichment", tags=["Enrichment"])
+app.include_router(health.router,            prefix=PREFIX,                  tags=["Health"])
+app.include_router(leads.router,             prefix=PREFIX,                  tags=["Leads"])
+app.include_router(segments.router,          prefix=PREFIX,                  tags=["Segments"])
+app.include_router(pipeline.router,          prefix=PREFIX,                  tags=["Pipeline"])
+app.include_router(costs.router,             prefix=PREFIX,                  tags=["Costs"])
+app.include_router(pain.router,              prefix=PREFIX,                  tags=["Pain Intelligence"])
+app.include_router(enrichment.router,        prefix=f"{PREFIX}/enrichment",  tags=["Enrichment"])
+app.include_router(enrichment_stage2.router, prefix=f"{PREFIX}/enrichment",  tags=["Enrichment Stage 2"])
