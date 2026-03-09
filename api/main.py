@@ -16,6 +16,7 @@ from .config import settings
 from .routes import health
 from .routes import leads
 from .routes import segments
+from .routes import segments_engine
 from .routes import pipeline
 from .routes import costs
 from .routes import pain
@@ -71,6 +72,7 @@ PREFIX = "/kjle/v1"
 app.include_router(health.router,             prefix=PREFIX,                  tags=["Health"])
 app.include_router(leads.router,              prefix=PREFIX,                  tags=["Leads"])
 app.include_router(segments.router,           prefix=PREFIX,                  tags=["Segments"])
+app.include_router(segments_engine.router,    prefix=PREFIX,                  tags=["Segmentation"])
 app.include_router(pipeline.router,           prefix=PREFIX,                  tags=["Pipeline"])
 app.include_router(costs.router,              prefix=PREFIX,                  tags=["Costs"])
 app.include_router(pain.router,               prefix=PREFIX,                  tags=["Pain Intelligence"])
