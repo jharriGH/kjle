@@ -25,6 +25,7 @@ from .routes import enrichment
 from .routes import enrichment_stage2
 from .routes import enrichment_stage3
 from .routes import enrichment_stage4
+from .routes import export
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -38,9 +39,10 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 KJLE API starting up")
-    logger.info(f"   Yelp        : {'✓ configured' if settings.YELP_API_KEY        else '✗ not set (Stage 2 Yelp disabled)'}")
-    logger.info(f"   Outscraper  : {'✓ configured' if settings.OUTSCRAPER_API_KEY  else '✗ not set (Stage 3 disabled)'}")
-    logger.info(f"   Firecrawl   : {'✓ configured' if settings.FIRECRAWL_API_KEY   else '✗ not set (Stage 4 disabled)'}")
+    logger.info(f"   Yelp          : {'✓ configured' if settings.YELP_API_KEY        else '✗ not set (Stage 2 Yelp disabled)'}")
+    logger.info(f"   Outscraper    : {'✓ configured' if settings.OUTSCRAPER_API_KEY  else '✗ not set (Stage 3 disabled)'}")
+    logger.info(f"   Firecrawl     : {'✓ configured' if settings.FIRECRAWL_API_KEY   else '✗ not set (Stage 4 disabled)'}")
+    logger.info(f"   ReachInbox    : {'✓ configured' if settings.REACHINBOX_API_KEY  else '✗ not set (RI export disabled)'}")
     yield
     logger.info("🛑 KJLE API shutting down")
 
@@ -82,3 +84,4 @@ app.include_router(enrichment.router,         prefix=f"{PREFIX}/enrichment",  ta
 app.include_router(enrichment_stage2.router,  prefix=f"{PREFIX}/enrichment",  tags=["Enrichment Stage 2"])
 app.include_router(enrichment_stage3.router,  prefix=f"{PREFIX}/enrichment",  tags=["Enrichment Stage 3"])
 app.include_router(enrichment_stage4.router,  prefix=f"{PREFIX}/enrichment",  tags=["Enrichment Stage 4"])
+app.include_router(export.router,             prefix=PREFIX,                  tags=["Export"])

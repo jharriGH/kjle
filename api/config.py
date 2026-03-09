@@ -21,23 +21,23 @@ class Settings(BaseSettings):
 
     # ── External APIs ─────────────────────────────────────────────────────────
     # Yelp Fusion — free tier, get key at https://fusion.yelp.com
-    # Stage 2 gracefully skips Yelp enrichment if empty.
     YELP_API_KEY: str = ""
 
     # Google API key — optional, increases PageSpeed rate limits
-    # Not required; PageSpeed Insights works unauthenticated.
     GOOGLE_API_KEY: str = ""
 
-    # Outscraper — $0.002/record, required for Stage 3 enrichment
-    # Get key at https://app.outscraper.com/profile
-    # Set via Render env var: OUTSCRAPER_API_KEY=your_key_here
+    # Outscraper — $0.002/record, Stage 3 enrichment
+    # https://app.outscraper.com/profile
     OUTSCRAPER_API_KEY: str = ""
 
-    # Firecrawl — $0.005/record, required for Stage 4 deep enrichment
-    # Get key at https://firecrawl.dev
-    # Set via Render env var: FIRECRAWL_API_KEY=your_key_here
-    # Stage 4 pain-gated at 75 — only highest-value leads reach this stage.
+    # Firecrawl — $0.005/record, Stage 4 deep enrichment
+    # https://firecrawl.dev
     FIRECRAWL_API_KEY: str = ""
+
+    # ReachInbox — email outreach export destination
+    # https://app.reachinbox.ai → Settings → API Keys
+    # Set via Render env var: REACHINBOX_API_KEY=your_key_here
+    REACHINBOX_API_KEY: str = ""
 
     class Config:
         env_file = ".env"
