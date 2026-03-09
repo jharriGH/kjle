@@ -1,41 +1,60 @@
 """
-KJLE — King James Lead Empire
-FastAPI Backend v1.0 — Prompt 7
-================================
-Main application entry point.
-Namespaced routes: /kjle/v1/...
+KJLE API — King James Lead Empire
+Main FastAPI application entry point
+Deployed on Render: https://kjle-api.onrender.com
 """
+
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
-import logging
+
 from .config import settings
-from .database import init_db
-from .routes import leads, segments, pipeline, costs, health, pain, enrichment, enrichment_stage2
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("kjle")
+# ── Route Imports ─────────────────────────────────────────────────────────────
+from .routes import health
+from .routes import leads
+from .routes import segments
+from .routes import pipeline
+from .routes import costs
+from .routes import pain
+from .routes import enrichment
+from .routes import enrichment_stage2
+from .routes import enrichment_stage3
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
+# ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("KJLE API starting up...")
-    await init_db()
-    log.info("Database connection established")
+    logger.info("🚀 KJLE API starting up")
+    logger.info(f"   Yelp        : {'✓ configured' if settings.YELP_API_KEY else '✗ not set (Stage 2 Yelp disabled)'}")
+    logger.info(f"   Outscraper  : {'✓ configured' if settings.OUTSCRAPER_API_KEY else '✗ not set (Stage 3 disabled)'}")
     yield
-    log.info("KJLE API shutting down")
+    logger.info("🛑 KJLE API shutting down")
 
 
+# ── App Init ──────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="KJLE — King James Lead Empire API",
-    description="Lead intelligence platform API",
+    title="KJLE — King James Lead Empire",
+    description=(
+        "Master lead intelligence platform. "
+        "Ingestion → Enrichment → Segmentation → Export."
+    ),
     version="1.0.0",
-    docs_url="/kjle/docs",
-    redoc_url="/kjle/redoc",
-    openapi_url="/kjle/openapi.json",
+    docs_url="/docs",
+    redoc_url="/redoc",
     lifespan=lifespan,
 )
 
+# ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
@@ -44,14 +63,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# — Route registration ————————————————————————————
+# ── Router Registration ───────────────────────────────────────────────────────
 PREFIX = "/kjle/v1"
 
-app.include_router(health.router,            prefix=PREFIX,                  tags=["Health"])
-app.include_router(leads.router,             prefix=PREFIX,                  tags=["Leads"])
-app.include_router(segments.router,          prefix=PREFIX,                  tags=["Segments"])
-app.include_router(pipeline.router,          prefix=PREFIX,                  tags=["Pipeline"])
-app.include_router(costs.router,             prefix=PREFIX,                  tags=["Costs"])
-app.include_router(pain.router,              prefix=PREFIX,                  tags=["Pain Intelligence"])
-app.include_router(enrichment.router,        prefix=f"{PREFIX}/enrichment",  tags=["Enrichment"])
-app.include_router(enrichment_stage2.router, prefix=f"{PREFIX}/enrichment",  tags=["Enrichment Stage 2"])
+app.include_router(health.router,             prefix=PREFIX,                  tags=["Health"])
+app.include_router(leads.router,              prefix=PREFIX,                  tags=["Leads"])
+app.include_router(segments.router,           prefix=PREFIX,                  tags=["Segments"])
+app.include_router(pipeline.router,           prefix=PREFIX,                  tags=["Pipeline"])
+app.include_router(costs.router,              prefix=PREFIX,                  tags=["Costs"])
+app.include_router(pain.router,               prefix=PREFIX,                  tags=["Pain Intelligence"])
+app.include_router(enrichment.router,         prefix=f"{PREFIX}/enrichment",  tags=["Enrichment"])
+app.include_router(enrichment_stage2.router,  prefix=f"{PREFIX}/enrichment",  tags=["Enrichment Stage 2"])
+app.include_router(enrichment_stage3.router,  prefix=f"{PREFIX}/enrichment",  tags=["Enrichment Stage 3"])
