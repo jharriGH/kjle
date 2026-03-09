@@ -1,60 +1,43 @@
 """
-KJLE API — King James Lead Empire
-Main FastAPI application entry point
-Deployed on Render: https://kjle-api.onrender.com
+KJLE — King James Lead Empire
+FastAPI Backend v1.0 — Prompt 8
+================================
+Main application entry point.
+Namespaced routes: /kjle/v1/...
 """
-
-import logging
-from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
+from contextlib import asynccontextmanager
+import logging
 from .config import settings
+from .database import init_db
+from .routes import leads, segments, pipeline, costs, health, pain, enrichment, enrichment_stage2, enrichment_stage3
 
-# ── Route Imports ─────────────────────────────────────────────────────────────
-from .routes import health
-from .routes import leads
-from .routes import segments
-from .routes import pipeline
-from .routes import costs
-from .routes import pain
-from .routes import enrichment
-from .routes import enrichment_stage2
-from .routes import enrichment_stage3
-
-# ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("kjle")
 
 
-# ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 KJLE API starting up")
-    logger.info(f"   Yelp        : {'✓ configured' if settings.YELP_API_KEY else '✗ not set (Stage 2 Yelp disabled)'}")
-    logger.info(f"   Outscraper  : {'✓ configured' if settings.OUTSCRAPER_API_KEY else '✗ not set (Stage 3 disabled)'}")
+    log.info("KJLE API starting up...")
+    log.info(f"   Yelp        : {'configured' if settings.YELP_API_KEY else 'not set'}")
+    log.info(f"   Outscraper  : {'configured' if settings.OUTSCRAPER_API_KEY else 'not set'}")
+    await init_db()
+    log.info("Database connection established")
     yield
-    logger.info("🛑 KJLE API shutting down")
+    log.info("KJLE API shutting down")
 
 
-# ── App Init ──────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="KJLE — King James Lead Empire",
-    description=(
-        "Master lead intelligence platform. "
-        "Ingestion → Enrichment → Segmentation → Export."
-    ),
+    title="KJLE — King James Lead Empire API",
+    description="Lead intelligence platform API",
     version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url="/kjle/docs",
+    redoc_url="/kjle/redoc",
+    openapi_url="/kjle/openapi.json",
     lifespan=lifespan,
 )
 
-# ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
@@ -63,7 +46,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Router Registration ───────────────────────────────────────────────────────
+# — Route registration ————————————————————————————
 PREFIX = "/kjle/v1"
 
 app.include_router(health.router,             prefix=PREFIX,                  tags=["Health"])
