@@ -29,6 +29,8 @@ from .routes import export
 from .routes import push_demoenginez
 from .routes import push_voicedrop
 from .routes import webhooks
+from .routes import scheduler
+from .routes.scheduler import setup_scheduler
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -51,7 +53,16 @@ async def lifespan(app: FastAPI):
     logger.info(f"   DemoEnginez   : push enabled → {de_mode} client")
     logger.info(f"   VoiceDrop OS  : push enabled → {vd_mode} client")
     logger.info(f"   Webhooks      : system active ({len(webhooks.SUPPORTED_EVENTS)} event types registered)")
+
+    # ── Start APScheduler ─────────────────────────────────────────────────────
+    _scheduler = setup_scheduler()
+    _scheduler.start()
+    logger.info("   Scheduler     : ⏰ APScheduler started (4 jobs active)")
+
     yield
+
+    # ── Shutdown APScheduler ──────────────────────────────────────────────────
+    _scheduler.shutdown(wait=False)
     logger.info("🛑 KJLE API shutting down")
 
 
@@ -96,3 +107,4 @@ app.include_router(export.router,             prefix=PREFIX,                  ta
 app.include_router(push_demoenginez.router,   prefix=PREFIX,                  tags=["Push — DemoEnginez"])
 app.include_router(push_voicedrop.router,     prefix=PREFIX,                  tags=["Push — VoiceDrop"])
 app.include_router(webhooks.router,           prefix=PREFIX,                  tags=["Webhooks"])
+app.include_router(scheduler.router,          prefix=PREFIX,                  tags=["Scheduler"])
