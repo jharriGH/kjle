@@ -36,12 +36,16 @@ class Settings(BaseSettings):
     REACHINBOX_API_KEY: str = ""
 
     # ── DemoEnginez Push ──────────────────────────────────────────────────────
-    # Both KJLE and DemoEnginez share one Supabase project (consolidated infra).
-    # If these are left empty, the push integration falls back to the shared
-    # KJLE Supabase client and writes directly to public.leads in the same project.
-    # Only set these if DemoEnginez is moved to a separate Supabase project later.
+    # Shared Supabase project — leave empty to use shared KJLE client.
+    # Set only if DemoEnginez moves to a dedicated Supabase project.
     DEMOENGINEZ_SUPABASE_URL: str = ""
     DEMOENGINEZ_SUPABASE_KEY: str = ""
+
+    # ── VoiceDrop OS Push ─────────────────────────────────────────────────────
+    # Shared Supabase project (voicedrop schema) — leave empty to use shared
+    # KJLE client. Set only if VoiceDrop OS moves to a dedicated Supabase project.
+    VOICEDROP_SUPABASE_URL: str = ""
+    VOICEDROP_SUPABASE_KEY: str = ""
 
     class Config:
         env_file = ".env"
