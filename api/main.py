@@ -28,6 +28,7 @@ from .routes import enrichment_stage4
 from .routes import export
 from .routes import push_demoenginez
 from .routes import push_voicedrop
+from .routes import webhooks
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -46,9 +47,10 @@ async def lifespan(app: FastAPI):
     logger.info(f"   Firecrawl     : {'✓ configured' if settings.FIRECRAWL_API_KEY      else '✗ not set (Stage 4 disabled)'}")
     logger.info(f"   ReachInbox    : {'✓ configured' if settings.REACHINBOX_API_KEY     else '✗ not set (RI export disabled)'}")
     de_mode = "dedicated" if (settings.DEMOENGINEZ_SUPABASE_URL and settings.DEMOENGINEZ_SUPABASE_KEY) else "shared Supabase"
-    vd_mode = "dedicated" if (settings.VOICEDROP_SUPABASE_URL and settings.VOICEDROP_SUPABASE_KEY) else "shared Supabase"
+    vd_mode = "dedicated" if (settings.VOICEDROP_SUPABASE_URL   and settings.VOICEDROP_SUPABASE_KEY)   else "shared Supabase"
     logger.info(f"   DemoEnginez   : push enabled → {de_mode} client")
     logger.info(f"   VoiceDrop OS  : push enabled → {vd_mode} client")
+    logger.info(f"   Webhooks      : system active ({len(webhooks.SUPPORTED_EVENTS)} event types registered)")
     yield
     logger.info("🛑 KJLE API shutting down")
 
@@ -93,3 +95,4 @@ app.include_router(enrichment_stage4.router,  prefix=f"{PREFIX}/enrichment",  ta
 app.include_router(export.router,             prefix=PREFIX,                  tags=["Export"])
 app.include_router(push_demoenginez.router,   prefix=PREFIX,                  tags=["Push — DemoEnginez"])
 app.include_router(push_voicedrop.router,     prefix=PREFIX,                  tags=["Push — VoiceDrop"])
+app.include_router(webhooks.router,           prefix=PREFIX,                  tags=["Webhooks"])
