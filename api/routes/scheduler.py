@@ -42,6 +42,8 @@ ENRICH_MIN_PAIN       = 50
 STALE_DAYS            = 180
 STALE_MAX_PAIN        = 30
 
+SCHEDULER_LOG_TABLE = "scheduler_log"
+
 JOB_DEFINITIONS = {
     "classify_segments": {
         "description": "Auto-classify all active leads into hot/warm/cold segments",

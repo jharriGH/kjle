@@ -36,6 +36,68 @@ ANOMALY_THRESHOLD_PCT = 20.0   # flag if today > rolling_avg * 1.20
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GET /costs  ← ROOT endpoint expected by Command Deck dashboard
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/costs")
+async def get_costs():
+    """
+    Unified cost response for the Command Deck dashboard.
+    Returns summary + by_service in the shape the frontend expects.
+    """
+    db = get_db()
+
+    month_start = _month_start_iso()
+    today       = _today_iso()
+    seven_days_ago = _days_ago_iso(7)
+
+    all_rows = db.table("api_cost_log").select(
+        "service, cost_per_unit, records_processed, created_at"
+    ).execute().data or []
+
+    month_rows   = [r for r in all_rows if (r.get("created_at") or "") >= month_start]
+    today_rows   = [r for r in all_rows if (r.get("created_at") or "") >= today]
+    seven_d_rows = [r for r in all_rows if (r.get("created_at") or "") >= seven_days_ago]
+
+    def _sum(rows):
+        return round(sum(
+            _safe_float(r.get("cost_per_unit", 0)) * _safe_int(r.get("records_processed", 1))
+            for r in rows
+        ), 6)
+
+    mtd_total   = _sum(month_rows)
+    today_total = _sum(today_rows)
+    seven_d     = _sum(seven_d_rows)
+    total_calls = len(all_rows)
+    avg_cost    = round(mtd_total / total_calls, 6) if total_calls > 0 else 0.0
+
+    # By service (MTD only)
+    service_map: dict = {}
+    for row in month_rows:
+        svc  = row.get("service") or "unknown"
+        cost = _safe_float(row.get("cost_per_unit", 0)) * _safe_int(row.get("records_processed", 1))
+        if svc not in service_map:
+            service_map[svc] = {"service": svc, "total_cost_usd": 0.0, "calls": 0}
+        service_map[svc]["total_cost_usd"] = round(service_map[svc]["total_cost_usd"] + cost, 6)
+        service_map[svc]["calls"] += 1
+
+    by_service = sorted(service_map.values(), key=lambda x: x["total_cost_usd"], reverse=True)
+
+    return {
+        "status": "success",
+        "summary": {
+            "total_cost_usd":     mtd_total,
+            "total_calls":        total_calls,
+            "avg_cost_per_call":  avg_cost,
+            "today_cost_usd":     today_total,
+            "seven_day_cost_usd": seven_d,
+        },
+        "by_service": by_service,
+        "as_of": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Pydantic Models
 # ─────────────────────────────────────────────────────────────────────────────
 
