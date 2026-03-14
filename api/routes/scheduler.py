@@ -44,6 +44,12 @@ STALE_MAX_PAIN        = 30
 
 SCHEDULER_LOG_TABLE = "scheduler_log"
 
+SCHEDULER_LOG_TABLE = "scheduler_log"
+
+SCHEDULER_LOG_TABLE = "scheduler_log"
+
+SCHEDULER_LOG_TABLE = "scheduler_log"
+
 JOB_DEFINITIONS = {
     "classify_segments": {
         "description": "Auto-classify all active leads into hot/warm/cold segments",
