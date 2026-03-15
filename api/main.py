@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
+from .database import init_db
 
 # ── Route Imports ─────────────────────────────────────────────────────────────
 from .routes import health
@@ -44,6 +45,11 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 KJLE API starting up")
+
+    # ── Initialize Supabase DB client ─────────────────────────────────────────
+    await init_db()
+    logger.info("   Database      : ✓ Supabase client initialized")
+
     logger.info(f"   Yelp          : {'✓ configured' if settings.YELP_API_KEY           else '✗ not set (Stage 2 Yelp disabled)'}")
     logger.info(f"   Outscraper    : {'✓ configured' if settings.OUTSCRAPER_API_KEY     else '✗ not set (Stage 3 disabled)'}")
     logger.info(f"   Firecrawl     : {'✓ configured' if settings.FIRECRAWL_API_KEY      else '✗ not set (Stage 4 disabled)'}")
