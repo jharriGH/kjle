@@ -99,8 +99,8 @@ PREFIX = "/kjle/v1"
 
 app.include_router(health.router,             prefix=PREFIX,                  tags=["Health"])
 app.include_router(leads.router,              prefix=PREFIX,                  tags=["Leads"])
-app.include_router(segments.router,           prefix=PREFIX,                  tags=["Segments"])
 app.include_router(segments_engine.router,    prefix=PREFIX,                  tags=["Segmentation"])
+app.include_router(segments.router,           prefix=PREFIX,                  tags=["Segments"])
 app.include_router(segment_manager.router,    prefix=PREFIX,                  tags=["Segment Manager"])
 app.include_router(pipeline.router,           prefix=PREFIX,                  tags=["Pipeline"])
 app.include_router(costs.router,              prefix=PREFIX,                  tags=["Costs"])
