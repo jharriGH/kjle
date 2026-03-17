@@ -31,6 +31,7 @@ from .routes import push_demoenginez
 from .routes import push_voicedrop
 from .routes import webhooks
 from .routes import scheduler
+from .routes import admin_settings
 from .routes.scheduler import setup_scheduler
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -59,6 +60,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"   DemoEnginez   : push enabled → {de_mode} client")
     logger.info(f"   VoiceDrop OS  : push enabled → {vd_mode} client")
     logger.info(f"   Webhooks      : system active ({len(webhooks.SUPPORTED_EVENTS)} event types registered)")
+    logger.info(f"   Admin Settings: ✓ loaded")
 
     # ── Start APScheduler ─────────────────────────────────────────────────────
     _scheduler = setup_scheduler()
@@ -114,3 +116,4 @@ app.include_router(push_demoenginez.router,   prefix=PREFIX,                  ta
 app.include_router(push_voicedrop.router,     prefix=PREFIX,                  tags=["Push — VoiceDrop"])
 app.include_router(webhooks.router,           prefix=PREFIX,                  tags=["Webhooks"])
 app.include_router(scheduler.router,          prefix=PREFIX,                  tags=["Scheduler"])
+app.include_router(admin_settings.router,     prefix=PREFIX,                  tags=["Admin Settings"])

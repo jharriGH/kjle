@@ -1,72 +1,126 @@
 """
-KJLE API — Pipeline Health Routes
-GET /kjle/v1/pipeline/health     — lead counts by niche + stage
-GET /kjle/v1/pipeline/summary    — total counts + fit flags
-GET /kjle/v1/pipeline/niches     — all niches with counts
+api/routes/pipeline.py
+GET /pipeline/status — DataQualityPanel data source
 """
-from fastapi import APIRouter
+
+from datetime import datetime, timezone
+from fastapi import APIRouter, Depends
 from ..database import get_db
 
 router = APIRouter()
 
 
-@router.get("/pipeline/health")
-async def pipeline_health():
-    db = get_db()
-    result = db.table("v_pipeline_health").select("*").execute()
-    return {"pipeline": result.data}
+@router.get("/pipeline/status")
+async def pipeline_status(db=Depends(get_db)):
+    now = datetime.now(timezone.utc).isoformat()
 
+    try:
+        # ── Total active leads ─────────────────────────────────────────────
+        total_res = (
+            db.table("leads")
+            .select("id", count="exact")
+            .eq("is_active", True)
+            .execute()
+        )
+        total = total_res.count or 0
 
-@router.get("/pipeline/summary")
-async def pipeline_summary():
-    db = get_db()
+        if total == 0:
+            return {
+                "status": "success",
+                "total_leads": 0,
+                "phone_coverage_pct": 0.0,
+                "email_coverage_pct": 0.0,
+                "website_coverage_pct": 0.0,
+                "enrichment_stages": {f"stage_{i}": 0 for i in range(5)},
+                "segment_counts": {"hot": 0, "warm": 0, "cold": 0, "unclassified": 0},
+                "last_updated": now,
+            }
 
-    # Total active leads
-    total = db.table("leads").select("id", count="exact").eq("is_active", True).execute()
+        # ── Phone coverage ─────────────────────────────────────────────────
+        phone_res = (
+            db.table("leads")
+            .select("id", count="exact")
+            .eq("is_active", True)
+            .not_.is_("phone", "null")
+            .neq("phone", "")
+            .execute()
+        )
+        phone_count = phone_res.count or 0
 
-    # Fit flag counts
-    demo    = db.table("leads").select("id", count="exact").eq("fit_demoenginez", True).eq("is_active", True).execute()
-    rep     = db.table("leads").select("id", count="exact").eq("fit_reputation", True).eq("is_active", True).execute()
-    schema  = db.table("leads").select("id", count="exact").eq("fit_schema_ranker", True).eq("is_active", True).execute()
-    voice   = db.table("leads").select("id", count="exact").eq("fit_voicedrop", True).eq("is_active", True).execute()
+        # ── Email coverage ─────────────────────────────────────────────────
+        email_res = (
+            db.table("leads")
+            .select("id", count="exact")
+            .eq("is_active", True)
+            .not_.is_("email", "null")
+            .neq("email", "")
+            .execute()
+        )
+        email_count = email_res.count or 0
 
-    # Stage counts
-    stage0  = db.table("leads").select("id", count="exact").eq("enrichment_stage", 0).eq("is_active", True).execute()
-    stage1  = db.table("leads").select("id", count="exact").eq("enrichment_stage", 1).eq("is_active", True).execute()
-    stage2  = db.table("leads").select("id", count="exact").eq("enrichment_stage", 2).eq("is_active", True).execute()
-    stage3  = db.table("leads").select("id", count="exact").eq("enrichment_stage", 3).eq("is_active", True).execute()
+        # ── Website coverage ───────────────────────────────────────────────
+        website_res = (
+            db.table("leads")
+            .select("id", count="exact")
+            .eq("is_active", True)
+            .not_.is_("website", "null")
+            .neq("website", "")
+            .execute()
+        )
+        website_count = website_res.count or 0
 
-    return {
-        "total_leads":      total.count,
-        "product_fit": {
-            "demoenginez":  demo.count,
-            "reputation":   rep.count,
-            "schema_ranker":schema.count,
-            "voicedrop":    voice.count,
-        },
-        "enrichment_stages": {
-            "stage_0_raw":      stage0.count,
-            "stage_1_scraped":  stage1.count,
-            "stage_2_pagespeed":stage2.count,
-            "stage_3_outscraper":stage3.count,
-        },
-    }
+        # ── Enrichment stage counts (0–4) ──────────────────────────────────
+        enrichment_stages = {}
+        for stage in range(5):
+            stage_res = (
+                db.table("leads")
+                .select("id", count="exact")
+                .eq("is_active", True)
+                .eq("enrichment_stage", stage)
+                .execute()
+            )
+            enrichment_stages[f"stage_{stage}"] = stage_res.count or 0
 
+        # ── Segment label counts ───────────────────────────────────────────
+        segment_counts = {"hot": 0, "warm": 0, "cold": 0, "unclassified": 0}
+        for label in ("hot", "warm", "cold"):
+            seg_res = (
+                db.table("leads")
+                .select("id", count="exact")
+                .eq("is_active", True)
+                .eq("segment_label", label)
+                .execute()
+            )
+            segment_counts[label] = seg_res.count or 0
 
-@router.get("/pipeline/niches")
-async def pipeline_niches():
-    db = get_db()
-    result = (
-        db.table("leads")
-        .select("niche_slug")
-        .eq("is_active", True)
-        .execute()
-    )
-    # Count by niche
-    counts = {}
-    for row in result.data:
-        slug = row["niche_slug"] or "other"
-        counts[slug] = counts.get(slug, 0) + 1
+        # Unclassified = total minus all labeled
+        labeled = segment_counts["hot"] + segment_counts["warm"] + segment_counts["cold"]
+        segment_counts["unclassified"] = max(total - labeled, 0)
 
-    sorted_niches = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-    return {"niches": [{"niche": k, "count": v} for k, v in sorted_niches]}
+        # ── Percentages ────────────────────────────────────────────────────
+        def pct(n):
+            return round((n / total) * 100, 2) if total > 0 else 0.0
+
+        return {
+            "status": "success",
+            "total_leads": total,
+            "phone_coverage_pct": pct(phone_count),
+            "email_coverage_pct": pct(email_count),
+            "website_coverage_pct": pct(website_count),
+            "enrichment_stages": enrichment_stages,
+            "segment_counts": segment_counts,
+            "last_updated": now,
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "detail": str(e),
+            "total_leads": 0,
+            "phone_coverage_pct": 0.0,
+            "email_coverage_pct": 0.0,
+            "website_coverage_pct": 0.0,
+            "enrichment_stages": {f"stage_{i}": 0 for i in range(5)},
+            "segment_counts": {"hot": 0, "warm": 0, "cold": 0, "unclassified": 0},
+            "last_updated": now,
+        }
