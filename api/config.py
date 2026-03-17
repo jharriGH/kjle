@@ -1,40 +1,42 @@
 """
-KJLE API — Configuration
-Reads from environment variables (set in Render dashboard).
+KJLE API — Application Configuration
+Reads from environment variables with sensible defaults.
+Set secrets via Render Environment Variables or a local .env file.
 """
 
+from typing import List
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # ── Supabase ──────────────────────────────────────────────────────────────
-    SUPABASE_URL: str = ""
-    SUPABASE_SERVICE_KEY: str = ""
+    # ── Supabase (KJLE) ───────────────────────────────────────────────────────
+    SUPABASE_URL: str
+    SUPABASE_SERVICE_KEY: str
 
-    # ── App ───────────────────────────────────────────────────────────────────
-    APP_ENV: str = "production"
-    SECRET_KEY: str = "kjle-secret-change-in-prod"
-    ADMIN_API_KEY: str = ""
+    # ── App Security ──────────────────────────────────────────────────────────
+    API_SECRET_KEY: str = "change-me-in-production"
+
+    # ── CORS ──────────────────────────────────────────────────────────────────
+    CORS_ORIGINS: List[str] = ["*"]
 
     # ── External APIs ─────────────────────────────────────────────────────────
+    YELP_API_KEY: str = ""
+    GOOGLE_API_KEY: str = ""
     OUTSCRAPER_API_KEY: str = ""
-    OPENAI_API_KEY: str = ""
-    ANTHROPIC_API_KEY: str = ""
-
-    # ── Outreach ──────────────────────────────────────────────────────────────
+    FIRECRAWL_API_KEY: str = ""
     REACHINBOX_API_KEY: str = ""
-    INSTANTLY_API_KEY: str = ""
 
-    # ── Truelist.io ───────────────────────────────────────────────────────────
+    # ── Truelist.io — email cleaning ──────────────────────────────────────────
     # Optional fallback — preferred source is admin_settings table key 'truelist_api_key'
     TRUELIST_API_KEY: str = ""
 
-    # ── Webhooks / Integrations ───────────────────────────────────────────────
-    WEBHOOK_SECRET: str = ""
-    SLACK_WEBHOOK_URL: str = ""
+    # ── DemoEnginez Push ──────────────────────────────────────────────────────
+    DEMOENGINEZ_SUPABASE_URL: str = ""
+    DEMOENGINEZ_SUPABASE_KEY: str = ""
 
-    # ── Cost tracking ─────────────────────────────────────────────────────────
-    COST_TRACKING_ENABLED: bool = True
+    # ── VoiceDrop OS Push ─────────────────────────────────────────────────────
+    VOICEDROP_SUPABASE_URL: str = ""
+    VOICEDROP_SUPABASE_KEY: str = ""
 
     class Config:
         env_file = ".env"
