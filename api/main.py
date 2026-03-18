@@ -28,6 +28,7 @@ from .routes import enrichment_stage3
 from .routes import enrichment_stage4
 from .routes import enrichment_email_clean
 from .routes import csv_import
+from .routes import lead_management
 from .routes import export
 from .routes import push_demoenginez
 from .routes import push_voicedrop
@@ -65,6 +66,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"   Webhooks      : system active ({len(webhooks.SUPPORTED_EVENTS)} event types registered)")
     logger.info(f"   Admin Settings: ✓ loaded")
     logger.info(f"   CSV Import    : ✓ ready")
+    logger.info(f"   Lead Mgmt     : ✓ ready")
 
     # ── Start APScheduler ─────────────────────────────────────────────────────
     _scheduler = setup_scheduler()
@@ -117,6 +119,7 @@ app.include_router(enrichment_stage3.router,      prefix=f"{PREFIX}/enrichment",
 app.include_router(enrichment_stage4.router,      prefix=f"{PREFIX}/enrichment",  tags=["Enrichment Stage 4"])
 app.include_router(enrichment_email_clean.router, prefix=f"{PREFIX}/enrichment",  tags=["Enrichment — Email Clean"])
 app.include_router(csv_import.router,             prefix=PREFIX,                  tags=["CSV Import"])
+app.include_router(lead_management.router,        prefix=PREFIX,                  tags=["Lead Management"])
 app.include_router(export.router,                 prefix=PREFIX,                  tags=["Export"])
 app.include_router(push_demoenginez.router,       prefix=PREFIX,                  tags=["Push — DemoEnginez"])
 app.include_router(push_voicedrop.router,         prefix=PREFIX,                  tags=["Push — VoiceDrop"])
