@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 API_SECRET_KEY = os.environ.get("API_SECRET_KEY", "kjle-prod-2026-secret")
-PREFIX = "/kjle/v1"
 SCHEMA = "kjle"
 
 router = APIRouter()
@@ -61,7 +60,7 @@ class BulkActionRequest(BaseModel):
 # Must be registered BEFORE /leads/{lead_id} to avoid route shadowing
 # ─────────────────────────────────────────────────
 
-@router.get(f"{PREFIX}/leads/stats")
+@router.get("/leads/stats")
 async def lead_stats(x_api_key: str = Header(...)):
     verify_api_key(x_api_key)
     supabase = get_supabase()
@@ -129,7 +128,7 @@ async def lead_stats(x_api_key: str = Header(...)):
 # GET /kjle/v1/leads — Paginated browse + filter
 # ─────────────────────────────────────────────────
 
-@router.get(f"{PREFIX}/leads")
+@router.get("/leads")
 async def list_leads(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
@@ -200,7 +199,7 @@ async def list_leads(
 # Must be registered BEFORE /{lead_id} routes
 # ─────────────────────────────────────────────────
 
-@router.post(f"{PREFIX}/leads/bulk")
+@router.post("/leads/bulk")
 async def bulk_action(payload: BulkActionRequest, x_api_key: str = Header(...)):
     verify_api_key(x_api_key)
 
@@ -246,8 +245,6 @@ async def bulk_action(payload: BulkActionRequest, x_api_key: str = Header(...)):
                     errors.append({"lead_id": lead["id"], "error": str(e)})
 
         elif payload.action in ("push_demoenginez", "push_voicedrop"):
-            # Delegate to existing push route logic pattern
-            # Inserts leads into the appropriate queue table
             target_schema = "demoenginez" if payload.action == "push_demoenginez" else "voicedrop"
             target_table = "leads_queue"
             leads_res = supabase.schema(SCHEMA).table("leads").select("*").in_("id", payload.lead_ids).execute()
@@ -283,7 +280,7 @@ async def bulk_action(payload: BulkActionRequest, x_api_key: str = Header(...)):
 # GET /kjle/v1/leads/{lead_id}
 # ─────────────────────────────────────────────────
 
-@router.get(f"{PREFIX}/leads/{{lead_id}}")
+@router.get("/leads/{lead_id}")
 async def get_lead(lead_id: str, x_api_key: str = Header(...)):
     verify_api_key(x_api_key)
     supabase = get_supabase()
@@ -304,7 +301,7 @@ async def get_lead(lead_id: str, x_api_key: str = Header(...)):
 # POST /kjle/v1/leads/{lead_id}/reclassify
 # ─────────────────────────────────────────────────
 
-@router.post(f"{PREFIX}/leads/{{lead_id}}/reclassify")
+@router.post("/leads/{lead_id}/reclassify")
 async def reclassify_lead(lead_id: str, x_api_key: str = Header(...)):
     verify_api_key(x_api_key)
     supabase = get_supabase()
@@ -318,7 +315,7 @@ async def reclassify_lead(lead_id: str, x_api_key: str = Header(...)):
         new_label = score_to_segment(lead_res.data.get("pain_score"))
         now = datetime.now(timezone.utc).isoformat()
 
-        updated = supabase.schema(SCHEMA).table("leads").update({
+        supabase.schema(SCHEMA).table("leads").update({
             "segment_label": new_label,
             "segmented_at": now,
         }).eq("id", lead_id).execute()
@@ -336,7 +333,7 @@ async def reclassify_lead(lead_id: str, x_api_key: str = Header(...)):
 # POST /kjle/v1/leads/{lead_id}/dnc
 # ─────────────────────────────────────────────────
 
-@router.post(f"{PREFIX}/leads/{{lead_id}}/dnc")
+@router.post("/leads/{lead_id}/dnc")
 async def mark_dnc(lead_id: str, x_api_key: str = Header(...)):
     verify_api_key(x_api_key)
     supabase = get_supabase()
@@ -366,7 +363,7 @@ async def mark_dnc(lead_id: str, x_api_key: str = Header(...)):
 # DELETE /kjle/v1/leads/{lead_id}
 # ─────────────────────────────────────────────────
 
-@router.delete(f"{PREFIX}/leads/{{lead_id}}")
+@router.delete("/leads/{lead_id}")
 async def delete_lead(lead_id: str, x_api_key: str = Header(...)):
     verify_api_key(x_api_key)
     supabase = get_supabase()
