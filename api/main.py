@@ -19,6 +19,7 @@ from .routes import leads
 from .routes import segments
 from .routes import segments_engine
 from .routes import segment_manager
+from .routes import segment_builder
 from .routes import pipeline
 from .routes import costs
 from .routes import pain
@@ -67,6 +68,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"   Admin Settings: ✓ loaded")
     logger.info(f"   CSV Import    : ✓ ready")
     logger.info(f"   Lead Mgmt     : ✓ ready")
+    logger.info(f"   Segment Bldr  : ✓ ready")
 
     # ── Start APScheduler ─────────────────────────────────────────────────────
     _scheduler = setup_scheduler()
@@ -103,12 +105,14 @@ app.add_middleware(
 )
 
 # ── Router Registration ───────────────────────────────────────────────────────
-# ⚠️ lead_management MUST be registered before leads to prevent /leads/stats
-# and /leads/bulk being swallowed by the leads /{id} catch-all route
+# ⚠️ Registration order matters — specific routes must come before catch-all /{id} routes:
+#    - lead_management before leads (prevents /leads/stats + /leads/bulk being swallowed)
+#    - segment_builder before segments + segment_manager (prevents /segments/saved + /segments/preview being swallowed)
 PREFIX = "/kjle/v1"
 
 app.include_router(health.router,                 prefix=PREFIX,                  tags=["Health"])
 app.include_router(lead_management.router,        prefix=PREFIX,                  tags=["Lead Management"])
+app.include_router(segment_builder.router,        prefix=PREFIX,                  tags=["Segment Builder"])
 app.include_router(leads.router,                  prefix=PREFIX,                  tags=["Leads"])
 app.include_router(segments_engine.router,        prefix=PREFIX,                  tags=["Segmentation"])
 app.include_router(segments.router,               prefix=PREFIX,                  tags=["Segments"])
