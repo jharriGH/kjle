@@ -103,9 +103,12 @@ app.add_middleware(
 )
 
 # ── Router Registration ───────────────────────────────────────────────────────
+# ⚠️ lead_management MUST be registered before leads to prevent /leads/stats
+# and /leads/bulk being swallowed by the leads /{id} catch-all route
 PREFIX = "/kjle/v1"
 
 app.include_router(health.router,                 prefix=PREFIX,                  tags=["Health"])
+app.include_router(lead_management.router,        prefix=PREFIX,                  tags=["Lead Management"])
 app.include_router(leads.router,                  prefix=PREFIX,                  tags=["Leads"])
 app.include_router(segments_engine.router,        prefix=PREFIX,                  tags=["Segmentation"])
 app.include_router(segments.router,               prefix=PREFIX,                  tags=["Segments"])
@@ -119,7 +122,6 @@ app.include_router(enrichment_stage3.router,      prefix=f"{PREFIX}/enrichment",
 app.include_router(enrichment_stage4.router,      prefix=f"{PREFIX}/enrichment",  tags=["Enrichment Stage 4"])
 app.include_router(enrichment_email_clean.router, prefix=f"{PREFIX}/enrichment",  tags=["Enrichment — Email Clean"])
 app.include_router(csv_import.router,             prefix=PREFIX,                  tags=["CSV Import"])
-app.include_router(lead_management.router,        prefix=PREFIX,                  tags=["Lead Management"])
 app.include_router(export.router,                 prefix=PREFIX,                  tags=["Export"])
 app.include_router(push_demoenginez.router,       prefix=PREFIX,                  tags=["Push — DemoEnginez"])
 app.include_router(push_voicedrop.router,         prefix=PREFIX,                  tags=["Push — VoiceDrop"])
