@@ -135,6 +135,9 @@ async def test_reachinbox(x_api_key: str = Header(...)):
 
 # ─────────────────────────────────────────────────
 # POST /kjle/v1/integrations/truelist/test
+# Base URL: https://api.truelist.io
+# Auth: Authorization: Bearer TOKEN
+# Test endpoint: GET /api/v1/batches — returns batch history, confirms key is valid
 # ─────────────────────────────────────────────────
 
 @router.post("/integrations/truelist/test")
@@ -149,19 +152,25 @@ async def test_truelist(x_api_key: str = Header(...)):
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
-                "https://truelist.io/api/v1/account",
+                "https://api.truelist.io/api/v1/batches",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
         if resp.status_code == 200:
             data = resp.json()
+            batch_count = len(data) if isinstance(data, list) else 0
             return {
                 "integration": "truelist",
                 "status": "ok",
                 "http_status": resp.status_code,
-                "account": data,
+                "batch_count": batch_count,
             }
         else:
-            return {"integration": "truelist", "status": "error", "http_status": resp.status_code, "message": resp.text[:200]}
+            return {
+                "integration": "truelist",
+                "status": "error",
+                "http_status": resp.status_code,
+                "message": resp.text[:200],
+            }
     except Exception as e:
         return {"integration": "truelist", "status": "error", "message": str(e)}
 
@@ -186,12 +195,11 @@ async def test_outscraper(x_api_key: str = Header(...)):
                 headers={"X-API-KEY": api_key},
             )
         if resp.status_code == 200:
-            data = resp.json()
             return {
                 "integration": "outscraper",
                 "status": "ok",
                 "http_status": resp.status_code,
-                "account": data,
+                "account": resp.json(),
             }
         else:
             return {"integration": "outscraper", "status": "error", "http_status": resp.status_code, "message": resp.text[:200]}
@@ -219,12 +227,11 @@ async def test_firecrawl(x_api_key: str = Header(...)):
                 headers={"Authorization": f"Bearer {api_key}"},
             )
         if resp.status_code == 200:
-            data = resp.json()
             return {
                 "integration": "firecrawl",
                 "status": "ok",
                 "http_status": resp.status_code,
-                "account": data,
+                "account": resp.json(),
             }
         else:
             return {"integration": "firecrawl", "status": "error", "http_status": resp.status_code, "message": resp.text[:200]}
@@ -272,7 +279,6 @@ async def webhooks_summary(x_api_key: str = Header(...)):
         total_res = supabase.table("webhooks").select("id", count="exact").execute()
         active_res = supabase.table("webhooks").select("id", count="exact").eq("is_active", True).execute()
 
-        # Recent deliveries from export_log as proxy for webhook activity
         recent_res = supabase.table("export_log").select(
             "id, created_at, export_type, lead_count"
         ).order("created_at", desc=True).limit(5).execute()
@@ -297,15 +303,10 @@ async def push_summary(x_api_key: str = Header(...)):
     supabase = get_supabase()
 
     try:
-        # DemoEnginez eligible leads
-        de_res = supabase.table("leads").select("id", count="exact").eq("fit_demoenginez", True).eq("is_active", True).execute()
-
-        # VoiceDrop eligible leads
-        vd_res = supabase.table("leads").select("id", count="exact").eq("fit_voicedrop", True).eq("is_active", True).execute()
-
-        # Hot leads eligible for both
-        hot_de_res = supabase.table("leads").select("id", count="exact").eq("fit_demoenginez", True).eq("segment_label", "hot").eq("is_active", True).execute()
-        hot_vd_res = supabase.table("leads").select("id", count="exact").eq("fit_voicedrop", True).eq("segment_label", "hot").eq("is_active", True).execute()
+        de_res      = supabase.table("leads").select("id", count="exact").eq("fit_demoenginez", True).eq("is_active", True).execute()
+        vd_res      = supabase.table("leads").select("id", count="exact").eq("fit_voicedrop", True).eq("is_active", True).execute()
+        hot_de_res  = supabase.table("leads").select("id", count="exact").eq("fit_demoenginez", True).eq("segment_label", "hot").eq("is_active", True).execute()
+        hot_vd_res  = supabase.table("leads").select("id", count="exact").eq("fit_voicedrop", True).eq("segment_label", "hot").eq("is_active", True).execute()
 
         return {
             "demoenginez": {
