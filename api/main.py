@@ -31,6 +31,7 @@ from .routes import enrichment_email_clean
 from .routes import csv_import
 from .routes import lead_management
 from .routes import integration_hub
+from .routes import budget_control
 from .routes import export
 from .routes import push_demoenginez
 from .routes import push_voicedrop
@@ -70,6 +71,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"   Lead Mgmt     : ✓ ready")
     logger.info(f"   Segment Bldr  : ✓ ready")
     logger.info(f"   Integration H : ✓ ready")
+    logger.info(f"   Budget Ctrl   : ✓ ready")
 
     _scheduler = setup_scheduler()
     _scheduler.start()
@@ -113,6 +115,7 @@ app.include_router(health.router,                 prefix=PREFIX,                
 app.include_router(lead_management.router,        prefix=PREFIX,                  tags=["Lead Management"])
 app.include_router(segment_builder.router,        prefix=PREFIX,                  tags=["Segment Builder"])
 app.include_router(integration_hub.router,        prefix=PREFIX,                  tags=["Integration Hub"])
+app.include_router(budget_control.router,         prefix=PREFIX,                  tags=["Budget Control"])
 app.include_router(leads.router,                  prefix=PREFIX,                  tags=["Leads"])
 app.include_router(segments_engine.router,        prefix=PREFIX,                  tags=["Segmentation"])
 app.include_router(segments.router,               prefix=PREFIX,                  tags=["Segments"])
