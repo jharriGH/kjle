@@ -74,10 +74,11 @@ async def lifespan(app: FastAPI):
     logger.info(f"   Integration H : ✓ ready")
     logger.info(f"   Budget Ctrl   : ✓ ready")
     logger.info(f"   Access & Auth : ✓ ready")
+    logger.info(f"   Email Clean   : ✓ ready (Truelist nightly job active)")
 
     _scheduler = setup_scheduler()
     _scheduler.start()
-    logger.info("   Scheduler     : ⏰ APScheduler started (4 jobs active)")
+    logger.info("   Scheduler     : ⏰ APScheduler started (5 jobs active)")
 
     yield
 

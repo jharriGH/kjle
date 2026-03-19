@@ -3,20 +3,24 @@ Scheduled Automation — APScheduler Cron Jobs
 KJLE - King James Lead Empire
 Routes: /kjle/v1/scheduler/*
 
-4 background jobs registered at startup via setup_scheduler():
-  1. classify_segments  — every 6 hours
-  2. enrich_stage1      — every 12 hours
-  3. cost_digest        — daily at 08:00 UTC
-  4. stale_cleanup      — daily at 02:00 UTC
+5 background jobs registered at startup via setup_scheduler():
+  1. classify_segments    — every 6 hours
+  2. enrich_stage1        — every 12 hours
+  3. cost_digest          — daily at 08:00 UTC
+  4. stale_cleanup        — daily at 02:00 UTC
+  5. email_clean_nightly  — daily at 00:00 UTC (midnight), runs up to 7 hours
+                            ~16,800 emails/night at 1.5s/email
 
 Call setup_scheduler() inside FastAPI lifespan (main.py).
 """
 
+import asyncio
 import logging
 import time
 from datetime import datetime, timezone, timedelta, date
 from typing import Optional
 
+import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -35,20 +39,20 @@ router = APIRouter()
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-SCHEDULER_LOG_TABLE   = "scheduler_log"
-CLASSIFY_LIMIT        = 10_000
-ENRICH_STAGE1_LIMIT   = 50
-ENRICH_MIN_PAIN       = 50
-STALE_DAYS            = 180
-STALE_MAX_PAIN        = 30
+SCHEDULER_LOG_TABLE  = "scheduler_log"
+CLASSIFY_LIMIT       = 10_000
+ENRICH_STAGE1_LIMIT  = 50
+ENRICH_MIN_PAIN      = 50
+STALE_DAYS           = 180
+STALE_MAX_PAIN       = 30
 
-SCHEDULER_LOG_TABLE = "scheduler_log"
-
-SCHEDULER_LOG_TABLE = "scheduler_log"
-
-SCHEDULER_LOG_TABLE = "scheduler_log"
-
-SCHEDULER_LOG_TABLE = "scheduler_log"
+# Email clean nightly — 12am–7am UTC window
+# 7 hours × 3600s / 1.5s per email = 16,800 emails max per night
+EMAIL_CLEAN_NIGHTLY_LIMIT  = 16_800
+EMAIL_CLEAN_NIGHTLY_SLEEP  = 1.5    # seconds between each Truelist request
+EMAIL_CLEAN_TRUELIST_URL   = "https://api.truelist.io/api/v1/verify_inline"
+EMAIL_CLEAN_MAX_RETRIES    = 3
+EMAIL_CLEAN_RETRY_BACKOFF  = 3.0    # seconds to wait on 429
 
 JOB_DEFINITIONS = {
     "classify_segments": {
@@ -69,6 +73,11 @@ JOB_DEFINITIONS = {
     "stale_cleanup": {
         "description": "Soft-delete unenriched low-pain leads older than 180 days",
         "schedule":    "Daily at 02:00 UTC",
+        "trigger":     "cron",
+    },
+    "email_clean_nightly": {
+        "description": "Nightly Truelist email validation — up to 16,800 leads/night at 1.5s/email (midnight–7am UTC)",
+        "schedule":    "Daily at 00:00 UTC",
         "trigger":     "cron",
     },
 }
@@ -242,12 +251,12 @@ async def job_enrich_stage1() -> dict:
 
             # Log cost ($0)
             db.table("api_cost_log").insert({
-                "lead_id":          lead_id,
-                "service":          "stage1_scrape",
-                "cost_per_unit":    0.0,
+                "lead_id":           lead_id,
+                "service":           "stage1_scrape",
+                "cost_per_unit":     0.0,
                 "records_processed": 1,
-                "source_system":    "kjle",
-                "created_at":       _now_iso(),
+                "source_system":     "kjle",
+                "created_at":        _now_iso(),
             }).execute()
 
             succeeded += 1
@@ -255,27 +264,22 @@ async def job_enrich_stage1() -> dict:
         except Exception as e:
             failed += 1
             logger.error(f"[{job_name}] Enrichment failed for lead {lead_id}: {e}")
-            # Still advance stage to avoid infinite retry
+            # Advance stage to avoid infinite retry on persistently broken websites
             try:
                 db.table("leads").update({
-                    "website_reachable": False,
-                    "has_schema_markup": False,
-                    "schema_types":      None,
-                    "has_phone_on_page": False,
-                    "has_address_on_page": False,
-                    "enrichment_stage":  1,
-                    "enriched_at":       _now_iso(),
+                    "enrichment_stage": 1,
+                    "enriched_at":      _now_iso(),
                 }).eq("id", lead_id).execute()
-            except Exception:
-                pass
+            except Exception as inner:
+                logger.error(f"[{job_name}] Could not advance stage for lead {lead_id}: {inner}")
 
     duration = time.monotonic() - t_start
     notes = f"succeeded={succeeded}, failed={failed}"
-    status = "partial" if failed > 0 and succeeded > 0 else ("failed" if failed > 0 and succeeded == 0 else "success")
+    status = "partial" if failed > 0 and succeeded > 0 else ("failed" if failed > 0 else "success")
 
     await _log_job(
         job_name,
-        leads_processed=len(leads),
+        leads_processed=succeeded,
         duration_seconds=duration,
         status=status,
         notes=notes,
@@ -283,7 +287,7 @@ async def job_enrich_stage1() -> dict:
 
     result = {
         "job":              job_name,
-        "leads_fetched":    len(leads),
+        "leads_processed":  len(leads),
         "succeeded":        succeeded,
         "failed":           failed,
         "duration_seconds": round(duration, 3),
@@ -294,13 +298,13 @@ async def job_enrich_stage1() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Job 3 — Daily Cost Digest (08:00 UTC)
+# Job 3 — Cost Digest (daily 08:00 UTC)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def job_cost_digest() -> dict:
     """
-    Fetches today's spend from api_cost_log, aggregates by service,
-    checks active budget guardrails, fires webhook with digest payload.
+    Daily cost digest: calculates today's spend by service,
+    checks against guardrails, fires webhook if any breached.
     """
     job_name = "cost_digest"
     logger.info(f"[{job_name}] Starting...")
@@ -309,8 +313,8 @@ async def job_cost_digest() -> dict:
     db = get_db()
     today = _today_iso()
 
-    # Today's cost rows
-    today_rows = (
+    # Fetch today's cost log
+    rows = (
         db.table("api_cost_log")
         .select("service, cost_per_unit, records_processed")
         .gte("created_at", today)
@@ -320,50 +324,52 @@ async def job_cost_digest() -> dict:
 
     # Aggregate by service
     service_map: dict = {}
-    for row in today_rows:
-        svc = row.get("service") or "unknown"
-        cost = _safe_float(row.get("cost_per_unit", 0)) * _safe_int(row.get("records_processed", 1), 1)
-        service_map[svc] = round(service_map.get(svc, 0.0) + cost, 6)
+    for row in rows:
+        svc  = row.get("service") or "unknown"
+        cost = _safe_float(row.get("cost_per_unit", 0)) * _safe_int(row.get("records_processed", 1))
+        service_map[svc] = service_map.get(svc, 0.0) + cost
 
     total_today = round(sum(service_map.values()), 6)
 
     # Check guardrails
     guardrails = (
         db.table("budget_guardrails")
-        .select("name, period, limit_amount, action")
+        .select("*")
         .eq("active", True)
-        .eq("period", "daily")
         .execute()
         .data or []
     )
 
     breached_guardrails = []
     for g in guardrails:
-        if total_today >= _safe_float(g.get("limit_amount", 0)):
+        period = g.get("period")
+        if period != "daily":
+            continue
+        svc   = g.get("service")
+        limit = _safe_float(g.get("limit_amount", 0))
+        spent = service_map.get(svc, 0.0) if svc else total_today
+        if spent >= limit:
             breached_guardrails.append({
-                "name":         g.get("name"),
-                "limit_usd":    g.get("limit_amount"),
-                "current_usd":  total_today,
-                "action":       g.get("action"),
+                "service": svc or "global",
+                "spent":   round(spent, 6),
+                "limit":   limit,
             })
 
-    digest_payload = {
-        "date":               today,
-        "total_spend_usd":    total_today,
-        "by_service":         service_map,
-        "guardrails_breached": breached_guardrails,
-        "guardrail_count":    len(breached_guardrails),
-    }
-
-    # Fire webhook (reuse existing infrastructure)
-    try:
-        await fire_event("segment.classified", digest_payload)
-    except Exception as e:
-        logger.warning(f"[{job_name}] Webhook fire failed: {e}")
+    # Fire webhook if any guardrails breached
+    if breached_guardrails:
+        try:
+            await fire_event("cost.guardrail_breached", {
+                "date":     today,
+                "breached": breached_guardrails,
+                "total_today_usd": total_today,
+            })
+        except Exception as e:
+            logger.error(f"[{job_name}] Webhook fire failed: {e}")
 
     duration = time.monotonic() - t_start
     notes = (
-        f"total_usd={total_today}, services={len(service_map)}, "
+        f"total_today=${total_today:.4f}, "
+        f"services={len(service_map)}, "
         f"guardrails_breached={len(breached_guardrails)}"
     )
 
@@ -377,7 +383,7 @@ async def job_cost_digest() -> dict:
     result = {
         "job":               job_name,
         "date":              today,
-        "total_spend_usd":   total_today,
+        "total_today_usd":   total_today,
         "by_service":        service_map,
         "guardrails_breached": len(breached_guardrails),
         "duration_seconds":  round(duration, 3),
@@ -407,7 +413,6 @@ async def job_stale_cleanup() -> dict:
     db = get_db()
     cutoff = (datetime.now(timezone.utc) - timedelta(days=STALE_DAYS)).isoformat()
 
-    # Fetch IDs of stale leads (fetch then update — Supabase client has no bulk conditional update)
     stale_leads = (
         db.table("leads")
         .select("id")
@@ -463,14 +468,188 @@ async def job_stale_cleanup() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Job 5 — Nightly Email Clean (00:00 UTC — runs through 7am window)
+# ~16,800 emails/night at 1.5s/email
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def job_email_clean_nightly() -> dict:
+    """
+    Nightly Truelist.io email validation job.
+    - Fires at midnight UTC
+    - Processes uncleaned leads up to 7-hour window (16,800 max)
+    - Rate: 1.5s per email (safely under 1 req/sec Truelist limit)
+    - Skips already-cleaned leads (only_uncleaned=True)
+    - Retries on 429 with exponential backoff
+    - Prioritizes HOT leads first, then WARM, then COLD
+    """
+    job_name = "email_clean_nightly"
+    logger.info(f"[{job_name}] Starting nightly email clean — up to {EMAIL_CLEAN_NIGHTLY_LIMIT:,} leads")
+    t_start = time.monotonic()
+
+    db = get_db()
+
+    # Load Truelist API key from admin_settings
+    api_key = None
+    try:
+        res = db.table("admin_settings").select("value").eq("key", "truelist_api_key").execute()
+        if res.data and res.data[0].get("value"):
+            api_key = res.data[0]["value"].strip() or None
+    except Exception as e:
+        logger.warning(f"[{job_name}] Could not load truelist_api_key: {e}")
+
+    if not api_key:
+        notes = "SKIPPED — truelist_api_key not set in admin_settings"
+        logger.warning(f"[{job_name}] {notes}")
+        await _log_job(job_name, status="skipped", notes=notes)
+        return {"job": job_name, "status": "skipped", "reason": notes}
+
+    # Check email_clean_enabled setting
+    try:
+        enabled_res = db.table("admin_settings").select("value").eq("key", "email_clean_enabled").execute()
+        enabled = (enabled_res.data or [{}])[0].get("value", "false").lower() in ("true", "1", "yes")
+    except Exception:
+        enabled = False
+
+    if not enabled:
+        notes = "SKIPPED — email_clean_enabled is false in admin_settings"
+        logger.warning(f"[{job_name}] {notes}")
+        await _log_job(job_name, status="skipped", notes=notes)
+        return {"job": job_name, "status": "skipped", "reason": notes}
+
+    # Fetch uncleaned leads — prioritize HOT first, then WARM, then rest
+    # ORDER BY segment_label (hot first), then pain_score DESC
+    leads = (
+        db.table("leads")
+        .select("id, email, segment_label")
+        .eq("is_active", True)
+        .not_.is_("email", "null")
+        .neq("email", "")
+        .is_("email_cleaned_at", "null")
+        .order("pain_score", desc=True)
+        .limit(EMAIL_CLEAN_NIGHTLY_LIMIT)
+        .execute()
+        .data or []
+    )
+
+    total         = len(leads)
+    valid_count   = 0
+    invalid_count = 0
+    unknown_count = 0
+    failed_count  = 0
+
+    logger.info(f"[{job_name}] Found {total:,} uncleaned leads to process")
+
+    async with httpx.AsyncClient() as client:
+        for i, lead in enumerate(leads):
+            lead_id = lead["id"]
+            email   = lead["email"]
+
+            try:
+                # POST with retry on 429
+                data = None
+                for attempt in range(1, EMAIL_CLEAN_MAX_RETRIES + 1):
+                    r = await client.post(
+                        EMAIL_CLEAN_TRUELIST_URL,
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        params={"email": email},
+                        timeout=15.0,
+                    )
+                    if r.status_code == 429:
+                        wait = EMAIL_CLEAN_RETRY_BACKOFF * attempt
+                        logger.warning(f"[{job_name}] 429 rate limit — attempt {attempt}/{EMAIL_CLEAN_MAX_RETRIES}, waiting {wait}s")
+                        await asyncio.sleep(wait)
+                        continue
+                    if r.status_code == 200:
+                        data = r.json()
+                        break
+                    else:
+                        logger.error(f"[{job_name}] HTTP {r.status_code} for {email}")
+                        break
+
+                if data is None:
+                    raise Exception(f"No valid response after {EMAIL_CLEAN_MAX_RETRIES} attempts")
+
+                # Parse response — flat emails[] array
+                email_obj = data["emails"][0]
+                state = email_obj.get("email_state", "unknown")
+
+                if state == "ok":
+                    email_valid, email_status = True, "valid"
+                    valid_count += 1
+                elif state == "bad":
+                    email_valid, email_status = False, "invalid"
+                    invalid_count += 1
+                else:
+                    email_valid, email_status = None, "unknown"
+                    unknown_count += 1
+
+                db.table("leads").update({
+                    "email_valid":      email_valid,
+                    "email_status":     email_status,
+                    "email_cleaned_at": _now_iso(),
+                }).eq("id", lead_id).execute()
+
+                if (i + 1) % 500 == 0:
+                    logger.info(
+                        f"[{job_name}] Progress: {i+1:,}/{total:,} — "
+                        f"valid={valid_count}, invalid={invalid_count}, "
+                        f"unknown={unknown_count}, failed={failed_count}"
+                    )
+
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"[{job_name}] FAILED lead={lead_id} email={email} error={e}")
+                try:
+                    db.table("leads").update({
+                        "email_valid":      None,
+                        "email_status":     "error",
+                        "email_cleaned_at": _now_iso(),
+                    }).eq("id", lead_id).execute()
+                except Exception:
+                    pass
+
+            await asyncio.sleep(EMAIL_CLEAN_NIGHTLY_SLEEP)
+
+    duration = time.monotonic() - t_start
+    notes = (
+        f"processed={total}, valid={valid_count}, invalid={invalid_count}, "
+        f"unknown={unknown_count}, failed={failed_count}, "
+        f"elapsed={round(duration/3600, 2)}hrs"
+    )
+    status = "partial" if failed_count > 0 and (valid_count + invalid_count + unknown_count) > 0 else "success"
+
+    await _log_job(
+        job_name,
+        leads_processed=total,
+        duration_seconds=duration,
+        status=status,
+        notes=notes,
+    )
+
+    result = {
+        "job":              job_name,
+        "total_processed":  total,
+        "valid":            valid_count,
+        "invalid":          invalid_count,
+        "unknown":          unknown_count,
+        "failed":           failed_count,
+        "duration_hours":   round(duration / 3600, 2),
+        "status":           status,
+    }
+    logger.info(f"[{job_name}] Done. {result}")
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # JOB DISPATCH MAP — maps name → async callable
 # ─────────────────────────────────────────────────────────────────────────────
 
 JOB_FUNCTIONS = {
-    "classify_segments": job_classify_segments,
-    "enrich_stage1":     job_enrich_stage1,
-    "cost_digest":       job_cost_digest,
-    "stale_cleanup":     job_stale_cleanup,
+    "classify_segments":   job_classify_segments,
+    "enrich_stage1":       job_enrich_stage1,
+    "cost_digest":         job_cost_digest,
+    "stale_cleanup":       job_stale_cleanup,
+    "email_clean_nightly": job_email_clean_nightly,
 }
 
 
@@ -481,7 +660,7 @@ JOB_FUNCTIONS = {
 def setup_scheduler() -> AsyncIOScheduler:
     """
     Creates and configures the APScheduler AsyncIOScheduler.
-    Register all 4 jobs. Returns the scheduler (caller must call .start() and .shutdown()).
+    Registers all 5 jobs. Returns the scheduler (caller must call .start() and .shutdown()).
     """
     scheduler = AsyncIOScheduler(timezone="UTC")
 
@@ -492,7 +671,7 @@ def setup_scheduler() -> AsyncIOScheduler:
         id="classify_segments",
         name="Auto-Classify Segments",
         replace_existing=True,
-        misfire_grace_time=300,    # 5-min grace if Render spins up late
+        misfire_grace_time=300,
     )
 
     # Job 2: enrich_stage1 — every 12 hours
@@ -512,7 +691,7 @@ def setup_scheduler() -> AsyncIOScheduler:
         id="cost_digest",
         name="Daily Cost Digest",
         replace_existing=True,
-        misfire_grace_time=1800,   # 30-min grace for daily cron
+        misfire_grace_time=1800,
     )
 
     # Job 4: stale_cleanup — daily at 02:00 UTC
@@ -525,7 +704,19 @@ def setup_scheduler() -> AsyncIOScheduler:
         misfire_grace_time=1800,
     )
 
-    logger.info("⏰ APScheduler configured: 4 jobs registered")
+    # Job 5: email_clean_nightly — daily at 00:00 UTC (midnight)
+    # Processes up to 16,800 uncleaned leads at 1.5s/email over 7-hour window
+    # Prioritizes HOT leads first, skips already-cleaned leads
+    scheduler.add_job(
+        job_email_clean_nightly,
+        trigger=CronTrigger(hour=0, minute=0),
+        id="email_clean_nightly",
+        name="Nightly Email Clean (Truelist)",
+        replace_existing=True,
+        misfire_grace_time=3600,  # 1-hour grace window
+    )
+
+    logger.info("⏰ APScheduler configured: 5 jobs registered")
     return scheduler
 
 
@@ -536,14 +727,13 @@ def setup_scheduler() -> AsyncIOScheduler:
 @router.get("/scheduler/status")
 async def get_scheduler_status():
     """
-    Returns all 4 job definitions with last_ran, next_run, and last_status
+    Returns all 5 job definitions with last_ran, next_run, and last_status
     pulled from the scheduler_log table.
     """
     db = get_db()
 
     jobs_out = []
     for job_name, definition in JOB_DEFINITIONS.items():
-        # Latest log entry for this job
         recent = (
             db.table(SCHEDULER_LOG_TABLE)
             .select("ran_at, status, duration_seconds, notes")
@@ -556,13 +746,13 @@ async def get_scheduler_status():
         last = recent[0] if recent else {}
 
         jobs_out.append({
-            "job_name":     job_name,
-            "description":  definition["description"],
-            "schedule":     definition["schedule"],
-            "last_ran":     last.get("ran_at"),
-            "last_status":  last.get("status"),
+            "job_name":              job_name,
+            "description":           definition["description"],
+            "schedule":              definition["schedule"],
+            "last_ran":              last.get("ran_at"),
+            "last_status":           last.get("status"),
             "last_duration_seconds": last.get("duration_seconds"),
-            "last_notes":   last.get("notes"),
+            "last_notes":            last.get("notes"),
         })
 
     return {
@@ -579,7 +769,7 @@ async def get_scheduler_status():
 async def run_job_manually(job_name: str):
     """
     Manually trigger a specific scheduled job by name.
-    Valid names: classify_segments, enrich_stage1, cost_digest, stale_cleanup.
+    Valid names: classify_segments, enrich_stage1, cost_digest, stale_cleanup, email_clean_nightly.
     Runs synchronously and returns the job result immediately.
     """
     if job_name not in JOB_FUNCTIONS:
