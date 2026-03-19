@@ -4,9 +4,9 @@ Route prefix handled in main.py: /kjle/v1/enrichment
 
 Truelist API:
   Base URL:  https://api.truelist.io
-  Endpoint:  POST /api/v1/verify_inline
+  Endpoint:  GET /api/v1/verify_inline  (uses GET with query param, despite docs showing POST + -G flag)
   Auth:      Authorization: Bearer TOKEN
-  Param:     ?email=address@domain.com  (query param, NOT json body)
+  Param:     ?email=address@domain.com  (URL-encoded query param)
   Response:  { "emails": [{ "email": { "email_state": "ok", "email_sub_state": "email_ok", ... } }] }
   States:    ok | risky | unknown | bad
 """
@@ -27,8 +27,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-TRUELIST_BASE  = "https://api.truelist.io"
-TRUELIST_URL   = f"{TRUELIST_BASE}/api/v1/verify_inline"
+TRUELIST_URL   = "https://api.truelist.io/api/v1/verify_inline"
 RATE_LIMIT_SLEEP = 0.5  # 2 requests/sec max
 
 
@@ -41,7 +40,9 @@ async def _get_truelist_api_key(db) -> str:
     try:
         res = db.table("admin_settings").select("value").eq("key", "truelist_api_key").execute()
         if res.data and res.data[0].get("value"):
-            return res.data[0]["value"].strip()
+            val = res.data[0]["value"].strip()
+            if val:
+                return val
     except Exception as e:
         logger.warning(f"Could not load truelist_api_key from admin_settings: {e}")
 
@@ -85,13 +86,19 @@ def _parse_truelist_response(data: dict) -> tuple[Optional[bool], str]:
 
 
 async def _verify_email(client: httpx.AsyncClient, api_key: str, email: str) -> dict:
-    """Call Truelist verify_inline API for a single email."""
-    r = await client.post(
+    """
+    Call Truelist verify_inline API for a single email.
+    Uses GET with URL-encoded query param (matching Truelist's -G curl examples).
+    """
+    r = await client.get(
         TRUELIST_URL,
         headers={"Authorization": f"Bearer {api_key}"},
         params={"email": email},
         timeout=15.0,
     )
+    # Log non-200 responses with detail before raising
+    if r.status_code != 200:
+        logger.error(f"[truelist] HTTP {r.status_code} for {email}: {r.text[:300]}")
     r.raise_for_status()
     return r.json()
 
@@ -149,7 +156,7 @@ async def batch_email_clean(
     res = query.execute()
     leads = res.data or []
 
-    total = len(leads)
+    total         = len(leads)
     valid_count   = 0
     invalid_count = 0
     unknown_count = 0
@@ -274,7 +281,7 @@ async def email_clean_status(db=Depends(get_db)):
 
 @router.post("/email-clean/single/{lead_id}")
 async def single_email_clean(lead_id: str, db=Depends(get_db)):
-    """Validate a single lead's email via Truelist.io."""
+    """Validate a single lead's email via Truelist.io. Returns full detail including any error."""
     api_key = await _get_truelist_api_key(db)
 
     res = db.table("leads").select("id, email").eq("id", lead_id).execute()
@@ -287,14 +294,35 @@ async def single_email_clean(lead_id: str, db=Depends(get_db)):
     if not email or not email.strip():
         raise HTTPException(status_code=400, detail=f"Lead {lead_id} has no email address.")
 
+    raw_response = None
+    error_detail = None
+
     try:
         async with httpx.AsyncClient() as client:
-            data = await _verify_email(client, api_key, email)
+            r = await client.get(
+                TRUELIST_URL,
+                headers={"Authorization": f"Bearer {api_key}"},
+                params={"email": email},
+                timeout=15.0,
+            )
+            raw_response = {"status_code": r.status_code, "body": r.text[:500]}
+
+            if r.status_code != 200:
+                error_detail = f"Truelist returned HTTP {r.status_code}: {r.text[:300]}"
+                await _update_lead_email_status(db, lead_id, None, "error")
+                return {
+                    "lead_id":      lead_id,
+                    "email":        email,
+                    "result":       "error",
+                    "error":        error_detail,
+                    "raw_response": raw_response,
+                }
+
+            data = r.json()
 
         email_valid, email_status = _parse_truelist_response(data)
         await _update_lead_email_status(db, lead_id, email_valid, email_status)
 
-        # Pull extra fields from response if available
         try:
             email_obj = data["emails"][0]["email"]
         except (KeyError, IndexError):
@@ -303,24 +331,32 @@ async def single_email_clean(lead_id: str, db=Depends(get_db)):
         logger.info(f"[email-clean/single] lead={lead_id} email={email} result={email_status}")
 
         return {
-            "lead_id":      lead_id,
-            "email":        email,
-            "result":       email_status,
-            "email_valid":  email_valid,
-            "email_status": email_status,
-            "email_state":  email_obj.get("email_state"),
+            "lead_id":         lead_id,
+            "email":           email,
+            "result":          email_status,
+            "email_valid":     email_valid,
+            "email_status":    email_status,
+            "email_state":     email_obj.get("email_state"),
             "email_sub_state": email_obj.get("email_sub_state"),
-            "mx_record":    email_obj.get("mx_record"),
-            "domain":       email_obj.get("domain"),
-            "cleaned_at":   datetime.now(timezone.utc).isoformat(),
+            "mx_record":       email_obj.get("mx_record"),
+            "domain":          email_obj.get("domain"),
+            "cleaned_at":      datetime.now(timezone.utc).isoformat(),
+            "raw_response":    raw_response,
         }
 
     except HTTPException:
         raise
     except Exception as e:
+        error_detail = str(e)
         logger.error(f"[email-clean/single] FAILED lead={lead_id} error={e}")
         try:
             await _update_lead_email_status(db, lead_id, None, "error")
         except Exception:
             pass
-        raise HTTPException(status_code=502, detail=f"Truelist API error for lead {lead_id}: {str(e)}")
+        return {
+            "lead_id":      lead_id,
+            "email":        email,
+            "result":       "error",
+            "error":        error_detail,
+            "raw_response": raw_response,
+        }
