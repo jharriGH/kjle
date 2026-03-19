@@ -1,6 +1,14 @@
 """
 KJLE — Prompt 26B: Truelist.io Email Cleaning Integration
 Route prefix handled in main.py: /kjle/v1/enrichment
+
+Truelist API:
+  Base URL:  https://api.truelist.io
+  Endpoint:  POST /api/v1/verify_inline
+  Auth:      Authorization: Bearer TOKEN
+  Param:     ?email=address@domain.com  (query param, NOT json body)
+  Response:  { "emails": [{ "email": { "email_state": "ok", "email_sub_state": "email_ok", ... } }] }
+  States:    ok | risky | unknown | bad
 """
 
 import asyncio
@@ -19,7 +27,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-TRUELIST_URL = "https://truelist.io/api/v1/verify"
+TRUELIST_BASE  = "https://api.truelist.io"
+TRUELIST_URL   = f"{TRUELIST_BASE}/api/v1/verify_inline"
 RATE_LIMIT_SLEEP = 0.5  # 2 requests/sec max
 
 
@@ -46,13 +55,42 @@ async def _get_truelist_api_key(db) -> str:
     )
 
 
+def _parse_truelist_response(data: dict) -> tuple[Optional[bool], str]:
+    """
+    Parse Truelist verify_inline response.
+
+    Response shape:
+      { "emails": [{ "email": { "email_state": "ok", "email_sub_state": "email_ok", ... } }] }
+
+    email_state values:
+      ok      → valid
+      risky   → unknown (accept-all, catch-all)
+      unknown → unknown
+      bad     → invalid
+    """
+    try:
+        email_obj = data["emails"][0]["email"]
+        state = email_obj.get("email_state", "unknown")
+    except (KeyError, IndexError, TypeError):
+        return None, "error"
+
+    if state == "ok":
+        return True, "valid"
+    elif state == "bad":
+        return False, "invalid"
+    elif state in ("risky", "unknown"):
+        return None, "unknown"
+    else:
+        return None, "unknown"
+
+
 async def _verify_email(client: httpx.AsyncClient, api_key: str, email: str) -> dict:
-    """Call Truelist API for a single email. Returns parsed result dict."""
+    """Call Truelist verify_inline API for a single email."""
     r = await client.post(
         TRUELIST_URL,
         headers={"Authorization": f"Bearer {api_key}"},
-        json={"email": email},
-        timeout=10.0,
+        params={"email": email},
+        timeout=15.0,
     )
     r.raise_for_status()
     return r.json()
@@ -86,13 +124,13 @@ async def batch_email_clean(
     db=Depends(get_db),
 ):
     """
-    Batch-validate lead emails via Truelist.io.
+    Batch-validate lead emails via Truelist.io verify_inline endpoint.
     Processes up to `limit` leads, rate-limited to 2 req/sec.
     """
     api_key = await _get_truelist_api_key(db)
     start_time = time.time()
 
-    # ----- Build query -----
+    # Build query
     query = (
         db.table("leads")
         .select("id, email")
@@ -112,32 +150,29 @@ async def batch_email_clean(
     leads = res.data or []
 
     total = len(leads)
-    valid_count = 0
+    valid_count   = 0
     invalid_count = 0
     unknown_count = 0
-    failed_count = 0
+    failed_count  = 0
 
     async with httpx.AsyncClient() as client:
         for lead in leads:
             lead_id = lead["id"]
-            email = lead["email"]
+            email   = lead["email"]
 
             try:
                 data = await _verify_email(client, api_key, email)
-                result = data.get("result", "unknown")
+                email_valid, email_status = _parse_truelist_response(data)
 
-                email_valid = True if result == "valid" else (False if result == "invalid" else None)
-                email_status = result
-
-                if result == "valid":
+                if email_status == "valid":
                     valid_count += 1
-                elif result == "invalid":
+                elif email_status == "invalid":
                     invalid_count += 1
                 else:
                     unknown_count += 1
 
                 await _update_lead_email_status(db, lead_id, email_valid, email_status)
-                logger.info(f"[email-clean] lead={lead_id} email={email} result={result}")
+                logger.info(f"[email-clean] lead={lead_id} email={email} result={email_status}")
 
             except Exception as e:
                 failed_count += 1
@@ -175,7 +210,6 @@ async def batch_email_clean(
 async def email_clean_status(db=Depends(get_db)):
     """Return email validation coverage stats across all leads."""
 
-    # Total leads with a non-null, non-empty email
     total_res = (
         db.table("leads")
         .select("id", count="exact")
@@ -185,7 +219,6 @@ async def email_clean_status(db=Depends(get_db)):
     )
     total_with_email = total_res.count or 0
 
-    # Cleaned (email_cleaned_at IS NOT NULL)
     cleaned_res = (
         db.table("leads")
         .select("id", count="exact")
@@ -196,7 +229,6 @@ async def email_clean_status(db=Depends(get_db)):
     )
     total_cleaned = cleaned_res.count or 0
 
-    # Valid
     valid_res = (
         db.table("leads")
         .select("id", count="exact")
@@ -205,7 +237,6 @@ async def email_clean_status(db=Depends(get_db)):
     )
     valid_count = valid_res.count or 0
 
-    # Invalid
     invalid_res = (
         db.table("leads")
         .select("id", count="exact")
@@ -214,7 +245,6 @@ async def email_clean_status(db=Depends(get_db)):
     )
     invalid_count = invalid_res.count or 0
 
-    # Unknown (cleaned but email_valid IS NULL)
     unknown_res = (
         db.table("leads")
         .select("id", count="exact")
@@ -224,7 +254,7 @@ async def email_clean_status(db=Depends(get_db)):
     )
     unknown_count = unknown_res.count or 0
 
-    uncleaned = total_with_email - total_cleaned
+    uncleaned    = total_with_email - total_cleaned
     coverage_pct = round((total_cleaned / total_with_email * 100), 1) if total_with_email > 0 else 0.0
 
     return {
@@ -247,12 +277,11 @@ async def single_email_clean(lead_id: str, db=Depends(get_db)):
     """Validate a single lead's email via Truelist.io."""
     api_key = await _get_truelist_api_key(db)
 
-    # Fetch lead
     res = db.table("leads").select("id, email").eq("id", lead_id).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found.")
 
-    lead = res.data[0]
+    lead  = res.data[0]
     email = lead.get("email", "")
 
     if not email or not email.strip():
@@ -262,23 +291,28 @@ async def single_email_clean(lead_id: str, db=Depends(get_db)):
         async with httpx.AsyncClient() as client:
             data = await _verify_email(client, api_key, email)
 
-        result = data.get("result", "unknown")
-        email_valid = True if result == "valid" else (False if result == "invalid" else None)
-        email_status = result
-
+        email_valid, email_status = _parse_truelist_response(data)
         await _update_lead_email_status(db, lead_id, email_valid, email_status)
-        logger.info(f"[email-clean/single] lead={lead_id} email={email} result={result}")
+
+        # Pull extra fields from response if available
+        try:
+            email_obj = data["emails"][0]["email"]
+        except (KeyError, IndexError):
+            email_obj = {}
+
+        logger.info(f"[email-clean/single] lead={lead_id} email={email} result={email_status}")
 
         return {
-            "lead_id": lead_id,
-            "email": email,
-            "result": result,
-            "email_valid": email_valid,
+            "lead_id":      lead_id,
+            "email":        email,
+            "result":       email_status,
+            "email_valid":  email_valid,
             "email_status": email_status,
-            "disposable": data.get("disposable"),
-            "role_account": data.get("role_account"),
-            "free_email": data.get("free_email"),
-            "cleaned_at": datetime.now(timezone.utc).isoformat(),
+            "email_state":  email_obj.get("email_state"),
+            "email_sub_state": email_obj.get("email_sub_state"),
+            "mx_record":    email_obj.get("mx_record"),
+            "domain":       email_obj.get("domain"),
+            "cleaned_at":   datetime.now(timezone.utc).isoformat(),
         }
 
     except HTTPException:
