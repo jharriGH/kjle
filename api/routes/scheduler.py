@@ -46,9 +46,10 @@ ENRICH_MIN_PAIN      = 50
 STALE_DAYS           = 180
 STALE_MAX_PAIN       = 30
 
-# Email clean nightly — 12am–7am UTC window
-# 7 hours × 3600s / 1.5s per email = 16,800 emails max per night
-EMAIL_CLEAN_NIGHTLY_LIMIT  = 16_800
+# Email clean nightly — Render Starter safe limit
+# ~36min per 1,000 leads — 2,500 fits within 90min Starter window
+EMAIL_CLEAN_NIGHTLY_LIMIT  = 2_500  # safe for Render Starter
+EMAIL_CLEAN_PAGE_SIZE      = 1_000  # Supabase max rows per request
 EMAIL_CLEAN_NIGHTLY_SLEEP  = 1.5    # seconds between each Truelist request
 EMAIL_CLEAN_TRUELIST_URL   = "https://api.truelist.io/api/v1/verify_inline"
 EMAIL_CLEAN_MAX_RETRIES    = 3
@@ -516,28 +517,41 @@ async def job_email_clean_nightly() -> dict:
         await _log_job(job_name, status="skipped", notes=notes)
         return {"job": job_name, "status": "skipped", "reason": notes}
 
-    # Fetch uncleaned leads — prioritize HOT first, then WARM, then rest
-    # ORDER BY segment_label (hot first), then pain_score DESC
-    leads = (
-        db.table("leads")
-        .select("id, email, segment_label")
-        .eq("is_active", True)
-        .not_.is_("email", "null")
-        .neq("email", "")
-        .is_("email_cleaned_at", "null")
-        .order("pain_score", desc=True)
-        .limit(EMAIL_CLEAN_NIGHTLY_LIMIT)
-        .execute()
-        .data or []
-    )
+    # Fetch uncleaned leads in pages of 1,000 (Supabase default row limit)
+    # Paginate until we hit EMAIL_CLEAN_NIGHTLY_LIMIT or run out of leads
+    # Prioritize HOT leads first (highest pain_score DESC)
+    all_leads = []
+    offset = 0
+    while len(all_leads) < EMAIL_CLEAN_NIGHTLY_LIMIT:
+        remaining = EMAIL_CLEAN_NIGHTLY_LIMIT - len(all_leads)
+        batch_size = min(EMAIL_CLEAN_PAGE_SIZE, remaining)
+        batch = (
+            db.table("leads")
+            .select("id, email, segment_label")
+            .eq("is_active", True)
+            .not_.is_("email", "null")
+            .neq("email", "")
+            .is_("email_cleaned_at", "null")
+            .order("pain_score", desc=True)
+            .range(offset, offset + batch_size - 1)
+            .execute()
+            .data or []
+        )
+        if not batch:
+            break
+        all_leads.extend(batch)
+        if len(batch) < batch_size:
+            break
+        offset += batch_size
 
+    leads = all_leads
     total         = len(leads)
     valid_count   = 0
     invalid_count = 0
     unknown_count = 0
     failed_count  = 0
 
-    logger.info(f"[{job_name}] Found {total:,} uncleaned leads to process")
+    logger.info(f"[{job_name}] Found {total:,} uncleaned leads to process (limit={EMAIL_CLEAN_NIGHTLY_LIMIT:,})")
 
     async with httpx.AsyncClient() as client:
         for i, lead in enumerate(leads):
