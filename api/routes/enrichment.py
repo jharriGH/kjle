@@ -220,14 +220,13 @@ async def enrich_single_lead(lead_id: str):
         db.table("leads")
         .select("id, business_name, website, enrichment_stage, niche_slug, state")
         .eq("id", lead_id)
-        .single()
         .execute()
     )
 
     if not result.data:
         raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
 
-    lead = result.data
+    lead = result.data[0]
 
     # Run enrichment
     success, update_payload = await _enrich_lead(lead)
