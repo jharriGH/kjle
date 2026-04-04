@@ -70,9 +70,15 @@ async def _fetch_outscraper(business_name: str, city: str, state: str) -> dict:
         "outscraper_longitude": None,
     }
 
-    api_key = settings.OUTSCRAPER_API_KEY
+    # Read key from admin_settings table (set via Supabase, not env var)
+    try:
+        db = get_db()
+        key_result = db.table("admin_settings").select("value").eq("key", "outscraper_api_key").execute()
+        api_key = key_result.data[0]["value"] if key_result.data else ""
+    except Exception:
+        api_key = ""
     if not api_key:
-        logger.warning("OUTSCRAPER_API_KEY not configured — skipping Stage 3")
+        logger.warning("outscraper_api_key not configured in admin_settings — skipping Stage 3")
         return empty
 
     if not business_name or not city or not state:
@@ -206,25 +212,24 @@ async def enrich_stage3_single(lead_id: str, min_pain: int = DEFAULT_MIN_PAIN):
             "enrichment_stage, pain_score, niche_slug"
         )
         .eq("id", lead_id)
-        .single()
         .execute()
     )
 
     if not result.data:
         raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
 
-    lead = result.data
+    lead = result.data[0]
     pain = lead.get("pain_score") or 0
     stage = lead.get("enrichment_stage") or 0
 
-    # Stage gate
-    if stage < 2:
+    # Stage gate (Stage 2 / Yelp removed — gate is now Stage 1)
+    if stage < 1:
         raise HTTPException(
             status_code=422,
             detail=(
                 f"Lead {lead_id} is at enrichment_stage {stage}. "
-                "Stage 3 requires enrichment_stage >= 2. "
-                "Run Stage 1 and Stage 2 first."
+                "Stage 3 requires enrichment_stage >= 1. "
+                "Run Stage 1 first."
             ),
         )
 
@@ -284,7 +289,7 @@ async def enrich_stage3_batch(body: BatchStage3Request):
             "id, business_name, city, state, website, "
             "enrichment_stage, pain_score, niche_slug"
         )
-        .eq("enrichment_stage", 2)
+        .eq("enrichment_stage", 1)  # Stage 2/Yelp removed
         .eq("is_active", True)
         .gte("pain_score", effective_min)
     )
@@ -302,7 +307,7 @@ async def enrich_stage3_batch(body: BatchStage3Request):
     if not leads:
         return {
             "status": "success",
-            "message": f"No Stage 2 leads found with pain_score >= {effective_min}",
+            "message": f"No Stage 1 leads found with pain_score >= {effective_min}",
             "summary": {
                 "processed": 0,
                 "succeeded": 0,
@@ -391,7 +396,7 @@ async def enrich_stage3_batch(body: BatchStage3Request):
             "skipped": skipped,
             "total_cost_usd": total_cost,
             "cost_per_record_usd": OUTSCRAPER_COST_PER_RECORD,
-            "outscraper_enabled": bool(settings.OUTSCRAPER_API_KEY),
+            "outscraper_enabled": True,
         },
         "filters": {**body.model_dump(), "effective_min_pain": effective_min},
         "results": results_detail,
@@ -418,7 +423,7 @@ async def get_stage3_cost_estimate(
     query = (
         db.table("leads")
         .select("id", count="exact")
-        .eq("enrichment_stage", 2)
+        .eq("enrichment_stage", 1)  # Stage 2/Yelp removed
         .eq("is_active", True)
         .gte("pain_score", effective_min)
     )
@@ -437,7 +442,7 @@ async def get_stage3_cost_estimate(
     total_query = (
         db.table("leads")
         .select("id", count="exact")
-        .eq("enrichment_stage", 2)
+        .eq("enrichment_stage", 1)  # Stage 2/Yelp removed
         .eq("is_active", True)
     )
     if niche_slug:
@@ -458,12 +463,12 @@ async def get_stage3_cost_estimate(
             "effective_min_pain": effective_min,
         },
         "estimate": {
-            "total_stage2_leads": total_stage2,
+            "total_stage1_leads": total_stage2,
             "eligible_for_stage3": eligible_count,
             "gated_out_by_pain": gated_out,
             "cost_per_record_usd": OUTSCRAPER_COST_PER_RECORD,
             "estimated_cost_usd": estimated_cost,
-            "outscraper_enabled": bool(settings.OUTSCRAPER_API_KEY),
+            "outscraper_enabled": True,
         },
         "note": (
             f"Stage 3 pain gate is set to {effective_min}. "
