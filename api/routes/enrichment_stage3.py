@@ -92,7 +92,7 @@ async def _fetch_outscraper(business_name: str, city: str, state: str) -> dict:
             resp = await client.get(
                 OUTSCRAPER_URL,
                 headers={"X-API-KEY": api_key},
-                params={"query": query, "limit": 1, "language": "en"},
+                params={"query": query, "limit": 1, "language": "en", "async": "false"},
             )
             resp.raise_for_status()
             data = resp.json()
