@@ -257,14 +257,13 @@ async def enrich_stage4_single(lead_id: str, min_pain: int = DEFAULT_MIN_PAIN):
             "enrichment_stage, pain_score, niche_slug"
         )
         .eq("id", lead_id)
-        .single()
         .execute()
     )
 
     if not result.data:
         raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
 
-    lead = result.data
+    lead = result.data[0]
     pain = lead.get("pain_score") or 0
     stage = lead.get("enrichment_stage") or 0
 
@@ -439,7 +438,7 @@ async def enrich_stage4_batch(body: BatchStage4Request):
             "skipped": skipped,
             "total_cost_usd": total_cost,
             "cost_per_record_usd": FIRECRAWL_COST_PER_RECORD,
-            "firecrawl_enabled": bool(settings.FIRECRAWL_API_KEY),
+            "firecrawl_enabled": True,
         },
         "filters": {**body.model_dump(), "effective_min_pain": effective_min},
         "results": results_detail,
@@ -510,7 +509,7 @@ async def get_stage4_cost_estimate(
             "gated_out_by_pain": gated_out,
             "cost_per_record_usd": FIRECRAWL_COST_PER_RECORD,
             "estimated_cost_usd": estimated_cost,
-            "firecrawl_enabled": bool(settings.FIRECRAWL_API_KEY),
+            "firecrawl_enabled": True,
         },
         "note": (
             f"Stage 4 pain gate is set to {effective_min}. "
