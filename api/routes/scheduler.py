@@ -41,10 +41,20 @@ router = APIRouter()
 
 SCHEDULER_LOG_TABLE  = "scheduler_log"
 CLASSIFY_LIMIT       = 10_000
-ENRICH_STAGE1_LIMIT  = 50
-ENRICH_MIN_PAIN      = 50
+ENRICH_STAGE1_LIMIT  = 200      # bumped from 50 — configurable via admin_settings key enrich_stage1_limit
+ENRICH_MIN_PAIN      = 0        # Stage 1 is free — run on all leads with websites
 STALE_DAYS           = 180
 STALE_MAX_PAIN       = 30
+
+# Stage 3 / Stage 4 nightly defaults — all overridable via admin_settings
+ENRICH_STAGE3_LIMIT        = 25     # leads per nightly run
+ENRICH_STAGE3_MIN_PAIN     = 60     # pain gate
+ENRICH_STAGE3_DAILY_BUDGET = 0.10   # USD — hard stop if exceeded
+ENRICH_STAGE4_LIMIT        = 10     # leads per nightly run
+ENRICH_STAGE4_MIN_PAIN     = 75     # pain gate
+ENRICH_STAGE4_DAILY_BUDGET = 0.05   # USD — hard stop if exceeded
+OUTSCRAPER_COST_PER_LEAD   = 0.002
+FIRECRAWL_COST_PER_LEAD    = 0.005
 
 # Email clean nightly — Render Starter safe limit
 # ~36min per 1,000 leads — 2,500 fits within 90min Starter window
@@ -79,6 +89,16 @@ JOB_DEFINITIONS = {
     "email_clean_nightly": {
         "description": "Nightly Truelist email validation — up to 16,800 leads/night at 1.5s/email (midnight–7am UTC)",
         "schedule":    "Daily at 00:00 UTC",
+        "trigger":     "cron",
+    },
+    "enrich_stage3_nightly": {
+        "description": "Nightly Outscraper Google Maps enrichment — Stage 1 leads, pain >= 60, budget-guarded",
+        "schedule":    "Daily at 01:00 UTC",
+        "trigger":     "cron",
+    },
+    "enrich_stage4_nightly": {
+        "description": "Nightly Firecrawl deep enrichment — Stage 3 leads, pain >= 75, budget-guarded",
+        "schedule":    "Daily at 03:00 UTC",
         "trigger":     "cron",
     },
 }
@@ -654,16 +674,437 @@ async def job_email_clean_nightly() -> dict:
     return result
 
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Budget Guard — checks spend before running paid enrichment jobs
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _get_admin_setting(key: str, default):
+    """Reads a single value from admin_settings table. Returns default on any error."""
+    try:
+        db = get_db()
+        res = db.table("admin_settings").select("value").eq("key", key).execute()
+        if res.data and res.data[0].get("value") is not None:
+            val = res.data[0]["value"]
+            # Try numeric conversion if default is numeric
+            if isinstance(default, float):
+                return float(val)
+            if isinstance(default, int):
+                return int(val)
+            return val
+    except Exception:
+        pass
+    return default
+
+
+async def _get_today_spend(service: str) -> float:
+    """Returns total spend for a service today from api_cost_log."""
+    try:
+        db = get_db()
+        today = _today_iso()
+        rows = (
+            db.table("api_cost_log")
+            .select("cost_per_unit, records_processed")
+            .eq("service", service)
+            .gte("created_at", today)
+            .execute()
+            .data or []
+        )
+        return round(sum(
+            _safe_float(r.get("cost_per_unit", 0)) * _safe_int(r.get("records_processed", 1))
+            for r in rows
+        ), 6)
+    except Exception:
+        return 0.0
+
+
+async def _budget_guard(service: str, cost_per_lead: float, batch_limit: int, daily_cap: float) -> tuple[bool, int, str]:
+    """
+    Checks budget before running a paid enrichment job.
+    Returns (allowed: bool, safe_limit: int, reason: str)
+    - allowed: False = skip entire job
+    - safe_limit: how many leads we can afford today within the cap
+    - reason: human-readable explanation for scheduler log
+    """
+    today_spend = await _get_today_spend(service)
+    remaining_budget = daily_cap - today_spend
+
+    if remaining_budget <= 0:
+        return False, 0, f"daily_cap_reached — spent ${today_spend:.4f} of ${daily_cap:.2f} cap for {service}"
+
+    affordable_leads = int(remaining_budget / cost_per_lead)
+    safe_limit = min(batch_limit, affordable_leads)
+
+    if safe_limit <= 0:
+        return False, 0, f"budget_too_low — ${remaining_budget:.4f} remaining, need ${cost_per_lead:.3f}/lead for {service}"
+
+    reason = (
+        f"budget_ok — ${today_spend:.4f} spent today, ${remaining_budget:.4f} remaining, "
+        f"cap=${daily_cap:.2f}, running {safe_limit} leads"
+    )
+    return True, safe_limit, reason
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 6 — Nightly Stage 3 Enrichment (01:00 UTC)
+# Outscraper Google Maps — pain-gated, budget-guarded
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def job_enrich_stage3_nightly() -> dict:
+    """
+    Nightly Outscraper enrichment job.
+    - Fires at 01:00 UTC
+    - Processes Stage 1 leads with pain_score >= enrich_stage3_min_pain (default 60)
+    - Batch size from admin_settings key enrich_stage3_nightly_limit (default 25)
+    - Daily budget cap from admin_settings key enrich_stage3_daily_budget_usd (default $0.10)
+    - Skips entirely if daily budget cap already reached
+    - Orders by pain_score DESC — hottest leads first
+    - Cost: $0.002/lead via Outscraper
+    """
+    job_name = "enrich_stage3_nightly"
+    logger.info(f"[{job_name}] Starting...")
+    t_start = time.monotonic()
+
+    from ..config import settings
+
+    # Load configurable settings
+    batch_limit = int(await _get_admin_setting("enrich_stage3_nightly_limit", ENRICH_STAGE3_LIMIT))
+    min_pain    = int(await _get_admin_setting("enrich_stage3_min_pain", ENRICH_STAGE3_MIN_PAIN))
+    daily_cap   = float(await _get_admin_setting("enrich_stage3_daily_budget_usd", ENRICH_STAGE3_DAILY_BUDGET))
+
+    # Budget Guard
+    allowed, safe_limit, budget_reason = await _budget_guard(
+        "outscraper", OUTSCRAPER_COST_PER_LEAD, batch_limit, daily_cap
+    )
+    if not allowed:
+        logger.warning(f"[{job_name}] Skipped — {budget_reason}")
+        await _log_job(job_name, status="skipped", notes=budget_reason)
+        return {"job": job_name, "status": "skipped", "reason": budget_reason}
+
+    logger.info(f"[{job_name}] {budget_reason}")
+
+    # Verify Outscraper API key
+    api_key = settings.OUTSCRAPER_API_KEY
+    if not api_key:
+        notes = "SKIPPED — OUTSCRAPER_API_KEY not set in environment"
+        logger.warning(f"[{job_name}] {notes}")
+        await _log_job(job_name, status="skipped", notes=notes)
+        return {"job": job_name, "status": "skipped", "reason": notes}
+
+    db = get_db()
+
+    # Fetch eligible leads: Stage 1, pain >= min_pain, ordered by pain DESC
+    leads = (
+        db.table("leads")
+        .select("id, business_name, city, state, website, pain_score, niche_slug")
+        .eq("enrichment_stage", 1)
+        .eq("is_active", True)
+        .gte("pain_score", min_pain)
+        .order("pain_score", desc=True)
+        .limit(safe_limit)
+        .execute()
+        .data or []
+    )
+
+    if not leads:
+        notes = f"no_eligible_leads — stage=1, pain>={min_pain}"
+        await _log_job(job_name, status="success", notes=notes)
+        return {"job": job_name, "status": "success", "leads_found": 0, "reason": notes}
+
+    succeeded = 0
+    failed = 0
+    total_cost = 0.0
+
+    for lead in leads:
+        lead_id = lead["id"]
+        business_name = (lead.get("business_name") or "").strip()
+        city  = (lead.get("city") or "").strip()
+        state = (lead.get("state") or "").strip()
+
+        try:
+            query = f"{business_name} {city} {state}"
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(
+                    "https://api.app.outscraper.com/maps/search-v3",
+                    headers={"X-API-KEY": api_key},
+                    params={"query": query, "limit": 1, "language": "en", "async": "false"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            results_outer = data.get("data", [])
+            place = (results_outer[0][0] if results_outer and results_outer[0] else {})
+
+            update_payload = {
+                "outscraper_place_id":        place.get("place_id"),
+                "outscraper_rating":          float(place["rating"]) if place.get("rating") is not None else None,
+                "outscraper_reviews_count":   int(place["reviews"]) if place.get("reviews") is not None else None,
+                "outscraper_phone":           place.get("phone") or place.get("phone_international"),
+                "outscraper_full_address":    place.get("full_address"),
+                "outscraper_business_status": place.get("business_status"),
+                "outscraper_website":         place.get("site") or place.get("website"),
+                "outscraper_latitude":        float(place["latitude"]) if place.get("latitude") is not None else None,
+                "outscraper_longitude":       float(place["longitude"]) if place.get("longitude") is not None else None,
+                "enrichment_stage": 3,
+                "enriched_at": _now_iso(),
+            }
+
+            db.table("leads").update(update_payload).eq("id", lead_id).execute()
+
+            # Log cost
+            db.table("api_cost_log").insert({
+                "lead_id": lead_id,
+                "service": "outscraper",
+                "cost_per_unit": OUTSCRAPER_COST_PER_LEAD,
+                "records_processed": 1,
+                "source_system": "kjle",
+                "created_at": _now_iso(),
+            }).execute()
+
+            total_cost += OUTSCRAPER_COST_PER_LEAD
+            succeeded += 1
+
+        except Exception as e:
+            failed += 1
+            logger.error(f"[{job_name}] Failed for lead {lead_id}: {e}")
+            # Advance stage to prevent infinite retry
+            try:
+                db.table("leads").update({
+                    "enrichment_stage": 3,
+                    "enriched_at": _now_iso(),
+                }).eq("id", lead_id).execute()
+            except Exception:
+                pass
+
+    duration = time.monotonic() - t_start
+    notes = (
+        f"succeeded={succeeded}, failed={failed}, "
+        f"total_cost=${round(total_cost, 4):.4f}, "
+        f"pain_gate={min_pain}, budget_cap=${daily_cap:.2f}"
+    )
+    status = "partial" if failed > 0 and succeeded > 0 else ("failed" if succeeded == 0 and failed > 0 else "success")
+
+    await _log_job(job_name, leads_processed=succeeded, duration_seconds=duration, status=status, notes=notes)
+
+    result = {
+        "job": job_name,
+        "leads_processed": len(leads),
+        "succeeded": succeeded,
+        "failed": failed,
+        "total_cost_usd": round(total_cost, 4),
+        "duration_seconds": round(duration, 3),
+        "status": status,
+    }
+    logger.info(f"[{job_name}] Done. {result}")
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 7 — Nightly Stage 4 Enrichment (03:00 UTC)
+# Firecrawl deep extraction — pain-gated, budget-guarded
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def job_enrich_stage4_nightly() -> dict:
+    """
+    Nightly Firecrawl deep enrichment job.
+    - Fires at 03:00 UTC (after Stage 3 completes)
+    - Processes Stage 3 leads with pain_score >= enrich_stage4_min_pain (default 75)
+    - Batch size from admin_settings key enrich_stage4_nightly_limit (default 10)
+    - Daily budget cap from admin_settings key enrich_stage4_daily_budget_usd (default $0.05)
+    - Skips entirely if daily budget cap already reached
+    - Orders by pain_score DESC — hottest leads first
+    - Cost: $0.005/lead via Firecrawl
+    """
+    job_name = "enrich_stage4_nightly"
+    logger.info(f"[{job_name}] Starting...")
+    t_start = time.monotonic()
+
+    from ..config import settings
+
+    # Load configurable settings
+    batch_limit = int(await _get_admin_setting("enrich_stage4_nightly_limit", ENRICH_STAGE4_LIMIT))
+    min_pain    = int(await _get_admin_setting("enrich_stage4_min_pain", ENRICH_STAGE4_MIN_PAIN))
+    daily_cap   = float(await _get_admin_setting("enrich_stage4_daily_budget_usd", ENRICH_STAGE4_DAILY_BUDGET))
+
+    # Budget Guard
+    allowed, safe_limit, budget_reason = await _budget_guard(
+        "firecrawl", FIRECRAWL_COST_PER_LEAD, batch_limit, daily_cap
+    )
+    if not allowed:
+        logger.warning(f"[{job_name}] Skipped — {budget_reason}")
+        await _log_job(job_name, status="skipped", notes=budget_reason)
+        return {"job": job_name, "status": "skipped", "reason": budget_reason}
+
+    logger.info(f"[{job_name}] {budget_reason}")
+
+    # Verify Firecrawl API key
+    api_key = settings.FIRECRAWL_API_KEY
+    if not api_key:
+        notes = "SKIPPED — FIRECRAWL_API_KEY not set in environment"
+        logger.warning(f"[{job_name}] {notes}")
+        await _log_job(job_name, status="skipped", notes=notes)
+        return {"job": job_name, "status": "skipped", "reason": notes}
+
+    db = get_db()
+
+    # Fetch eligible leads: Stage 3, pain >= min_pain, ordered by pain DESC
+    leads = (
+        db.table("leads")
+        .select("id, business_name, website, outscraper_website, pain_score, niche_slug")
+        .eq("enrichment_stage", 3)
+        .eq("is_active", True)
+        .gte("pain_score", min_pain)
+        .order("pain_score", desc=True)
+        .limit(safe_limit)
+        .execute()
+        .data or []
+    )
+
+    if not leads:
+        notes = f"no_eligible_leads — stage=3, pain>={min_pain}"
+        await _log_job(job_name, status="success", notes=notes)
+        return {"job": job_name, "status": "success", "leads_found": 0, "reason": notes}
+
+    succeeded = 0
+    failed = 0
+    total_cost = 0.0
+
+    EXTRACT_PROMPT = (
+        "Extract: business owner name, services offered, service areas, "
+        "years in business, any pricing mentioned, unique selling points"
+    )
+
+    for lead in leads:
+        lead_id = lead["id"]
+        website = (lead.get("website") or lead.get("outscraper_website") or "").strip()
+
+        if not website:
+            # No website — advance stage, no cost
+            try:
+                db.table("leads").update({
+                    "enrichment_stage": 4,
+                    "enriched_at": _now_iso(),
+                }).eq("id", lead_id).execute()
+            except Exception:
+                pass
+            continue
+
+        url = website if website.startswith(("http://", "https://")) else f"https://{website}"
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    "https://api.firecrawl.dev/v1/scrape",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "url": url,
+                        "formats": ["markdown", "extract"],
+                        "extract": {"prompt": EXTRACT_PROMPT},
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            fc_data = data.get("data", {}) if data.get("success") else {}
+            raw_md = fc_data.get("markdown") or ""
+            extracted = fc_data.get("extract") or {}
+
+            def _str(keys):
+                for k in keys:
+                    v = extracted.get(k)
+                    if v and isinstance(v, str):
+                        return v.strip()
+                    if v and isinstance(v, list):
+                        return ", ".join(str(i).strip() for i in v if i)
+                return None
+
+            def _csv(keys):
+                for k in keys:
+                    v = extracted.get(k)
+                    if not v:
+                        continue
+                    if isinstance(v, list):
+                        items = [str(i).strip() for i in v if i]
+                        return ", ".join(items) if items else None
+                    if isinstance(v, str):
+                        return v.strip()
+                return None
+
+            update_payload = {
+                "firecrawl_markdown":          raw_md[:5000] if raw_md else None,
+                "firecrawl_owner_name":        _str(["business_owner_name", "owner_name", "owner"]),
+                "firecrawl_services":          _csv(["services_offered", "services", "service_list"]),
+                "firecrawl_service_areas":     _csv(["service_areas", "areas_served", "service_area"]),
+                "firecrawl_years_in_business": _str(["years_in_business", "years_operating", "founded"]),
+                "firecrawl_usp":               _str(["unique_selling_points", "usp", "value_proposition"]),
+                "enrichment_stage": 4,
+                "enriched_at": _now_iso(),
+            }
+
+            db.table("leads").update(update_payload).eq("id", lead_id).execute()
+
+            # Log cost
+            db.table("api_cost_log").insert({
+                "lead_id": lead_id,
+                "service": "firecrawl",
+                "cost_per_unit": FIRECRAWL_COST_PER_LEAD,
+                "records_processed": 1,
+                "source_system": "kjle",
+                "created_at": _now_iso(),
+            }).execute()
+
+            total_cost += FIRECRAWL_COST_PER_LEAD
+            succeeded += 1
+
+        except Exception as e:
+            failed += 1
+            logger.error(f"[{job_name}] Failed for lead {lead_id}: {e}")
+            try:
+                db.table("leads").update({
+                    "enrichment_stage": 4,
+                    "enriched_at": _now_iso(),
+                }).eq("id", lead_id).execute()
+            except Exception:
+                pass
+
+    duration = time.monotonic() - t_start
+    notes = (
+        f"succeeded={succeeded}, failed={failed}, "
+        f"total_cost=${round(total_cost, 4):.4f}, "
+        f"pain_gate={min_pain}, budget_cap=${daily_cap:.2f}"
+    )
+    status = "partial" if failed > 0 and succeeded > 0 else ("failed" if succeeded == 0 and failed > 0 else "success")
+
+    await _log_job(job_name, leads_processed=succeeded, duration_seconds=duration, status=status, notes=notes)
+
+    result = {
+        "job": job_name,
+        "leads_processed": len(leads),
+        "succeeded": succeeded,
+        "failed": failed,
+        "total_cost_usd": round(total_cost, 4),
+        "duration_seconds": round(duration, 3),
+        "status": status,
+    }
+    logger.info(f"[{job_name}] Done. {result}")
+    return result
+
 # ─────────────────────────────────────────────────────────────────────────────
 # JOB DISPATCH MAP — maps name → async callable
 # ─────────────────────────────────────────────────────────────────────────────
 
 JOB_FUNCTIONS = {
-    "classify_segments":   job_classify_segments,
-    "enrich_stage1":       job_enrich_stage1,
-    "cost_digest":         job_cost_digest,
-    "stale_cleanup":       job_stale_cleanup,
-    "email_clean_nightly": job_email_clean_nightly,
+    "classify_segments":    job_classify_segments,
+    "enrich_stage1":        job_enrich_stage1,
+    "cost_digest":          job_cost_digest,
+    "stale_cleanup":        job_stale_cleanup,
+    "email_clean_nightly":  job_email_clean_nightly,
+    "enrich_stage3_nightly": job_enrich_stage3_nightly,
+    "enrich_stage4_nightly": job_enrich_stage4_nightly,
 }
 
 
@@ -730,7 +1171,30 @@ def setup_scheduler() -> AsyncIOScheduler:
         misfire_grace_time=3600,  # 1-hour grace window
     )
 
-    logger.info("⏰ APScheduler configured: 5 jobs registered")
+    # Job 6: enrich_stage3_nightly — daily at 01:00 UTC
+    # Outscraper Google Maps enrichment — pain-gated, budget-guarded
+    scheduler.add_job(
+        job_enrich_stage3_nightly,
+        trigger=CronTrigger(hour=1, minute=0),
+        id="enrich_stage3_nightly",
+        name="Nightly Stage 3 Enrichment (Outscraper)",
+        replace_existing=True,
+        misfire_grace_time=1800,
+    )
+
+    # Job 7: enrich_stage4_nightly — daily at 03:00 UTC
+    # Firecrawl deep extraction — pain-gated, budget-guarded
+    # Runs 2hrs after Stage 3 to allow Stage 3 leads to be classified first
+    scheduler.add_job(
+        job_enrich_stage4_nightly,
+        trigger=CronTrigger(hour=3, minute=0),
+        id="enrich_stage4_nightly",
+        name="Nightly Stage 4 Enrichment (Firecrawl)",
+        replace_existing=True,
+        misfire_grace_time=1800,
+    )
+
+    logger.info("⏰ APScheduler configured: 7 jobs registered")
     return scheduler
 
 
@@ -783,7 +1247,7 @@ async def get_scheduler_status():
 async def run_job_manually(job_name: str):
     """
     Manually trigger a specific scheduled job by name.
-    Valid names: classify_segments, enrich_stage1, cost_digest, stale_cleanup, email_clean_nightly.
+    Valid names: classify_segments, enrich_stage1, cost_digest, stale_cleanup, email_clean_nightly, enrich_stage3_nightly, enrich_stage4_nightly.
     Runs synchronously and returns the job result immediately.
     """
     if job_name not in JOB_FUNCTIONS:
