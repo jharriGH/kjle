@@ -42,18 +42,46 @@ async def list_leads(
         "data_quality_score, email_state, is_active, created_at"
     ).eq("is_active", is_active)
 
-    # Apply filters
-    if niche_slug:          query = query.eq("niche_slug", niche_slug)
-    if state:               query = query.eq("state", state.upper())
-    if city:                query = query.ilike("city", f"%{city}%")
-    if min_pain is not None: query = query.gte("pain_score", min_pain)
-    if max_pain is not None: query = query.lte("pain_score", max_pain)
-    if fit_demoenginez is not None:   query = query.eq("fit_demoenginez", fit_demoenginez)
-    if fit_reputation is not None:    query = query.eq("fit_reputation", fit_reputation)
-    if fit_schema_ranker is not None: query = query.eq("fit_schema_ranker", fit_schema_ranker)
-    if fit_voicedrop is not None:     query = query.eq("fit_voicedrop", fit_voicedrop)
-    if enrichment_stage is not None:  query = query.eq("enrichment_stage", enrichment_stage)
-    if email_state:         query = query.eq("email_state", email_state)
+    count_query = db.table("leads").select("id", count="exact").eq("is_active", is_active)
+
+    # Apply filters to both queries
+    if niche_slug:
+        query = query.eq("niche_slug", niche_slug)
+        count_query = count_query.eq("niche_slug", niche_slug)
+    if state:
+        query = query.eq("state", state.upper())
+        count_query = count_query.eq("state", state.upper())
+    if city:
+        query = query.ilike("city", f"%{city}%")
+        count_query = count_query.ilike("city", f"%{city}%")
+    if min_pain is not None:
+        query = query.gte("pain_score", min_pain)
+        count_query = count_query.gte("pain_score", min_pain)
+    if max_pain is not None:
+        query = query.lte("pain_score", max_pain)
+        count_query = count_query.lte("pain_score", max_pain)
+    if fit_demoenginez is not None:
+        query = query.eq("fit_demoenginez", fit_demoenginez)
+        count_query = count_query.eq("fit_demoenginez", fit_demoenginez)
+    if fit_reputation is not None:
+        query = query.eq("fit_reputation", fit_reputation)
+        count_query = count_query.eq("fit_reputation", fit_reputation)
+    if fit_schema_ranker is not None:
+        query = query.eq("fit_schema_ranker", fit_schema_ranker)
+        count_query = count_query.eq("fit_schema_ranker", fit_schema_ranker)
+    if fit_voicedrop is not None:
+        query = query.eq("fit_voicedrop", fit_voicedrop)
+        count_query = count_query.eq("fit_voicedrop", fit_voicedrop)
+    if enrichment_stage is not None:
+        query = query.eq("enrichment_stage", enrichment_stage)
+        count_query = count_query.eq("enrichment_stage", enrichment_stage)
+    if email_state:
+        query = query.eq("email_state", email_state)
+        count_query = count_query.eq("email_state", email_state)
+
+    # Get total count
+    count_result = count_query.execute()
+    total = count_result.count if count_result.count is not None else 0
 
     # Ordering + pagination
     query = query.order(order_by, desc=(order_dir == "desc"))
@@ -64,6 +92,7 @@ async def list_leads(
     return {
         "page":      page,
         "page_size": page_size,
+        "total":     total,
         "count":     len(result.data),
         "leads":     result.data,
     }
