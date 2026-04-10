@@ -87,7 +87,7 @@ async def call_kjle_api(method: str, path: str, params: dict = None) -> dict:
     """Helper to call KJLE API internally."""
     url = f"{KJLE_BASE}{path}"
     headers = {"x-api-key": KJLE_KEY}
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         if method.upper() == "GET":
             r = await client.get(url, headers=headers, params=params or {})
         else:
@@ -201,6 +201,7 @@ async def commander_chat(body: ChatRequest):
 
     except Exception as e:
         logger.warning(f"[Commander] Data fetch error: {e}")
+        context_data["note"] = "Some live data unavailable — API may be busy processing. Responding with available information."
 
     # Build enhanced message with real data
     enhanced_message = body.message
