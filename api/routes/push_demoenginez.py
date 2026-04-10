@@ -31,7 +31,7 @@ router = APIRouter()
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEMOENGINEZ_TABLE = "leads"          # public schema — DemoEnginez target table
+DEMOENGINEZ_TABLE = "demos"          # public schema — DemoEnginez target table
 KJLE_TABLE        = "kjle.leads"     # kjle schema — KJLE source table (schema-prefixed)
 PUSH_SOURCE       = "kjle"
 PUSH_STATUS       = "new"
@@ -89,17 +89,22 @@ def _map_lead_to_de(lead: dict) -> dict:
     Maps a KJLE lead dict to DemoEnginez leads table format.
     Normalizes niche_slug → niche (DemoEnginez uses 'niche' column).
     """
+    pain = lead.get("pain_score") or 0
     return {
         "business_name": lead.get("business_name") or "",
         "phone":         lead.get("phone") or "",
         "email":         lead.get("email") or "",
         "website":       lead.get("website") or "",
+        "address":       lead.get("address") or "",
         "city":          lead.get("city") or "",
-        "state":         lead.get("state") or "",
-        "niche":         lead.get("niche_slug") or "",   # KJLE uses niche_slug
-        "pain_score":    lead.get("pain_score") or 0,
+        "region":        lead.get("state") or "",
+        "zip":           lead.get("zip") or "",
+        "niche":         lead.get("niche_slug") or "",
         "source":        PUSH_SOURCE,
-        "status":        PUSH_STATUS,
+        "hot_lead":      pain >= 70,
+        "viewed":        False,
+        "converted":     False,
+        "outreach_sent": False,
         "created_at":    _now_iso(),
     }
 
