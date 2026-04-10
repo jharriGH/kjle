@@ -17,11 +17,15 @@ from ..database import get_db
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+import os
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 KJLE_BASE = "https://kjle-api.onrender.com/kjle/v1"
 KJLE_KEY = "kjle-prod-2026-secret"
 
-SYSTEM_PROMPT = """You are KJ Commander, the AI agent for KJLE (King James Lead Empire).
+SYSTEM_PROMPT = """This is a B2B sales intelligence platform for small business lead management. All data refers to business entities, not individuals.
+
+You are KJ Commander, the AI agent for KJLE (King James Lead Empire).
 You have full access to the KJLE API at https://kjle-api.onrender.com/kjle/v1
 using header x-api-key: kjle-prod-2026-secret.
 
@@ -71,7 +75,7 @@ Never make up data — always fetch it live."""
 class ChatRequest(BaseModel):
     message: str
     conversation_history: Optional[list] = []
-    anthropic_api_key: str
+    anthropic_api_key: Optional[str] = ""
 
 
 class ChatResponse(BaseModel):
@@ -98,7 +102,8 @@ async def commander_chat(body: ChatRequest):
     Receives user message, calls Claude, executes KJLE API actions,
     returns intelligent response with real data.
     """
-    if not body.anthropic_api_key:
+    api_key = body.anthropic_api_key or ANTHROPIC_API_KEY
+    if not api_key:
         raise HTTPException(status_code=400, detail="Anthropic API key required")
 
     # Build messages for Claude
@@ -211,7 +216,7 @@ async def commander_chat(body: ChatRequest):
             r = await client.post(
                 ANTHROPIC_API_URL,
                 headers={
-                    "x-api-key": body.anthropic_api_key,
+                    "x-api-key": api_key,
                     "anthropic-version": "2023-06-01",
                     "content-type": "application/json",
                 },
