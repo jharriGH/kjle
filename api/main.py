@@ -39,7 +39,6 @@ from .routes import push_voicedrop
 from .routes import webhooks
 from .routes import scheduler
 from .routes import admin_settings
-from .routes import commander
 from .routes.scheduler import setup_scheduler
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -140,4 +139,3 @@ app.include_router(push_voicedrop.router,         prefix=PREFIX,                
 app.include_router(webhooks.router,               prefix=PREFIX,                  tags=["Webhooks"])
 app.include_router(scheduler.router,              prefix=PREFIX,                  tags=["Scheduler"])
 app.include_router(admin_settings.router,         prefix=PREFIX,                  tags=["Admin Settings"])
-app.include_router(commander.router,              prefix=PREFIX,                  tags=["KJ Commander"])
