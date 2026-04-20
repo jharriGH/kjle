@@ -39,6 +39,8 @@ from .routes import push_voicedrop
 from .routes import webhooks
 from .routes import scheduler
 from .routes import admin_settings
+from .routes import commander
+from .routes import reachinbox
 from .routes.scheduler import setup_scheduler
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -78,7 +80,7 @@ async def lifespan(app: FastAPI):
 
     _scheduler = setup_scheduler()
     _scheduler.start()
-    logger.info("   Scheduler     : ⏰ APScheduler started (5 jobs active)")
+    logger.info(f"   Scheduler     : ⏰ APScheduler started ({len(_scheduler.get_jobs())} jobs active)")
 
     yield
 
@@ -138,4 +140,6 @@ app.include_router(push_demoenginez.router,       prefix=PREFIX,                
 app.include_router(push_voicedrop.router,         prefix=PREFIX,                  tags=["Push — VoiceDrop"])
 app.include_router(webhooks.router,               prefix=PREFIX,                  tags=["Webhooks"])
 app.include_router(scheduler.router,              prefix=PREFIX,                  tags=["Scheduler"])
+app.include_router(commander.router,              prefix=PREFIX,                  tags=["Commander"])
+app.include_router(reachinbox.router,             prefix=PREFIX,                  tags=["ReachInbox"])
 app.include_router(admin_settings.router,         prefix=PREFIX,                  tags=["Admin Settings"])

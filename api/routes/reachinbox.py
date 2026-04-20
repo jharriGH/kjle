@@ -25,11 +25,14 @@ from ..config import settings
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-RI_BASE    = "https://api.reachinbox.ai/api/v1"
-RI_HEADERS = {
-    "Authorization": f"Bearer {settings.REACHINBOX_API_KEY}",
-    "Content-Type":  "application/json",
-}
+RI_BASE = "https://api.reachinbox.ai/api/v1"
+
+
+def _ri_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {settings.REACHINBOX_API_KEY}",
+        "Content-Type":  "application/json",
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -114,21 +117,21 @@ class AddLeadsRequest(BaseModel):
 
 async def ri_get(path: str, params: dict = None) -> dict:
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(f"{RI_BASE}{path}", headers=RI_HEADERS, params=params or {})
+        r = await client.get(f"{RI_BASE}{path}", headers=_ri_headers(), params=params or {})
         if r.status_code != 200:
             raise HTTPException(status_code=r.status_code, detail=f"ReachInbox error: {r.text[:200]}")
         return r.json()
 
 async def ri_post(path: str, body: dict) -> dict:
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(f"{RI_BASE}{path}", headers=RI_HEADERS, json=body)
+        r = await client.post(f"{RI_BASE}{path}", headers=_ri_headers(), json=body)
         if r.status_code not in [200, 201]:
             raise HTTPException(status_code=r.status_code, detail=f"ReachInbox error: {r.text[:200]}")
         return r.json()
 
 async def ri_put(path: str, body: dict) -> dict:
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.put(f"{RI_BASE}{path}", headers=RI_HEADERS, json=body)
+        r = await client.put(f"{RI_BASE}{path}", headers=_ri_headers(), json=body)
         if r.status_code not in [200, 201]:
             raise HTTPException(status_code=r.status_code, detail=f"ReachInbox error: {r.text[:200]}")
         return r.json()

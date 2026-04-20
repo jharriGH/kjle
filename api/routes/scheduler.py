@@ -40,8 +40,6 @@ router = APIRouter()
 # ─────────────────────────────────────────────────────────────────────────────
 
 SCHEDULER_LOG_TABLE  = "scheduler_log"
-CLASSIFY_LIMIT       = 10_000
-ENRICH_STAGE1_LIMIT  = 200      # bumped from 50 — configurable via admin_settings key enrich_stage1_limit
 ENRICH_MIN_PAIN      = 0        # Stage 1 is free — run on all leads with websites
 STALE_DAYS           = 180
 STALE_MAX_PAIN       = 30
@@ -72,7 +70,7 @@ JOB_DEFINITIONS = {
         "trigger":     "interval",
     },
     "enrich_stage1": {
-        "description": "Auto-enrich up to 50 unenriched leads (stage 0, pain >= 50) with Stage 1 free enrichment",
+        "description": "Auto-enrich unenriched Stage 0 leads via free website scrape — batch size tunable via admin_settings.enrich_batch_size (default 1000)",
         "schedule":    "Every 12 hours",
         "trigger":     "interval",
     },
@@ -87,7 +85,7 @@ JOB_DEFINITIONS = {
         "trigger":     "cron",
     },
     "email_clean_nightly": {
-        "description": "Nightly Truelist email validation — up to 16,800 leads/night at 1.5s/email (midnight–7am UTC)",
+        "description": "Nightly Truelist email validation — up to 2,500 leads/night at 1.5s/email (midnight UTC)",
         "schedule":    "Daily at 00:00 UTC",
         "trigger":     "cron",
     },
@@ -175,11 +173,13 @@ async def job_classify_segments() -> dict:
     counts = {"hot": 0, "warm": 0, "cold": 0}
     failed = 0
 
+    classify_limit = int(await _get_admin_setting("classify_batch_size", 100_000))
+
     leads = (
         db.table("leads")
         .select("id, pain_score, fit_demoenginez, enrichment_stage, website_reachable")
         .eq("is_active", True)
-        .limit(CLASSIFY_LIMIT)
+        .limit(classify_limit)
         .execute()
         .data or []
     )
@@ -240,6 +240,8 @@ async def job_enrich_stage1() -> dict:
 
     db = get_db()
 
+    stage1_limit = int(await _get_admin_setting("enrich_batch_size", 1000))
+
     leads = (
         db.table("leads")
         .select("id, website, business_name, pain_score")
@@ -249,7 +251,7 @@ async def job_enrich_stage1() -> dict:
         .not_.is_("website", "null")
         .neq("website", "")
         .order("pain_score", desc=True)
-        .limit(ENRICH_STAGE1_LIMIT)
+        .limit(stage1_limit)
         .execute()
         .data or []
     )
