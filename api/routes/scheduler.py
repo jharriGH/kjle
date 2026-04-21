@@ -64,6 +64,20 @@ EMAIL_CLEAN_TRUELIST_URL   = "https://api.truelist.io/api/v1/verify_inline"
 EMAIL_CLEAN_MAX_RETRIES    = 3
 EMAIL_CLEAN_RETRY_BACKOFF  = 3.0    # seconds to wait on 429
 
+# ── Campaign sync targets (config-driven) ──
+# Each entry describes one (project, server) pair to sync hourly from ReachInbox.
+# Adding a new project or server = append one dict. No logic changes required.
+CAMPAIGN_SYNC_TARGETS = [
+    {
+        "project":           "kjle",
+        "reachinbox_server": "server_1",
+        "api_base":          "https://api.reachinbox.ai/api/v1",
+        "api_key_attr":      "REACHINBOX_API_KEY",   # settings attribute name
+        "statuses_to_sync":  ["active", "paused"],
+    },
+]
+
+
 JOB_DEFINITIONS = {
     "classify_segments": {
         "description": "Auto-classify all active leads into hot/warm/cold segments",
@@ -104,6 +118,11 @@ JOB_DEFINITIONS = {
         "description": "Daily cost + lead-pipeline digest emailed via Resend (rolling 24h)",
         "schedule":    "Daily at 16:00 UTC (09:00 PDT / 08:00 PST)",
         "trigger":     "cron",
+    },
+    "campaign_sync_hourly": {
+        "description": "Hourly campaign stats sync from ReachInbox — project/server-scoped via CAMPAIGN_SYNC_TARGETS",
+        "schedule":    "Every 60 minutes",
+        "trigger":     "interval",
     },
 }
 
@@ -160,6 +179,22 @@ def _safe_int(val, default=0) -> int:
         return int(val) if val is not None else default
     except (TypeError, ValueError):
         return default
+
+
+def _map_ri_status(ri_status: Optional[str]) -> Optional[str]:
+    """Map ReachInbox status strings to our lowercase canonical values."""
+    if not ri_status:
+        return None
+    mapping = {
+        "draft":     "draft",
+        "active":    "active",
+        "running":   "active",
+        "paused":    "paused",
+        "stopped":   "paused",
+        "completed": "completed",
+        "archived":  "archived",
+    }
+    return mapping.get(ri_status.strip().lower())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1231,6 +1266,134 @@ async def job_daily_cost_report() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Job 9 — Hourly Campaign Stats Sync (every 60 minutes)
+# Pulls RI campaign stats for configured (project, server) pairs — see
+# CAMPAIGN_SYNC_TARGETS at top of file. Adding a new project = 1 dict entry.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def job_campaign_sync_hourly() -> dict:
+    """
+    Hourly campaign_performance sync.
+
+    For each target in CAMPAIGN_SYNC_TARGETS:
+      - SELECT rows matching (project, reachinbox_server, status IN statuses_to_sync)
+      - GET {api_base}/campaigns/{id}/status for each row
+      - Update sent/opened/replied/bounced/unsubscribed + status + last_synced_at
+
+    Config-driven; no code changes needed to add projects/servers.
+    Non-blocking on per-campaign failure (logs and continues).
+    """
+    job_name = "campaign_sync_hourly"
+    logger.info(f"[{job_name}] Starting...")
+    t_start = time.monotonic()
+
+    from ..config import settings
+
+    db = get_db()
+    total_synced = 0
+    total_failed = 0
+    per_target = []
+
+    for tgt in CAMPAIGN_SYNC_TARGETS:
+        project  = tgt["project"]
+        server   = tgt["reachinbox_server"]
+        api_base = tgt["api_base"]
+        api_key  = getattr(settings, tgt["api_key_attr"], "") or ""
+        statuses = tgt["statuses_to_sync"]
+
+        if not api_key:
+            reason = f"no API key for settings.{tgt['api_key_attr']}"
+            logger.warning(f"[{job_name}] target {project}/{server} skipped — {reason}")
+            per_target.append({
+                "project": project, "server": server, "candidates": 0,
+                "synced": 0, "failed": 0, "skipped": reason,
+            })
+            continue
+
+        try:
+            rows = (
+                db.table("campaign_performance")
+                .select("id, reachinbox_campaign_id")
+                .eq("project", project)
+                .eq("reachinbox_server", server)
+                .in_("status", statuses)
+                .not_.is_("reachinbox_campaign_id", "null")
+                .execute().data or []
+            )
+        except Exception as e:
+            logger.error(f"[{job_name}] {project}/{server} fetch failed: {e}")
+            per_target.append({
+                "project": project, "server": server, "candidates": 0,
+                "synced": 0, "failed": 0, "error": str(e)[:200],
+            })
+            continue
+
+        synced = 0
+        failed = 0
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for row in rows:
+                cid = row["reachinbox_campaign_id"]
+                try:
+                    r = await client.get(f"{api_base}/campaigns/{cid}/status", headers=headers)
+                    if r.status_code != 200:
+                        failed += 1
+                        logger.warning(f"[{job_name}] {project}/{server} campaign {cid} HTTP {r.status_code}")
+                        continue
+                    data = (r.json() or {}).get("data") or {}
+                    update_payload = {
+                        "sent_count":         _safe_int(data.get("totalEmailSent")),
+                        "opened_count":       _safe_int(data.get("totalUniqueEmailOpened")),
+                        "replied_count":      _safe_int(data.get("totalEmailReplied")),
+                        "bounced_count":      _safe_int(data.get("totalBounces")),
+                        "unsubscribed_count": _safe_int(data.get("totalUnsubscribes")),
+                        "last_synced_at":     _now_iso(),
+                    }
+                    mapped = _map_ri_status(data.get("status"))
+                    if mapped:
+                        update_payload["status"] = mapped
+                    db.table("campaign_performance").update(update_payload).eq("id", row["id"]).execute()
+                    synced += 1
+                except Exception as e:
+                    failed += 1
+                    logger.error(f"[{job_name}] {project}/{server} campaign {cid} error: {e}")
+
+        total_synced += synced
+        total_failed += failed
+        per_target.append({
+            "project": project, "server": server,
+            "candidates": len(rows), "synced": synced, "failed": failed,
+        })
+
+    duration = time.monotonic() - t_start
+    notes = f"synced={total_synced}, failed={total_failed}, targets={len(CAMPAIGN_SYNC_TARGETS)}"
+    status = (
+        "partial" if total_failed > 0 and total_synced > 0
+        else ("failed" if total_failed > 0 and total_synced == 0 else "success")
+    )
+
+    await _log_job(
+        job_name,
+        leads_processed=total_synced,
+        duration_seconds=duration,
+        status=status,
+        notes=notes,
+    )
+
+    result = {
+        "job":              job_name,
+        "synced":           total_synced,
+        "failed":           total_failed,
+        "per_target":       per_target,
+        "duration_seconds": round(duration, 3),
+        "status":           status,
+    }
+    logger.info(f"[{job_name}] Done. {result}")
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # JOB DISPATCH MAP — maps name → async callable
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1243,6 +1406,7 @@ JOB_FUNCTIONS = {
     "enrich_stage3_nightly": job_enrich_stage3_nightly,
     "enrich_stage4_nightly": job_enrich_stage4_nightly,
     "daily_cost_report":    job_daily_cost_report,
+    "campaign_sync_hourly": job_campaign_sync_hourly,
 }
 
 
@@ -1343,7 +1507,18 @@ def setup_scheduler() -> AsyncIOScheduler:
         misfire_grace_time=1800,
     )
 
-    logger.info("⏰ APScheduler configured: 8 jobs registered")
+    # Job 9: campaign_sync_hourly — every 60 minutes
+    # Pulls campaign stats from RI for configured (project, server) pairs
+    scheduler.add_job(
+        job_campaign_sync_hourly,
+        trigger=IntervalTrigger(minutes=60),
+        id="campaign_sync_hourly",
+        name="Hourly Campaign Stats Sync",
+        replace_existing=True,
+        misfire_grace_time=600,
+    )
+
+    logger.info(f"⏰ APScheduler configured: {len(scheduler.get_jobs())} jobs registered")
     return scheduler
 
 

@@ -39,16 +39,36 @@ logger = logging.getLogger(__name__)
 
 def get_kjle_campaign_activity_summary(since_utc: datetime) -> List[Dict]:
     """
-    Return per-campaign activity rollup since `since_utc`.
-    Returns [] gracefully if the campaign_performance table does not exist
-    or any query error occurs — callers render "(no campaign data yet)".
+    Return per-campaign activity rollup since `since_utc` for project='kjle'.
+
+    Implementation reads from the `campaign_performance` table (project-aware,
+    multi-server). Schema column names differ from the contract shape — this
+    function maps them. The function signature + return shape are load-bearing
+    for daily_report.py — do not change.
+
+    Column mapping (campaign_performance → contract):
+        reachinbox_campaign_id → campaign_id
+        campaign_name          → campaign_name
+        sent_count             → sent
+        opened_count           → opened
+        replied_count          → replied
+        demo_booked_count      → booked
+
+    Scope: project='kjle' only (telehealth/other projects excluded from KJE digest).
+    Activity filter: updated_at >= since_utc AND sent_count > 0.
+    Returns [] gracefully on any DB/table error.
     """
     try:
         db = get_db()
         res = (
             db.table("campaign_performance")
-            .select("campaign_id, campaign_name, sent, opened, replied, booked")
-            .gte("recorded_at", since_utc.isoformat())
+            .select(
+                "reachinbox_campaign_id, campaign_name, "
+                "sent_count, opened_count, replied_count, demo_booked_count"
+            )
+            .eq("project", "kjle")
+            .gte("updated_at", since_utc.isoformat())
+            .gt("sent_count", 0)
             .execute()
         )
         rows = res.data or []
@@ -57,23 +77,15 @@ def get_kjle_campaign_activity_summary(since_utc: datetime) -> List[Dict]:
         logger.info(f"campaign_activity: summary unavailable ({e}); returning empty list")
         return []
 
-    # Aggregate by campaign_id across the window (multiple snapshots may exist).
-    bucket: Dict[str, Dict] = {}
+    out: List[Dict] = []
     for r in rows:
-        cid = r.get("campaign_id")
-        if not cid:
-            continue
-        b = bucket.setdefault(cid, {
+        cid = r.get("reachinbox_campaign_id") or ""
+        out.append({
             "campaign_id":   cid,
-            "campaign_name": r.get("campaign_name") or cid,
-            "sent":   0,
-            "opened": 0,
-            "replied": 0,
-            "booked": 0,
+            "campaign_name": r.get("campaign_name") or cid or "(unnamed)",
+            "sent":          int(r.get("sent_count")        or 0),
+            "opened":        int(r.get("opened_count")      or 0),
+            "replied":       int(r.get("replied_count")     or 0),
+            "booked":        int(r.get("demo_booked_count") or 0),
         })
-        for k in ("sent", "opened", "replied", "booked"):
-            v = r.get(k)
-            if isinstance(v, (int, float)):
-                b[k] += int(v)
-
-    return sorted(bucket.values(), key=lambda x: x["sent"], reverse=True)
+    return sorted(out, key=lambda x: x["sent"], reverse=True)

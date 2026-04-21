@@ -41,6 +41,7 @@ from .routes import scheduler
 from .routes import admin_settings
 from .routes import commander
 from .routes import reachinbox
+from .routes import campaigns
 from .routes.scheduler import setup_scheduler
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -143,3 +144,4 @@ app.include_router(scheduler.router,              prefix=PREFIX,                
 app.include_router(commander.router,              prefix=PREFIX,                  tags=["Commander"])
 app.include_router(reachinbox.router,             prefix=PREFIX,                  tags=["ReachInbox"])
 app.include_router(admin_settings.router,         prefix=PREFIX,                  tags=["Admin Settings"])
+app.include_router(campaigns.router,              prefix=PREFIX,                  tags=["Campaign Performance"])

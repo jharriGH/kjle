@@ -106,6 +106,10 @@ class CreateCampaignRequest(BaseModel):
     # Auto-launch after creation
     auto_launch: bool = False
 
+    # Auto-register metadata (consumed by campaign_performance tracking)
+    domain_used: Optional[str] = None
+    offer_type: Optional[str]  = None
+
 class AddLeadsRequest(BaseModel):
     campaign_id:   int
     lead_filter:   CampaignLeadFilter
@@ -387,6 +391,24 @@ async def create_full_campaign(body: CreateCampaignRequest):
         if body.auto_launch and body.account_ids:
             await ri_post("/campaigns/start", {"campaignId": campaign_id})
             steps_completed.append("🚀 Campaign launched!")
+
+        # ── Step 8: Auto-register in campaign_performance (non-fatal) ────────
+        try:
+            from .campaigns import _auto_register_from_ri_create
+            launched = bool(body.auto_launch and body.account_ids)
+            await _auto_register_from_ri_create(
+                ri_campaign_id = str(campaign_id),
+                campaign_name  = body.name,
+                niche          = body.lead_filter.niche_slug,
+                domain_used    = body.domain_used,
+                offer_type     = body.offer_type,
+                leads_count    = leads_added,
+                launched       = launched,
+            )
+            steps_completed.append("📊 Registered in campaign_performance")
+        except Exception as e:
+            logger.warning(f"[auto-register] non-fatal (campaign_id={campaign_id}): {e}")
+            steps_completed.append(f"⚠️ auto-register skipped: {str(e)[:100]}")
 
         return {
             "status":          "success",
