@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 from ..database import get_db
+from ..lib import cost_guard
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -211,6 +212,24 @@ async def commander_chat(body: ChatRequest):
     # Update messages with enhanced content
     messages[-1]["content"] = enhanced_message
 
+    # ── Hard budget guard ────────────────────────────────────────────────────
+    # Estimate an upper bound for the call (1024 max_tokens output + 2K input ~= $0.018).
+    # If the guard trips, return an honest error instead of silently retrying.
+    estimated_cost = cost_guard.anthropic_cost(2000, 1024)
+    if not await cost_guard.check_budget(
+        service="anthropic",
+        estimated_cost_usd=estimated_cost,
+        job_name="commander_chat",
+        leads_affected=0,
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "This request was blocked by the daily budget guard. "
+                "Please try again tomorrow or ask an admin to review the cap."
+            ),
+        )
+
     # Call Claude API
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -234,6 +253,23 @@ async def commander_chat(body: ChatRequest):
             raise HTTPException(status_code=500, detail=f"Claude API error: {data}")
 
         response_text = data["content"][0]["text"]
+
+        # Log actual cost from response usage tokens (not estimate)
+        usage = data.get("usage") or {}
+        in_tok  = int(usage.get("input_tokens")  or 0)
+        out_tok = int(usage.get("output_tokens") or 0)
+        await cost_guard.log_cost(
+            stage="commander",
+            service="anthropic",
+            cost_usd=cost_guard.anthropic_cost(in_tok, out_tok),
+            tokens_used=in_tok + out_tok,
+            metadata={
+                "model": "claude-sonnet-4-20250514",
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+                "actions_taken": actions_taken,
+            },
+        )
 
         return {
             "response": response_text,

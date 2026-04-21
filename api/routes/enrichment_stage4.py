@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 from ..database import get_db
 from ..config import settings
+from ..lib import cost_guard
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,19 @@ async def _fetch_firecrawl(website: str) -> dict:
 
     if not website:
         logger.info("No website URL — skipping Firecrawl call")
+        return empty
+
+    # ── Hard budget guard ────────────────────────────────────────────────────
+    # Firecrawl is a flat per-scrape charge — $0.005 reference rate is
+    # conservative-low; tunable via a future admin_setting if billing data
+    # suggests adjusting.
+    if not await cost_guard.check_budget(
+        service="firecrawl",
+        estimated_cost_usd=cost_guard.FIRECRAWL_COST_PER_SCRAPE,
+        job_name="enrich_stage4_manual",
+        leads_affected=1,
+    ):
+        logger.warning("Firecrawl call blocked by budget guard")
         return empty
 
     url = website if website.startswith(("http://", "https://")) else f"https://{website}"
@@ -226,8 +240,22 @@ async def _run_stage4(lead: dict) -> dict:
 
     firecrawl_data = await _fetch_firecrawl(website)
 
-    # Log cost — charged per call regardless of result quality
+    # Log cost — charged per call regardless of result quality.
+    # Legacy api_cost_log insert (fixed $0.005) kept for existing readers.
     await _log_cost(lead_id)
+
+    # New hard-cap ledger: only log if we actually attempted a scrape
+    # (skip when firecrawl was blocked or no website was provided).
+    if firecrawl_data.get("firecrawl_markdown") is not None \
+       or firecrawl_data.get("firecrawl_owner_name") is not None:
+        await cost_guard.log_cost(
+            stage="stage4",
+            service="firecrawl",
+            cost_usd=cost_guard.FIRECRAWL_COST_PER_SCRAPE,
+            lead_id=lead_id,
+            items_fetched=1,
+            metadata={"entry_point": "enrich_stage4_manual"},
+        )
 
     return {
         **firecrawl_data,

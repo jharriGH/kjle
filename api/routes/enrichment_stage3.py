@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from ..database import get_db
 from ..config import settings
+from ..lib import cost_guard
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,20 @@ async def _fetch_outscraper(business_name: str, city: str, state: str) -> dict:
 
     if not business_name or not city or not state:
         logger.info("Missing business_name/city/state — skipping Outscraper call")
+        return empty
+
+    # ── Hard budget guard ────────────────────────────────────────────────────
+    # Outscraper bills per review returned; we estimate an upper-bound cost
+    # for the pre-call check. 50 reviews * $0.003 = $0.15 — generous ceiling
+    # so a single call is almost never blocked in isolation, but caps still
+    # kick in under volume.
+    if not await cost_guard.check_budget(
+        service="outscraper",
+        estimated_cost_usd=50 * cost_guard.OUTSCRAPER_COST_PER_REVIEW,
+        job_name="enrich_stage3_manual",
+        leads_affected=1,
+    ):
+        logger.warning("Outscraper call blocked by budget guard")
         return empty
 
     query = f"{business_name} {city} {state}"
@@ -182,8 +197,20 @@ async def _run_stage3(lead: dict) -> dict:
 
     outscraper_data = await _fetch_outscraper(business_name, city, state)
 
-    # Always log cost — we paid for the API call regardless of result
+    # Always log cost — we paid for the API call regardless of result.
+    # Legacy api_cost_log insert (fixed $0.002) kept for existing readers.
     await _log_cost(lead_id)
+
+    # New hard-cap ledger: log actual review-based cost to enrichment_cost_log.
+    review_count = outscraper_data.get("outscraper_reviews_count") or 0
+    await cost_guard.log_cost(
+        stage="stage3",
+        service="outscraper",
+        cost_usd=cost_guard.outscraper_cost(review_count),
+        lead_id=lead_id,
+        items_fetched=review_count,
+        metadata={"entry_point": "enrich_stage3_manual"},
+    )
 
     return {
         **outscraper_data,

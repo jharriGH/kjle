@@ -19,6 +19,12 @@ from fastapi import APIRouter, HTTPException, Header, Query
 from pydantic import BaseModel
 from supabase import create_client, Client
 
+from ..lib.cost_guard import (
+    SERVICE_TO_CAP_KEY,
+    TOTAL_CAP_KEY,
+    MONTHLY_CAP_KEY,
+)
+
 logger = logging.getLogger(__name__)
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
@@ -78,6 +84,105 @@ class GuardrailCreate(BaseModel):
 # ─────────────────────────────────────────────────
 # GET /kjle/v1/budget/summary
 # ─────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────
+# GET /kjle/v1/budget/today — hard-cap dashboard
+# Reads enrichment_cost_log + budget_halt_log (new tables).
+# ─────────────────────────────────────────────────
+
+def _today_start_utc_iso() -> str:
+    now = datetime.now(timezone.utc)
+    return datetime(now.year, now.month, now.day, tzinfo=timezone.utc).isoformat()
+
+
+@router.get("/budget/today")
+async def budget_today(x_api_key: str = Header(...)):
+    verify_api_key(x_api_key)
+    supabase = get_supabase()
+    today_start = _today_start_utc_iso()
+
+    try:
+        # Caps (live from admin_settings)
+        settings_rows = supabase.table("admin_settings").select("key, value").in_(
+            "key",
+            list(SERVICE_TO_CAP_KEY.values()) + [TOTAL_CAP_KEY, MONTHLY_CAP_KEY],
+        ).execute().data or []
+        caps = {row["key"]: _safe_float(row.get("value")) for row in settings_rows}
+
+        total_cap = caps.get(TOTAL_CAP_KEY, 0.0)
+
+        # Today's costs
+        cost_rows = supabase.table("enrichment_cost_log").select(
+            "service, stage, cost_usd, lead_id"
+        ).gte("occurred_at", today_start).execute().data or []
+
+        spent_by_service: dict = {}
+        spent_by_stage:   dict = {}
+        leads_by_stage:   dict = {}
+
+        for r in cost_rows:
+            svc = r.get("service") or "unknown"
+            stg = r.get("stage") or "unknown"
+            c   = _safe_float(r.get("cost_usd"))
+            spent_by_service[svc] = spent_by_service.get(svc, 0.0) + c
+            spent_by_stage[stg]   = spent_by_stage.get(stg, 0.0)   + c
+            if r.get("lead_id"):
+                leads_by_stage.setdefault(stg, set()).add(r["lead_id"])
+
+        total_spent = round(sum(spent_by_service.values()), 6)
+        pct_used = round((total_spent / total_cap * 100), 1) if total_cap > 0 else None
+
+        by_service = []
+        for svc, cap_key in SERVICE_TO_CAP_KEY.items():
+            svc_cap = caps.get(cap_key, 0.0)
+            svc_spent = round(spent_by_service.get(svc, 0.0), 6)
+            by_service.append({
+                "service":   svc,
+                "spent":     svc_spent,
+                "cap":       svc_cap,
+                "remaining": round(max(svc_cap - svc_spent, 0.0), 6),
+            })
+
+        by_stage = []
+        for stg, spent in sorted(spent_by_stage.items(), key=lambda x: x[1], reverse=True):
+            lead_count = len(leads_by_stage.get(stg, set()))
+            cpl = round(spent / lead_count, 6) if lead_count else 0.0
+            by_stage.append({
+                "stage":            stg,
+                "spent":            round(spent, 6),
+                "leads_processed":  lead_count,
+                "cost_per_lead":    cpl,
+            })
+
+        # Today's halt events
+        halt_rows = supabase.table("budget_halt_log").select(
+            "occurred_at, service, metadata, leads_affected, current_daily_spend_usd, cap_value_usd"
+        ).gte("occurred_at", today_start).order("occurred_at", desc=True).execute().data or []
+
+        halt_events = [{
+            "time":             h.get("occurred_at"),
+            "service":          h.get("service"),
+            "reason":           (h.get("metadata") or {}).get("breach", "cap_exceeded"),
+            "leads_affected":   h.get("leads_affected"),
+            "current_spend":    _safe_float(h.get("current_daily_spend_usd")),
+            "cap":              _safe_float(h.get("cap_value_usd")),
+        } for h in halt_rows]
+
+        return {
+            "date":              date.today().isoformat(),
+            "total_spent_usd":   total_spent,
+            "total_cap_usd":     total_cap,
+            "remaining_usd":     round(max(total_cap - total_spent, 0.0), 6),
+            "pct_used":          pct_used,
+            "by_service":        by_service,
+            "by_stage":          by_stage,
+            "halt_events_today": halt_events,
+        }
+
+    except Exception as e:
+        logger.error(f"budget_today error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/budget/summary")
 async def budget_summary(x_api_key: str = Header(...)):

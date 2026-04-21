@@ -27,6 +27,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import APIRouter, HTTPException, Query
 
 from ..database import get_db
+from ..lib import cost_guard
 from .segments_engine import _classify_lead
 from .enrichment import _fetch_and_parse
 from .webhooks import fire_event
@@ -97,6 +98,11 @@ JOB_DEFINITIONS = {
     "enrich_stage4_nightly": {
         "description": "Nightly Firecrawl deep enrichment — Stage 3 leads, pain >= 75, budget-guarded",
         "schedule":    "Daily at 03:00 UTC",
+        "trigger":     "cron",
+    },
+    "daily_cost_report": {
+        "description": "Daily cost + lead-pipeline digest emailed via Resend (rolling 24h)",
+        "schedule":    "Daily at 16:00 UTC (09:00 PDT / 08:00 PST)",
         "trigger":     "cron",
     },
 }
@@ -825,6 +831,18 @@ async def job_enrich_stage3_nightly() -> dict:
         state = (lead.get("state") or "").strip()
 
         try:
+            # ── Hard budget guard (per-lead, inside loop) ────────────────────
+            # If caps trip mid-batch, abort the batch cleanly rather than
+            # continuing to burn money.
+            if not await cost_guard.check_budget(
+                service="outscraper",
+                estimated_cost_usd=50 * cost_guard.OUTSCRAPER_COST_PER_REVIEW,
+                job_name=job_name,
+                leads_affected=len(leads) - succeeded - failed,
+            ):
+                logger.warning(f"[{job_name}] Budget guard halted batch mid-run")
+                break
+
             query = f"{business_name} {city} {state}"
             async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.get(
@@ -854,7 +872,7 @@ async def job_enrich_stage3_nightly() -> dict:
 
             db.table("leads").update(update_payload).eq("id", lead_id).execute()
 
-            # Log cost
+            # Log cost — legacy table (kept for existing readers like _budget_guard)
             db.table("api_cost_log").insert({
                 "lead_id": lead_id,
                 "service": "outscraper",
@@ -863,6 +881,18 @@ async def job_enrich_stage3_nightly() -> dict:
                 "source_system": "kjle",
                 "created_at": _now_iso(),
             }).execute()
+
+            # New hard-cap ledger — actual review-based cost
+            review_count = int(place["reviews"]) if place.get("reviews") is not None else 0
+            await cost_guard.log_cost(
+                stage="stage3",
+                service="outscraper",
+                cost_usd=cost_guard.outscraper_cost(review_count),
+                lead_id=lead_id,
+                items_fetched=review_count,
+                job_run_id=job_name,
+                metadata={"entry_point": "scheduler_nightly"},
+            )
 
             total_cost += OUTSCRAPER_COST_PER_LEAD
             succeeded += 1
@@ -995,6 +1025,16 @@ async def job_enrich_stage4_nightly() -> dict:
         url = website if website.startswith(("http://", "https://")) else f"https://{website}"
 
         try:
+            # ── Hard budget guard (per-lead) ─────────────────────────────────
+            if not await cost_guard.check_budget(
+                service="firecrawl",
+                estimated_cost_usd=cost_guard.FIRECRAWL_COST_PER_SCRAPE,
+                job_name=job_name,
+                leads_affected=len(leads) - succeeded - failed,
+            ):
+                logger.warning(f"[{job_name}] Budget guard halted batch mid-run")
+                break
+
             async with httpx.AsyncClient(timeout=60.0) as client:
                 resp = await client.post(
                     "https://api.firecrawl.dev/v1/scrape",
@@ -1049,7 +1089,7 @@ async def job_enrich_stage4_nightly() -> dict:
 
             db.table("leads").update(update_payload).eq("id", lead_id).execute()
 
-            # Log cost
+            # Log cost — legacy table (kept for existing readers)
             db.table("api_cost_log").insert({
                 "lead_id": lead_id,
                 "service": "firecrawl",
@@ -1058,6 +1098,17 @@ async def job_enrich_stage4_nightly() -> dict:
                 "source_system": "kjle",
                 "created_at": _now_iso(),
             }).execute()
+
+            # New hard-cap ledger
+            await cost_guard.log_cost(
+                stage="stage4",
+                service="firecrawl",
+                cost_usd=cost_guard.FIRECRAWL_COST_PER_SCRAPE,
+                lead_id=lead_id,
+                items_fetched=1,
+                job_run_id=job_name,
+                metadata={"entry_point": "scheduler_nightly"},
+            )
 
             total_cost += FIRECRAWL_COST_PER_LEAD
             succeeded += 1
@@ -1096,6 +1147,90 @@ async def job_enrich_stage4_nightly() -> dict:
     return result
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Job 8 — Daily Cost Report email (16:00 UTC = 09:00 PDT / 08:00 PST)
+# Rolling 24h window. Honors admin_settings.daily_cost_report_enabled.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def job_daily_cost_report() -> dict:
+    """
+    Build + send the daily KJLE cost report email to
+    admin_settings.daily_cost_report_email (default sales@mobilewebmds.com)
+    via Resend. Skips if daily_cost_report_enabled='false'.
+    """
+    job_name = "daily_cost_report"
+    logger.info(f"[{job_name}] Starting...")
+    t_start = time.monotonic()
+
+    db = get_db()
+
+    # Enabled flag
+    try:
+        res = db.table("admin_settings").select("value").eq("key", "daily_cost_report_enabled").execute()
+        raw = (res.data[0].get("value") if res.data else "true") or "true"
+        enabled = raw.strip().lower() in ("true", "1", "yes", "on")
+    except Exception as e:
+        logger.warning(f"[{job_name}] Could not read enabled flag: {e}")
+        enabled = True
+
+    if not enabled:
+        notes = "SKIPPED — daily_cost_report_enabled=false"
+        logger.info(f"[{job_name}] {notes}")
+        await _log_job(job_name, status="skipped", notes=notes)
+        return {"job": job_name, "status": "skipped", "reason": notes}
+
+    # Recipient
+    try:
+        res = db.table("admin_settings").select("value").eq("key", "daily_cost_report_email").execute()
+        recipient = (res.data[0].get("value") if res.data else "") or "sales@mobilewebmds.com"
+    except Exception:
+        recipient = "sales@mobilewebmds.com"
+    recipient = recipient.strip() or "sales@mobilewebmds.com"
+
+    # Build body
+    from ..lib.daily_report import build_daily_report
+    from ..lib.email_sender import send_email, is_configured
+
+    try:
+        subject, body = build_daily_report()
+    except Exception as e:
+        logger.error(f"[{job_name}] Report build failed: {e}")
+        duration = time.monotonic() - t_start
+        await _log_job(job_name, duration_seconds=duration, status="failed",
+                       notes=f"build_error: {e}")
+        return {"job": job_name, "status": "failed", "error": str(e)}
+
+    if not is_configured():
+        notes = "SKIPPED — RESEND_API_KEY not set (preview-only mode)"
+        logger.warning(f"[{job_name}] {notes}; subject={subject!r}")
+        duration = time.monotonic() - t_start
+        await _log_job(job_name, duration_seconds=duration, status="skipped", notes=notes)
+        return {
+            "job": job_name, "status": "skipped", "reason": notes,
+            "preview": {"to": recipient, "subject": subject, "body_len": len(body)},
+        }
+
+    result = await send_email(to=recipient, subject=subject, body_text=body)
+    duration = time.monotonic() - t_start
+
+    status = "success" if result.get("ok") else "failed"
+    notes = f"to={recipient}, subject_len={len(subject)}, body_len={len(body)}, id={result.get('id')}"
+    if not result.get("ok"):
+        notes += f", error={result.get('error')}"
+
+    await _log_job(job_name, duration_seconds=duration, status=status, notes=notes)
+
+    return {
+        "job":       job_name,
+        "status":    status,
+        "recipient": recipient,
+        "subject":   subject,
+        "email_id":  result.get("id"),
+        "error":     result.get("error"),
+        "duration_seconds": round(duration, 3),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # JOB DISPATCH MAP — maps name → async callable
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1107,6 +1242,7 @@ JOB_FUNCTIONS = {
     "email_clean_nightly":  job_email_clean_nightly,
     "enrich_stage3_nightly": job_enrich_stage3_nightly,
     "enrich_stage4_nightly": job_enrich_stage4_nightly,
+    "daily_cost_report":    job_daily_cost_report,
 }
 
 
@@ -1196,7 +1332,18 @@ def setup_scheduler() -> AsyncIOScheduler:
         misfire_grace_time=1800,
     )
 
-    logger.info("⏰ APScheduler configured: 7 jobs registered")
+    # Job 8: daily_cost_report — daily at 16:00 UTC (09:00 PDT / 08:00 PST)
+    # Rolling 24h cost + pipeline digest emailed via Resend
+    scheduler.add_job(
+        job_daily_cost_report,
+        trigger=CronTrigger(hour=16, minute=0),
+        id="daily_cost_report",
+        name="Daily Cost Report Email",
+        replace_existing=True,
+        misfire_grace_time=1800,
+    )
+
+    logger.info("⏰ APScheduler configured: 8 jobs registered")
     return scheduler
 
 
