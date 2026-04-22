@@ -21,7 +21,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 RESEND_API_URL = "https://api.resend.com/emails"
-DEFAULT_FROM   = "KJLE Reports <reports@freereputationaudits.com>"
+DEFAULT_FROM   = "KJLE Reports <kjle@kjreportz.com>"
 
 
 def is_configured() -> bool:

@@ -1221,6 +1221,14 @@ async def job_daily_cost_report() -> dict:
         recipient = "sales@mobilewebmds.com"
     recipient = recipient.strip() or "sales@mobilewebmds.com"
 
+    # Sender (from_addr)
+    try:
+        res = db.table("admin_settings").select("value").eq("key", "daily_cost_report_sender").execute()
+        sender = (res.data[0].get("value") if res.data else "") or "KJLE Reports <kjle@kjreportz.com>"
+    except Exception:
+        sender = "KJLE Reports <kjle@kjreportz.com>"
+    sender = sender.strip() or "KJLE Reports <kjle@kjreportz.com>"
+
     # Build body
     from ..lib.daily_report import build_daily_report
     from ..lib.email_sender import send_email, is_configured
@@ -1244,7 +1252,7 @@ async def job_daily_cost_report() -> dict:
             "preview": {"to": recipient, "subject": subject, "body_len": len(body)},
         }
 
-    result = await send_email(to=recipient, subject=subject, body_text=body)
+    result = await send_email(to=recipient, subject=subject, body_text=body, from_addr=sender)
     duration = time.monotonic() - t_start
 
     status = "success" if result.get("ok") else "failed"

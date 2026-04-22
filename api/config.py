@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     FIRECRAWL_API_KEY: str = ""
     REACHINBOX_API_KEY: str = ""
     ANTHROPIC_API_KEY: str = ""     # Commander still reads os.environ directly; typed here for visibility
-    RESEND_API_KEY: str = ""        # Daily cost report email — reports@freereputationaudits.com
+    RESEND_API_KEY: str = ""        # Daily cost report email — kjle@kjreportz.com
 
     # ── Truelist.io — email cleaning ──────────────────────────────────────────
     # Optional fallback — preferred source is admin_settings table key 'truelist_api_key'
