@@ -9,3 +9,6 @@ python-multipart>=0.0.9
 slowapi>=0.1.9
 beautifulsoup4
 apscheduler
+# Empire-wide cost reporting per KJ_RULEZ Empire Cost Logging Rule.
+# Source: kj-bridgedeck repo, kje-cost-logger/ subdirectory.
+kje-cost-logger @ git+https://github.com/jharriGH/kj-bridgedeck.git@main#subdirectory=kje-cost-logger

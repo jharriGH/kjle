@@ -7,6 +7,7 @@ Receives user messages, calls Claude API, executes KJLE API
 actions, and returns intelligent responses. No Lovable Cloud needed.
 """
 
+import asyncio
 import logging
 import httpx
 from fastapi import APIRouter, HTTPException
@@ -23,6 +24,24 @@ ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 KJLE_BASE = "https://kjle-api.onrender.com/kjle/v1"
 KJLE_KEY = "kjle-prod-2026-secret"
+
+# --- Empire-wide cost reporting (per KJ_RULEZ Empire Cost Logging Rule) -----
+# Fire-and-forget POST to BridgeDeck /cost/ingest after each Anthropic call.
+# Failure modes are silent so cost logging never breaks the hot path.
+try:
+    from kje_cost_logger import CostLogger
+    _bridgedeck_logger: Optional["CostLogger"] = (
+        CostLogger(
+            bridgedeck_url=os.environ.get("BRIDGEDECK_URL", "https://kj-bridgedeck-api.onrender.com"),
+            api_key=os.environ["BRIDGEDECK_INGEST_KEY"],
+            source_system="kjle",
+            project_slug="kjle",
+        )
+        if os.environ.get("BRIDGEDECK_INGEST_KEY")
+        else None
+    )
+except Exception:  # ImportError or any constructor failure — never block boot
+    _bridgedeck_logger = None
 
 SYSTEM_PROMPT = """This is a B2B sales intelligence platform for small business lead management. All data refers to business entities, not individuals.
 
@@ -270,6 +289,17 @@ async def commander_chat(body: ChatRequest):
                 "actions_taken": actions_taken,
             },
         )
+
+        # Empire-wide cost reporting — fire-and-forget so logging never
+        # blocks the response path.
+        if _bridgedeck_logger is not None:
+            asyncio.create_task(_bridgedeck_logger.log_manual(
+                model="claude-sonnet-4-20250514",
+                tokens_in=in_tok,
+                tokens_out=out_tok,
+                cost_usd=cost_guard.anthropic_cost(in_tok, out_tok),
+                intent="commander_chat",
+            ))
 
         return {
             "response": response_text,
