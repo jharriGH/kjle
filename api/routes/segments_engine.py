@@ -176,22 +176,25 @@ async def get_segment_summary(
     def _pct(n):
         return round(n / total * 100, 2) if total > 0 else 0.0
 
-    # Top 5 niches by hot lead count (no state filter applied to niche ranking)
-    all_hot = (
-        db.table("leads")
-        .select("niche_slug")
-        .eq("is_active", True)
-        .eq("segment_label", "hot")
-        .execute()
-        .data or []
-    )
+    # Top 5 niches by hot lead count (no niche/state filter applied to ranking).
+    # Uses segments_by_niche() RPC for server-side GROUP BY — the prior
+    # implementation pulled raw rows and would silently truncate at ~1K
+    # once total hot leads grew past PostgREST's default row cap.
+    try:
+        rpc_res = db.rpc("segments_by_niche", {
+            "p_state":                None,
+            "p_include_unclassified": False,
+        }).execute()
+        rpc_rows = rpc_res.data or []
+    except Exception as e:
+        logger.error(f"segments_by_niche RPC failed in /segments/summary: {e}")
+        rpc_rows = []
 
-    niche_hot_counts: dict = {}
-    for row in all_hot:
-        ns = row.get("niche_slug") or "unknown"
-        niche_hot_counts[ns] = niche_hot_counts.get(ns, 0) + 1
-
-    top_niches = sorted(niche_hot_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+    top_niches = sorted(
+        rpc_rows,
+        key=lambda r: int(r.get("hot_count") or 0),
+        reverse=True,
+    )[:5]
 
     return {
         "status": "success",
@@ -208,7 +211,11 @@ async def get_segment_summary(
             "cold_pct": _pct(cold_count),
         },
         "top_5_niches_by_hot": [
-            {"niche_slug": ns, "hot_count": cnt} for ns, cnt in top_niches
+            {
+                "niche_slug": r.get("niche_slug") or "unknown",
+                "hot_count":  int(r.get("hot_count") or 0),
+            }
+            for r in top_niches
         ],
     }
 
@@ -340,57 +347,45 @@ async def get_cold_leads(
 
 @router.get("/segments/by-niche")
 async def get_segments_by_niche(
-    state: Optional[str] = Query(None),
+    state:                Optional[str] = Query(None),
+    include_unclassified: bool          = Query(True, description="Include leads with no segment_label"),
 ):
     """
-    Returns hot / warm / cold counts per niche_slug, sorted by hot_count desc.
-    Aggregates in Python from a single broad select — avoids N+1 queries.
+    Returns hot / warm / cold (and optionally unclassified) counts per
+    niche_slug, sorted by total volume desc.
+
+    Aggregation runs server-side in Postgres via the segments_by_niche()
+    RPC — the previous Python-side aggregation silently truncated to
+    ~1,000 rows due to PostgREST's default row cap.
     """
     db = get_db()
 
-    query = (
-        db.table("leads")
-        .select("niche_slug, segment_label")
-        .eq("is_active", True)
-        .not_.is_("segment_label", "null")
-    )
+    res = db.rpc("segments_by_niche", {
+        "p_state":                state.upper() if state else None,
+        "p_include_unclassified": include_unclassified,
+    }).execute()
+    rows = res.data or []
 
-    if state:
-        query = query.eq("state", state.upper())
-
-    rows = query.execute().data or []
-
-    # Aggregate in Python
-    niche_map: dict = {}
-    for row in rows:
-        ns    = row.get("niche_slug") or "unknown"
-        label = row.get("segment_label") or "cold"
-
-        if ns not in niche_map:
-            niche_map[ns] = {"niche_slug": ns, "hot": 0, "warm": 0, "cold": 0, "total": 0}
-
-        if label in ("hot", "warm", "cold"):
-            niche_map[ns][label] += 1
-        niche_map[ns]["total"] += 1
-
-    niches = sorted(niche_map.values(), key=lambda x: x["hot"], reverse=True)
-
-    # Rename keys for cleaner response
-    result_niches = []
-    for n in niches:
-        total = n["total"] or 1
-        result_niches.append({
-            "niche_slug":  n["niche_slug"],
-            "hot_count":   n["hot"],
-            "warm_count":  n["warm"],
-            "cold_count":  n["cold"],
-            "total":       n["total"],
-            "hot_pct":     round(n["hot"] / total * 100, 2),
+    niches = []
+    for r in rows:
+        hot   = int(r.get("hot_count")          or 0)
+        warm  = int(r.get("warm_count")         or 0)
+        cold  = int(r.get("cold_count")         or 0)
+        unc   = int(r.get("unclassified_count") or 0)
+        total = int(r.get("total")              or 0)
+        niches.append({
+            "niche_slug":         r.get("niche_slug") or "unknown",
+            "hot_count":          hot,
+            "warm_count":         warm,
+            "cold_count":         cold,
+            "unclassified_count": unc,
+            "total":              total,
+            "hot_pct":            round(hot / total * 100, 2) if total else 0.0,
         })
 
     return {
-        "status": "success",
-        "filters": {"state": state},
-        "niche_count": len(result_niches),
-        "niches": result_niches,
+        "status":      "success",
+        "filters":     {"state": state, "include_unclassified": include_unclassified},
+        "niche_count": len(niches),
+        "niches":      niches,
     }
