@@ -809,6 +809,14 @@ async def job_enrich_stage3_nightly() -> dict:
     logger.info(f"[{job_name}] Starting...")
     t_start = time.monotonic()
 
+    # ── Kill-switch gate (admin_settings.stage3_nightly_enabled) ─────────────
+    enabled_raw = await _get_admin_setting("stage3_nightly_enabled", "true")
+    if str(enabled_raw).strip().lower() not in ("true", "1", "yes", "on"):
+        notes = "paused via admin_settings, skipped"
+        logger.info(f"[{job_name}] {notes}")
+        await _log_job(job_name, status="skipped", notes=notes)
+        return {"job": job_name, "status": "skipped", "reason": notes}
+
     from ..config import settings
 
     # Load configurable settings
@@ -986,6 +994,14 @@ async def job_enrich_stage4_nightly() -> dict:
     job_name = "enrich_stage4_nightly"
     logger.info(f"[{job_name}] Starting...")
     t_start = time.monotonic()
+
+    # ── Kill-switch gate (admin_settings.stage4_nightly_enabled) ─────────────
+    enabled_raw = await _get_admin_setting("stage4_nightly_enabled", "true")
+    if str(enabled_raw).strip().lower() not in ("true", "1", "yes", "on"):
+        notes = "paused via admin_settings, skipped"
+        logger.info(f"[{job_name}] {notes}")
+        await _log_job(job_name, status="skipped", notes=notes)
+        return {"job": job_name, "status": "skipped", "reason": notes}
 
     from ..config import settings
 

@@ -21,7 +21,7 @@ router = APIRouter()
 DEFAULTS: Dict[str, str] = {
     "budget_cap_usd":               "10.00",
     "classify_batch_size":          "1000",
-    "enrich_batch_size":            "50",
+    "enrich_batch_size":            "1000",
     "stale_cutoff_days":            "180",
     "email_clean_enabled":          "false",
     "email_clean_batch_size":       "100",
