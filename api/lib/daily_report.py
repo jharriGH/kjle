@@ -205,6 +205,91 @@ def _pipeline_section(since: datetime) -> str:
     )
 
 
+def _dnc_section(since: datetime) -> str:
+    """
+    DNC HEALTH section. Reads from dnc_audit_log + dnc_cache + dnc_suppressions
+    + admin_settings.searchbug_balance_last. Degrades gracefully — if any of
+    those tables don't exist yet (migration not run), section becomes a single
+    'idle/unprovisioned' line so the email still ships.
+
+    Cap-exceeded events ('budget_cap*') are excluded from real-lookup totals
+    and surfaced separately as 'halts'.
+    """
+    db = get_db()
+    try:
+        rows = (
+            db.table("dnc_audit_log")
+            .select("result, cost_usd, source, error")
+            .gte("occurred_at", since.isoformat())
+            .execute()
+            .data or []
+        )
+    except Exception as e:
+        logger.info(f"daily_report: dnc_audit_log unavailable ({e}); rendering idle DNC section")
+        return "DNC HEALTH\n(table not yet provisioned — run dnc_schema.sql)\n"
+
+    fresh = sum(1 for r in rows if r.get("result") == "fresh_lookup")
+    hits  = sum(1 for r in rows if r.get("result") == "cache_hit")
+    halts = sum(
+        1 for r in rows
+        if r.get("result") == "error" and (r.get("error") or "").startswith("budget_cap")
+    )
+    cost = round(
+        sum(
+            _safe_float(r.get("cost_usd"))
+            for r in rows
+            if not (
+                r.get("result") == "error"
+                and (r.get("error") or "").startswith("budget_cap")
+            )
+        ),
+        5,
+    )
+
+    try:
+        cache_size = (
+            db.table("dnc_cache").select("phone", count="exact").limit(1).execute().count or 0
+        )
+    except Exception:
+        cache_size = 0
+
+    try:
+        sup_size = (
+            db.table("dnc_suppressions").select("phone", count="exact").limit(1).execute().count or 0
+        )
+    except Exception:
+        sup_size = 0
+
+    src_counts: dict = {}
+    for r in rows:
+        s = r.get("source") or "unknown"
+        src_counts[s] = src_counts.get(s, 0) + 1
+    top_sources = sorted(src_counts.items(), key=lambda kv: kv[1], reverse=True)[:3]
+    sources_str = ", ".join(f"{s}={n}" for s, n in top_sources) if top_sources else "none"
+
+    balance = _get_setting("searchbug_balance_last", "")
+    balance_line = f"Searchbug balance: ${balance}" if balance else "Searchbug balance: not yet checked"
+
+    if (fresh + hits + halts) == 0:
+        return (
+            "DNC HEALTH\n"
+            "DNC: idle (0 lookups in last 24h)\n"
+            f"Cache size: {cache_size:,} phones / Suppression list: {sup_size:,} phones\n"
+            f"{balance_line}\n"
+        )
+
+    total = fresh + hits
+    return (
+        "DNC HEALTH (last 24h)\n"
+        f"Lookups: {fresh:,} fresh + {hits:,} cached = {total:,} total"
+        + (f" | {halts:,} halts" if halts else "") + "\n"
+        f"Cost: {_fmt_usd(cost)}\n"
+        f"Cache size: {cache_size:,} phones / Suppression list: {sup_size:,} phones\n"
+        f"Top sources: {sources_str}\n"
+        f"{balance_line}\n"
+    )
+
+
 def _campaigns_section(since: datetime) -> str:
     # Integration shim — returns [] if parallel session's campaign_performance
     # table doesn't exist yet. Neither session blocks the other.
@@ -288,6 +373,7 @@ def build_daily_report(fire_time_utc: Optional[datetime] = None) -> Tuple[str, s
     mtd_body, _ = _mtd_section(now)
     pipeline_body = _pipeline_section(since)
     campaigns_body = _campaigns_section(since)
+    dnc_body = _dnc_section(since)
     anomalies_body = _anomalies_section(since, by_service)
 
     subject = f"KJLE Daily Report — {now.strftime('%Y-%m-%d')} — {_fmt_usd(total_spent)} spent"
@@ -300,6 +386,7 @@ def build_daily_report(fire_time_utc: Optional[datetime] = None) -> Tuple[str, s
         mtd_body,
         pipeline_body,
         campaigns_body,
+        dnc_body,
         anomalies_body,
         footer,
     ])

@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     REACHINBOX_API_KEY: str = ""
     ANTHROPIC_API_KEY: str = ""     # Commander still reads os.environ directly; typed here for visibility
     RESEND_API_KEY: str = ""        # Daily cost report email — kjle@kjreportz.com
+    SEARCHBUG_API_KEY: str = ""     # DNC provider PASS field; CO_CODE sourced from admin_settings.dnc_searchbug_co_code
 
     # ── Truelist.io — email cleaning ──────────────────────────────────────────
     # Optional fallback — preferred source is admin_settings table key 'truelist_api_key'
