@@ -205,6 +205,25 @@ def _pipeline_section(since: datetime) -> str:
     )
 
 
+def _format_searchbug_balance_line() -> str:
+    """Render the Searchbug balance line with severity indicator."""
+    raw = _get_setting("searchbug_balance_last", "")
+    if not raw:
+        return "Searchbug balance: not yet checked"
+    try:
+        bal = float(raw)
+    except (ValueError, TypeError):
+        return f"Searchbug balance: {raw} (unparseable)"
+
+    if bal > 10:
+        return f"Searchbug balance: ${bal:.2f} ✅"
+    if bal > 3:
+        return f"Searchbug balance: ${bal:.2f} ⚠️ LOW — top up soon"
+    if bal > 0:
+        return f"Searchbug balance: ${bal:.2f} 🔴 CRITICAL — top up immediately"
+    return f"Searchbug balance: ${bal:.2f} 🚨 ZERO/NEGATIVE — fail-closed mode active"
+
+
 def _dnc_section(since: datetime) -> str:
     """
     DNC HEALTH section. Reads from dnc_audit_log + dnc_cache + dnc_suppressions
@@ -267,8 +286,7 @@ def _dnc_section(since: datetime) -> str:
     top_sources = sorted(src_counts.items(), key=lambda kv: kv[1], reverse=True)[:3]
     sources_str = ", ".join(f"{s}={n}" for s, n in top_sources) if top_sources else "none"
 
-    balance = _get_setting("searchbug_balance_last", "")
-    balance_line = f"Searchbug balance: ${balance}" if balance else "Searchbug balance: not yet checked"
+    balance_line = _format_searchbug_balance_line()
 
     if (fresh + hits + halts) == 0:
         return (

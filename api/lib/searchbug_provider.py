@@ -13,6 +13,7 @@ Tier: api_lnd2 — Federal + 13 state DNC, TCPA litigator flag, line type, VoIP
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
@@ -141,6 +142,11 @@ class SearchbugProvider(DNCProvider):
         line_type = _derive_line_type(phone_data)
         carrier   = (phone_data.get("CARRIER") or "").strip()
 
+        # ── Balance bookkeeping (persistence + threshold alerts) ─────────────
+        # We own this per-provider since balance is Searchbug-specific.
+        # Failures here must not break the lookup result for the caller.
+        await self._persist_and_alert_balance(data)
+
         return DNCResult(
             is_dnc         = is_dnc,
             reason         = dnc_raw if is_dnc else "clean",
@@ -151,3 +157,57 @@ class SearchbugProvider(DNCProvider):
             provider       = self.name,
             error          = None,
         )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Balance persistence + threshold alerting
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _persist_and_alert_balance(self, raw_response: dict) -> None:
+        """
+        Pull Data.STATS.BALANCE off a Searchbug response, persist it to
+        admin_settings.searchbug_balance_last, and let the monitor decide
+        whether to fire any threshold alerts. Best-effort — never raises.
+        """
+        try:
+            balance_raw = (
+                (raw_response or {})
+                .get("Data", {})
+                .get("STATS", {})
+                .get("BALANCE")
+            )
+        except Exception as e:
+            logger.warning(f"SearchbugProvider: balance read failed: {e}")
+            return
+
+        if balance_raw is None or str(balance_raw).strip() == "":
+            return
+
+        balance_str = str(balance_raw).strip()
+
+        # Persist the latest value (overwrite each time — only newest matters)
+        try:
+            from ..database import get_db
+            db = get_db()
+            db.table("admin_settings").upsert(
+                {
+                    "key":        "searchbug_balance_last",
+                    "value":      balance_str,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                on_conflict="key",
+            ).execute()
+        except Exception as e:
+            logger.warning(f"SearchbugProvider: balance upsert failed: {e}")
+
+        # Threshold check — anti-spam handled inside the monitor.
+        try:
+            balance_f = float(balance_str)
+        except (ValueError, TypeError):
+            logger.warning(f"SearchbugProvider: balance unparseable: {balance_str!r}")
+            return
+
+        try:
+            from .searchbug_balance_monitor import check_and_alert_balance
+            await check_and_alert_balance(balance_f)
+        except Exception as e:
+            logger.warning(f"SearchbugProvider: balance monitor failed: {e}")

@@ -151,21 +151,6 @@ def _serialize_response(
     }
 
 
-def _persist_searchbug_balance(raw_response: dict) -> None:
-    """Pull Data.STATS.BALANCE off a Searchbug response and save it for ops visibility."""
-    try:
-        balance = (
-            (raw_response or {})
-            .get("Data", {})
-            .get("STATS", {})
-            .get("BALANCE")
-        )
-        if balance is not None and str(balance).strip():
-            _upsert_admin_setting("searchbug_balance_last", str(balance).strip())
-    except Exception as e:
-        logger.warning(f"dnc: searchbug balance persist failed: {e}")
-
-
 async def _perform_check(
     raw_phone: str,
     source: str,
@@ -327,7 +312,8 @@ async def _perform_check(
     except Exception as e:
         logger.error(f"dnc: cost_guard.log_cost failed: {e}")
 
-    _persist_searchbug_balance(result.raw_response)
+    # Balance persistence + threshold alerts are handled by SearchbugProvider
+    # itself (api/lib/searchbug_provider.py::_persist_and_alert_balance).
 
     _audit(
         phone=phone, source=src, result="fresh_lookup",

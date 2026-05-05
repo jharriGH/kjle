@@ -1276,6 +1276,20 @@ async def job_daily_cost_report() -> dict:
     if not result.get("ok"):
         notes += f", error={result.get('error')}"
 
+    # ── Belt-and-suspenders Searchbug balance alert ──────────────────────────
+    # Catches days with zero fresh DNC lookups but a previously-recorded low
+    # balance. Anti-spam handled inside the monitor (1 alert per threshold per
+    # UTC day). Best-effort — never breaks the digest send.
+    balance_alerts = 0
+    try:
+        from ..lib.searchbug_balance_monitor import check_and_alert_balance
+        alert_result = await check_and_alert_balance()
+        balance_alerts = int(alert_result.get("alerts_sent") or 0)
+        if balance_alerts:
+            notes += f", balance_alerts={balance_alerts}"
+    except Exception as e:
+        logger.error(f"[{job_name}] balance monitor check failed: {e}")
+
     await _log_job(job_name, duration_seconds=duration, status=status, notes=notes)
 
     return {
@@ -1285,6 +1299,7 @@ async def job_daily_cost_report() -> dict:
         "subject":   subject,
         "email_id":  result.get("id"),
         "error":     result.get("error"),
+        "balance_alerts_sent": balance_alerts,
         "duration_seconds": round(duration, 3),
     }
 
