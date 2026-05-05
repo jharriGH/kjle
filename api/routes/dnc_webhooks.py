@@ -294,10 +294,20 @@ def _extract_phone_email(body: dict) -> tuple[Optional[str], Optional[str]]:
 
 
 def _extract_reply_text(body: dict) -> Optional[str]:
+    """
+    Pull reply text from a webhook payload, defensively across known shapes.
+    Mirrors _extract_phone_email's nested-path pattern: prefer nested 'reply.X'
+    first (some providers nest), then 'data.X' (ReachInbox's actual format),
+    then top-level (legacy / generic webhooks).
+    """
     reply = body.get("reply") or {}
+    data  = body.get("data")  or {}
     return (
         reply.get("text")
         or reply.get("body")
+        or data.get("reply_text")
+        or data.get("text")
+        or data.get("body")
         or body.get("reply_text")
         or body.get("text")
         or body.get("body")
