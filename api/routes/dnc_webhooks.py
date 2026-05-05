@@ -3,11 +3,19 @@ KJLE — DNC inbound webhooks (Phase 3)
 File: api/routes/dnc_webhooks.py
 
 Routes (PREFIX /kjle/v1 added by main.py):
-  POST /dnc/webhooks/reachinbox    — signature-auth (HMAC-SHA256), no x-api-key
-  POST /dnc/webhooks/suppression   — x-api-key auth; generic suppression intake
+  POST /dnc/webhooks/reachinbox?secret=<...>  — query-param secret auth
+                                                (constant-time compare)
+  POST /dnc/webhooks/suppression              — x-api-key auth; generic intake
 
 Closes the DNC feedback loop: opt-out signals from ReachInbox (and any future
 empire app) flow automatically into KJLE's suppression list.
+
+ReachInbox auth model (per their docs at https://docs.reachinbox.ai/webhooks):
+  HTTPS only, NO request signing — URL secrecy IS the security boundary.
+  We require a ?secret=<REACHINBOX_WEBHOOK_SECRET> query parameter and compare
+  it constant-time against settings.REACHINBOX_WEBHOOK_SECRET. Both sides
+  must be non-empty (empty=empty is rejected). If the env var is unset, all
+  webhooks fail-closed with 401.
 
 Internal helpers (private to this module):
   _add_phone_suppression()  — normalize, UPSERT dnc_suppressions, invalidate cache, audit
@@ -21,7 +29,6 @@ ReachInbox event canonicalization (defensive against schema variation):
 """
 from __future__ import annotations
 
-import hashlib
 import hmac
 import json
 import logging
@@ -41,13 +48,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # ── Constants ────────────────────────────────────────────────────────────────
-
-# ReachInbox HMAC-SHA256 signature header.
-# NOTE: hard-coded as "X-Webhook-Signature" — adjust this constant if ReachInbox
-# uses a different header (e.g., "X-RI-Signature", "X-Hub-Signature-256"). The
-# secret is read from settings.REACHINBOX_WEBHOOK_SECRET (Render env var).
-REACHINBOX_SIG_HEADER = "x-webhook-signature"
-SIG_PREFIX_PATTERNS   = ("sha256=", "SHA256=")  # tolerated and stripped
 
 # Canonical event types → known string variants we accept (case-insensitive).
 EVENT_TYPE_VARIANTS = {
@@ -231,34 +231,22 @@ async def _add_email_suppression(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ReachInbox webhook signature verification (HMAC-SHA256)
+# ReachInbox webhook auth — query-param shared secret (constant-time compare)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _verify_signature(body_bytes: bytes, signature_header: Optional[str], secret: str) -> bool:
+def _verify_query_secret(provided: Optional[str], expected: str) -> bool:
     """
-    Verify HMAC-SHA256 hex signature with optional 'sha256=' prefix tolerance.
-    Returns True iff the header is present, decodable, and timing-safe-equal
-    to the expected digest.
+    Constant-time comparison of the ?secret=... query param against the
+    configured shared secret. Both sides must be non-empty — fail-closed
+    when REACHINBOX_WEBHOOK_SECRET is unset (won't accidentally accept
+    empty=empty).
     """
-    if not secret:
-        return False  # fail-closed if secret not configured
-    if not signature_header:
-        return False
-
-    received = signature_header.strip()
-    for prefix in SIG_PREFIX_PATTERNS:
-        if received.startswith(prefix):
-            received = received[len(prefix):]
-            break
-
-    expected = hmac.new(
-        secret.encode("utf-8"),
-        body_bytes,
-        hashlib.sha256,
-    ).hexdigest()
-
+    if not expected:
+        return False        # secret env var unset → fail-closed
+    if not provided:
+        return False        # query param missing or empty
     try:
-        return hmac.compare_digest(expected, received.lower())
+        return hmac.compare_digest(expected, provided)
     except Exception:
         return False
 
@@ -313,25 +301,30 @@ def _extract_reply_text(body: dict) -> Optional[str]:
 @router.post("/dnc/webhooks/reachinbox")
 async def reachinbox_webhook(request: Request):
     """
-    Inbound webhook from ReachInbox. Signature-authenticated (HMAC-SHA256).
+    Inbound webhook from ReachInbox. Authenticated via ?secret=<...> query
+    param (constant-time compare against REACHINBOX_WEBHOOK_SECRET).
 
-    Always returns 200 once the signature is verified — even on unknown event
+    Example URL format:
+      https://kjle-api.onrender.com/kjle/v1/dnc/webhooks/reachinbox?secret=<REACHINBOX_WEBHOOK_SECRET>
+
+    Always returns 200 once the secret is verified — even on unknown event
     types or missing data — so ReachInbox doesn't loop on retries. Detailed
     diagnostics land in dnc_audit_log for postmortem.
     """
     body_bytes = await request.body()
-    sig = request.headers.get(REACHINBOX_SIG_HEADER) or request.headers.get(REACHINBOX_SIG_HEADER.title())
-    secret = settings.REACHINBOX_WEBHOOK_SECRET or ""
+    provided_secret = request.query_params.get("secret")
+    expected_secret = settings.REACHINBOX_WEBHOOK_SECRET or ""
 
-    if not _verify_signature(body_bytes, sig, secret):
+    if not _verify_query_secret(provided_secret, expected_secret):
         # Fail-closed. Log security event (no audit row — we don't know who sent this).
+        # Intentionally NOT logging the secret value or its length.
         logger.warning(
-            f"dnc_webhooks: ReachInbox signature INVALID — header_present={bool(sig)}, "
-            f"secret_configured={bool(secret)}, body_len={len(body_bytes)}"
+            f"dnc_webhooks: ReachInbox secret INVALID — provided_present={bool(provided_secret)}, "
+            f"secret_configured={bool(expected_secret)}, body_len={len(body_bytes)}"
         )
-        raise HTTPException(status_code=401, detail="invalid_signature")
+        raise HTTPException(status_code=401, detail="invalid_secret")
 
-    # Parse JSON manually (we already consumed the raw body for HMAC)
+    # Parse JSON manually (we already consumed the raw body above for body_len logging)
     try:
         body = json.loads(body_bytes.decode("utf-8") or "{}") if body_bytes else {}
     except Exception as e:
@@ -414,6 +407,12 @@ async def reachinbox_webhook(request: Request):
                    result="webhook_skipped",
                    metadata={**base_metadata, "reason": "reply_no_unsubscribe_match",
                              "reply_excerpt": reply_text[:200]})
+
+    suppressions_added = int(summary.get("phone_added", False)) + int(summary.get("email_added", False))
+    logger.info(
+        f"dnc_webhooks: ReachInbox event processed — type={canonical}, "
+        f"source=reachinbox, suppressions_added={suppressions_added}"
+    )
 
     return {"status": "received", "processed": True, **summary}
 
