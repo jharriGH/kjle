@@ -22,10 +22,13 @@ Internal helpers (private to this module):
   _add_email_suppression()  — normalize, UPSERT email_suppressions, audit
 
 ReachInbox event canonicalization (defensive against schema variation):
-  unsubscribed → suppress phone + email
-  bounced_hard → suppress email only
-  replied      → run reply_parser; suppress phone + email if unsubscribe match
-  complained   → suppress phone + email
+  unsubscribed   → suppress phone + email
+  bounced_hard   → suppress email only        (RI string: "Email bounced")
+  replied        → run reply_parser; suppress phone + email if unsubscribe match
+                                              (RI string: "Reply received")
+  complained     → suppress phone + email
+  wrong_person   → suppress email only        (RI string: "Lead wrong person")
+  not_interested → suppress email only        (RI string: "Lead not interested")
 """
 from __future__ import annotations
 
@@ -49,12 +52,19 @@ router = APIRouter()
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-# Canonical event types → known string variants we accept (case-insensitive).
+# Canonical event types → known string variants we accept (case-insensitive,
+# whitespace-stripped — see _canonicalize_event). Add new vendor strings here.
 EVENT_TYPE_VARIANTS = {
-    "unsubscribed": {"lead.unsubscribed", "unsubscribed", "lead_unsubscribed", "optout"},
-    "bounced_hard": {"lead.bounced_hard", "hard_bounce", "bounced.hard"},
-    "replied":      {"lead.replied", "replied", "reply.received"},
-    "complained":   {"lead.complained", "spam_complaint", "complaint", "lead.complained_spam"},
+    "unsubscribed":   {"lead.unsubscribed", "unsubscribed", "lead_unsubscribed", "optout"},
+    "bounced_hard":   {"lead.bounced_hard", "hard_bounce", "bounced.hard",
+                       "Email bounced"},                                       # ReachInbox UI string
+    "replied":        {"lead.replied", "replied", "reply.received",
+                       "Reply received"},                                      # ReachInbox UI string
+    "complained":     {"lead.complained", "spam_complaint", "complaint", "lead.complained_spam"},
+    "wrong_person":   {"Lead wrong person", "wrong_person",                    # ReachInbox UI string
+                       "wrong.person", "lead.wrong_person"},
+    "not_interested": {"Lead not interested", "not_interested",                # ReachInbox UI string
+                       "lead.not_interested"},
 }
 
 # Auth shared with the rest of the codebase
@@ -360,10 +370,12 @@ async def reachinbox_webhook(request: Request):
 
     # Reason mapping for the suppression record
     reason_text = {
-        "unsubscribed": "reachinbox_unsubscribe",
-        "bounced_hard": "reachinbox_bounced_hard",
-        "replied":      "reachinbox_replied_unsubscribe",
-        "complained":   "reachinbox_spam_complaint",
+        "unsubscribed":   "reachinbox_unsubscribe",
+        "bounced_hard":   "reachinbox_bounced_hard",
+        "replied":        "reachinbox_replied_unsubscribe",
+        "complained":     "reachinbox_spam_complaint",
+        "wrong_person":   "reachinbox_wrong_person",
+        "not_interested": "reachinbox_not_interested",
     }[canonical]
 
     base_metadata = {"raw_event": raw_event, "canonical_event": canonical}
@@ -385,6 +397,22 @@ async def reachinbox_webhook(request: Request):
             r = await _add_email_suppression(email, reason_text, "reachinbox",
                                               metadata={**base_metadata})
             summary["email_added"] = bool(r.get("added"))
+
+    elif canonical == "wrong_person" or canonical == "not_interested":
+        # Email-channel signals — recipient said "wrong person" or "not
+        # interested" via reply/feedback. Suppress email only; phone is a
+        # different channel with different consent posture, leave it alone.
+        if email:
+            r = await _add_email_suppression(email, reason_text, "reachinbox",
+                                              metadata={**base_metadata})
+            summary["email_added"] = bool(r.get("added"))
+        else:
+            # Defensive visibility: event arrived but we couldn't extract an
+            # email. Audit so we can spot ReachInbox payload-shape drift and
+            # adjust _extract_phone_email if needed.
+            _audit(phone=None, email=None, source="reachinbox",
+                   result="webhook_skipped",
+                   metadata={**base_metadata, "reason": "no_email_in_payload"})
 
     elif canonical == "replied":
         reply_text = _extract_reply_text(body) or ""
