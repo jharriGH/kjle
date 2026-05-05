@@ -335,6 +335,90 @@ async def _perform_check(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Email-side helpers (Phase 3: companion to phone DNC check)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _normalize_email(raw: Optional[str]) -> Optional[str]:
+    """Lowercase + strip + sanity-check for '@'. Returns None on invalid."""
+    if not raw:
+        return None
+    s = str(raw).strip().lower()
+    if not s or "@" not in s or s.startswith("@") or s.endswith("@"):
+        return None
+    return s
+
+
+async def _perform_email_check(raw_email: str, source: str) -> dict:
+    """Shared lookup pipeline used by both /dnc/check-email and /dnc/check-email/{email}."""
+    email = _normalize_email(raw_email)
+    if not email:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid_email_format: could not normalize {raw_email!r}",
+        )
+
+    db = get_db()
+    src = source or "unknown"
+
+    is_suppressed = False
+    reason = ""
+    metadata: dict = {}
+
+    try:
+        res = (
+            db.table("email_suppressions")
+            .select("email, reason, source")
+            .eq("email", email)
+            .execute()
+        )
+        if res.data:
+            row = res.data[0]
+            is_suppressed = True
+            reason = f"internal_suppression:{row.get('reason') or 'unknown'}"
+            metadata = {"suppression_reason": row.get("reason"), "suppression_source": row.get("source")}
+    except Exception as e:
+        logger.warning(f"dnc: email_suppressions read failed for {email}: {e}")
+        # Treat lookup failure as 'clean' for the response, but flag in audit.
+        metadata = {"lookup_error": str(e)[:200]}
+
+    # Audit row — phone column NULL since this is an email lookup
+    _audit(
+        phone=None, source=src,
+        result=("internal_suppression" if is_suppressed else "clean_email"),
+        is_dnc=None,
+        metadata={"email": email, **metadata},
+    )
+
+    return {
+        "is_suppressed":     is_suppressed,
+        "reason":            reason,
+        "result_source":     "internal_suppression" if is_suppressed else "clean",
+        "email_normalized":  email,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /dnc/check-email          (query param fallback — Phase 3)
+# GET /dnc/check-email/{email}  (path param)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/dnc/check-email")
+async def dnc_check_email_query(
+    email:  str = Query(..., description="Email address (any case)"),
+    source: str = Query("unknown"),
+):
+    return await _perform_email_check(email, source)
+
+
+@router.get("/dnc/check-email/{email}")
+async def dnc_check_email_path(
+    email:  str,
+    source: str = Query("unknown"),
+):
+    return await _perform_email_check(email, source)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # GET /dnc/check  (query-param fallback — must precede /{phone} for clarity)
 # ─────────────────────────────────────────────────────────────────────────────
 

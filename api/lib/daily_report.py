@@ -272,13 +272,6 @@ def _dnc_section(since: datetime) -> str:
     except Exception:
         cache_size = 0
 
-    try:
-        sup_size = (
-            db.table("dnc_suppressions").select("phone", count="exact").limit(1).execute().count or 0
-        )
-    except Exception:
-        sup_size = 0
-
     src_counts: dict = {}
     for r in rows:
         s = r.get("source") or "unknown"
@@ -292,7 +285,7 @@ def _dnc_section(since: datetime) -> str:
         return (
             "DNC HEALTH\n"
             "DNC: idle (0 lookups in last 24h)\n"
-            f"Cache size: {cache_size:,} phones / Suppression list: {sup_size:,} phones\n"
+            f"Cache size: {cache_size:,} phones\n"
             f"{balance_line}\n"
         )
 
@@ -302,10 +295,95 @@ def _dnc_section(since: datetime) -> str:
         f"Lookups: {fresh:,} fresh + {hits:,} cached = {total:,} total"
         + (f" | {halts:,} halts" if halts else "") + "\n"
         f"Cost: {_fmt_usd(cost)}\n"
-        f"Cache size: {cache_size:,} phones / Suppression list: {sup_size:,} phones\n"
+        f"Cache size: {cache_size:,} phones\n"
         f"Top sources: {sources_str}\n"
         f"{balance_line}\n"
     )
+
+
+def _suppressions_section(since: datetime) -> str:
+    """
+    SUPPRESSIONS section. Reads dnc_suppressions + email_suppressions for the
+    rolling 24h window, plus current totals from both tables.
+
+    Graceful degradation: if email_suppressions table doesn't exist (Phase 3
+    migration not run), the email line shows '(table not yet provisioned)'
+    and the section still renders the phone half.
+
+    Source breakdown caps at top 5; remainder shown as '...+ N more'.
+    """
+    db = get_db()
+
+    # ── Phone suppressions ───────────────────────────────────────────────────
+    try:
+        phone_24h_res = (
+            db.table("dnc_suppressions")
+            .select("phone, source", count="exact")
+            .gte("suppressed_at", since.isoformat())
+            .execute()
+        )
+        phone_24h_rows  = phone_24h_res.data or []
+        phone_24h_count = phone_24h_res.count if phone_24h_res.count is not None else len(phone_24h_rows)
+    except Exception as e:
+        logger.info(f"daily_report: phone suppressions 24h fetch failed: {e}")
+        phone_24h_rows  = []
+        phone_24h_count = 0
+
+    try:
+        phone_total = (
+            db.table("dnc_suppressions").select("phone", count="exact").limit(1).execute().count or 0
+        )
+    except Exception:
+        phone_total = 0
+
+    # ── Email suppressions (Phase 3 — graceful degradation) ─────────────────
+    email_table_missing = False
+    try:
+        email_24h_res = (
+            db.table("email_suppressions")
+            .select("email, source", count="exact")
+            .gte("suppressed_at", since.isoformat())
+            .execute()
+        )
+        email_24h_rows  = email_24h_res.data or []
+        email_24h_count = email_24h_res.count if email_24h_res.count is not None else len(email_24h_rows)
+    except Exception as e:
+        logger.info(f"daily_report: email_suppressions unavailable ({e}); rendering partial section")
+        email_24h_rows  = []
+        email_24h_count = 0
+        email_table_missing = True
+
+    if email_table_missing:
+        email_total = 0
+    else:
+        try:
+            email_total = (
+                db.table("email_suppressions").select("email", count="exact").limit(1).execute().count or 0
+            )
+        except Exception:
+            email_total = 0
+
+    # ── Source breakdown across both tables (24h window) ────────────────────
+    src_counts: dict = {}
+    for r in (phone_24h_rows + email_24h_rows):
+        s = r.get("source") or "unknown"
+        src_counts[s] = src_counts.get(s, 0) + 1
+    sorted_sources = sorted(src_counts.items(), key=lambda kv: kv[1], reverse=True)
+    top_5 = sorted_sources[:5]
+    extra = len(sorted_sources) - 5
+    sources_str = ", ".join(f"{s}={n}" for s, n in top_5) if top_5 else "none"
+    if extra > 0:
+        sources_str += f" ...+ {extra} more"
+
+    lines = ["SUPPRESSIONS (last 24h)"]
+    lines.append(f"Phone suppressions added: {phone_24h_count:,}")
+    if email_table_missing:
+        lines.append("Email suppressions: (table not yet provisioned — run email_suppressions.sql)")
+    else:
+        lines.append(f"Email suppressions added: {email_24h_count:,}")
+    lines.append(f"By source: {sources_str}")
+    lines.append(f"Total suppression list: {phone_total:,} phones, {email_total:,} emails")
+    return "\n".join(lines) + "\n"
 
 
 def _campaigns_section(since: datetime) -> str:
@@ -392,6 +470,7 @@ def build_daily_report(fire_time_utc: Optional[datetime] = None) -> Tuple[str, s
     pipeline_body = _pipeline_section(since)
     campaigns_body = _campaigns_section(since)
     dnc_body = _dnc_section(since)
+    suppressions_body = _suppressions_section(since)
     anomalies_body = _anomalies_section(since, by_service)
 
     subject = f"KJLE Daily Report — {now.strftime('%Y-%m-%d')} — {_fmt_usd(total_spent)} spent"
@@ -405,6 +484,7 @@ def build_daily_report(fire_time_utc: Optional[datetime] = None) -> Tuple[str, s
         pipeline_body,
         campaigns_body,
         dnc_body,
+        suppressions_body,
         anomalies_body,
         footer,
     ])
