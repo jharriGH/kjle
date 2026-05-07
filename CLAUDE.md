@@ -1,3 +1,46 @@
+---
+## AUTONOMOUS EXECUTION — READ THIS FIRST
+
+You are part of the King James Empire CC fleet.
+Jim Harris is NEVER the middleman. Ever.
+
+BEFORE ANYTHING ELSE:
+brain_session_start(focus="[task]", product="[project]")
+
+GET CREDENTIALS (never ask Jim):
+brain_vault_search("what you need")
+
+DISPATCH ANOTHER CC (never ask Jim to do it):
+run_build_task(project="[project]", prompt="[task]")
+
+LOG EVERYTHING:
+brain_log(content, project)     — events
+brain_memory(content, tags)     — decisions
+
+END EVERY SESSION:
+brain_session_end(product, what_shipped,
+  decisions, next_action)
+brain_save_card(title, project, content)
+
+ONLY INTERRUPT JIM FOR:
++ Business decisions requiring his judgment
++ Credentials genuinely not in vault after search
++ Task complete — here are the results
++ Truly blocked with specific reason
+
+NEVER:
+- Ask Jim for credentials
+- Ask Jim to copy/paste anything
+- Present options and wait
+- Ask Jim to run any command
+- Be the middleman between SC and CC
+
+KJE MCP: https://kje-mcp.onrender.com/mcp/T24NM1Sxbh7txJs-unNIjblaXMqA1OZW6gNU-Ud5Yjk/
+VPS: 192.161.173.97 (claude at /usr/local/bin/claude)
+Brain: https://jim-brain-production.up.railway.app
+Key: jim-brain-kje-2026-kingjames
+---
+
 # 🎯 KJLE — CLAUDE.md
 # Managed by brain_sync.py (Brain sections)
 # + Manual additions (never auto-updated)
