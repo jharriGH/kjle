@@ -340,23 +340,76 @@ def is_domain_expiring_soon(expires: Optional[str], days: int = 90) -> Optional[
 # Computed from CSV data only — no enrichment needed
 # Score: 0-100, higher = more pain = better prospect
 
+def _known_absent(val) -> bool:
+    """
+    True iff val is KNOWN to be absent. False if unknown (None) or present.
+
+    Null-aware penalty helper for compute_pain_score_v1 (v2 formula). Lets us
+    distinguish "we know the lead doesn't have X" (apply penalty) from
+    "we haven't measured X yet" (don't penalize unknowns).
+
+      bool False         → known absent → True  (apply penalty)
+      empty str ""       → known absent → True
+      0                  → known absent → True
+      None               → unknown      → False (no penalty)
+      True / non-empty
+        / non-zero       → present      → False (no penalty)
+
+    Order of isinstance checks matters: bool is a subclass of int in Python,
+    so the bool branch must precede the (int, float) branch.
+    """
+    if val is None:
+        return False
+    if isinstance(val, bool):
+        return val is False
+    if isinstance(val, str):
+        return val.strip() == ""
+    if isinstance(val, (int, float)):
+        return val == 0
+    return False
+
+
 def compute_pain_score_v1(row: dict, niche_slug: str) -> dict:
     """
-    Pain Score v1 — uses only data available from the source CSV.
-    Returns sub-scores and composite score.
+    Pain Score formula. Returns sub-scores and composite score.
+
+    v2 (deployed 2026-05-06) — surgical rebalance of v1 to fix degenerate
+    distribution (95% of leads were collapsing into the 50-59 band).
+    Two changes:
+
+      1. Null-aware penalties: NULL no longer treated as known-absent.
+         Sub-scores stop inflating uniformly across leads with sparse data.
+         Affected: SEO, Social, Website, Bizintel sub-scores.
+
+      2. Re-weighted composite:
+            reputation: 0.30 → 0.40   (strongest differentiator)
+            website:    0.25 → 0.20
+            seo:        0.25 → 0.10   (sparse signals, becomes tiebreaker)
+            social:     0.10 → 0.10   (unchanged)
+            bizintel:   0.10 → 0.20   (domain status is a powerful binary)
+
+    NOTE: function name retained as compute_pain_score_v1 for call-site
+    compatibility. Internal formula is v2 (Change 1 + Change 2 from
+    2026-05-06). See the pain_score_version field on each lead for the
+    actual formula version a row was scored with.
+
+    Future formula revisions should add v3 logic INSIDE this function and
+    bump the pain_score_version field, NOT rename the function. Renaming
+    forces every call site (ingest pipeline, recompute backfill scripts,
+    any downstream tooling) to be updated in lockstep, which is a
+    distribution-of-changes problem we explicitly avoid here.
     """
-    # Niche weight defaults (will override with DB values later)
     weights = {
-        'website':    0.25,
-        'reputation': 0.30,
-        'seo':        0.25,
+        'website':    0.20,
+        'reputation': 0.40,
+        'seo':        0.10,
         'social':     0.10,
-        'bizintel':   0.10,
+        'bizintel':   0.20,
     }
 
     scores = {}
 
-    # ── Safe numeric cast helper ────────────────────────────
+    # ── Safe numeric cast helpers ────────────────────────────
     def to_float(val, default=None):
         try:
             return float(val) if val is not None and str(val).strip() not in ('', 'nan') else default
@@ -370,6 +423,8 @@ def compute_pain_score_v1(row: dict, niche_slug: str) -> dict:
             return default
 
     # ── Reputation Sub-Score (0-100) ─────────────────────────
+    # Continuous signals (stars, reviews, claimed status). Already null-safe
+    # in v1 — null stars produce no penalty. No change in v2.
     rep = 0
     stars = to_float(row.get('google_stars'))
     reviews = to_int(row.get('google_review_count'), 0)
@@ -391,45 +446,47 @@ def compute_pain_score_v1(row: dict, niche_slug: str) -> dict:
     rep = min(rep, 100)
     scores['pain_score_reputation'] = rep
 
-    # ── SEO Sub-Score (0-100) ────────────────────────────────
+    # ── SEO Sub-Score (0-100, v2 null-aware) ─────────────────
     seo = 0
+    if _known_absent(row.get('seo_schema_present')):  seo += 40
+    if _known_absent(row.get('mobile_friendly')):     seo += 30
+    if _known_absent(row.get('google_analytics')):    seo += 15
+    if _known_absent(row.get('google_pixel')):        seo += 10
     google_rank = to_int(row.get('google_rank'), 0)
-    if not row.get('seo_schema_present'):            seo += 40
-    if not row.get('mobile_friendly'):               seo += 30
-    if not row.get('google_analytics'):              seo += 15
-    if not row.get('google_pixel'):                  seo += 10
-    if google_rank and google_rank > 10:             seo += 20
+    if google_rank and google_rank > 10:              seo += 20
     seo = min(seo, 100)
     scores['pain_score_seo'] = seo
 
-    # ── Social Sub-Score (0-100) ─────────────────────────────
+    # ── Social Sub-Score (0-100, v2 null-aware) ──────────────
     social = 0
     fb_stars = to_float(row.get('facebook_stars'))
-    if not row.get('facebook_url'):                  social += 25
-    if not row.get('instagram_url'):                 social += 20
-    if not row.get('ads_facebook'):                  social += 15
-    if not row.get('ads_adwords'):                   social += 15
-    if fb_stars is not None and fb_stars < 3.5:      social += 25
+    if _known_absent(row.get('facebook_url')):        social += 25
+    if _known_absent(row.get('instagram_url')):       social += 20
+    if _known_absent(row.get('ads_facebook')):        social += 15
+    if _known_absent(row.get('ads_adwords')):         social += 15
+    if fb_stars is not None and fb_stars < 3.5:       social += 25
     social = min(social, 100)
     scores['pain_score_social'] = social
 
-    # ── Website Sub-Score (from CSV only) ───────────────────
+    # ── Website Sub-Score (0-100, v2 null-aware) ─────────────
     web = 0
-    if not row.get('website'):                  web += 50   # no website at all
-    if not row.get('mobile_friendly'):          web += 20
-    if row.get('uses_wordpress') is False and not row.get('uses_shopify'): web += 5
-    domain_exp = row.get('domain_expired')
-    if domain_exp:                              web += 25
+    if _known_absent(row.get('website')):             web += 50  # known empty: no website
+    if _known_absent(row.get('mobile_friendly')):     web += 20
+    if row.get('uses_wordpress') is False and _known_absent(row.get('uses_shopify')):
+        web += 5
+    if row.get('domain_expired'):                     web += 25  # truthy: known expired
     web = min(web, 100)
     scores['pain_score_website'] = web
 
-    # ── Business Intelligence Sub-Score ─────────────────────
+    # ── Business Intelligence Sub-Score (0-100, v2 null-aware) ──
     biz = 0
-    domain_soon = row.get('domain_expiring_soon')
-    if domain_soon:                             biz += 30
-    if not row.get('ads_adwords') and not row.get('ads_facebook'): biz += 20
+    if row.get('domain_expiring_soon'):               biz += 30  # truthy: known expiring
+    # Both ads channels known absent: penalty. If either is unknown, no penalty.
+    if (_known_absent(row.get('ads_adwords'))
+            and _known_absent(row.get('ads_facebook'))):
+        biz += 20
     email_state = row.get('email_state', '')
-    if email_state == 'risky':                  biz += 15
+    if email_state == 'risky':                        biz += 15
     biz = min(biz, 100)
     scores['pain_score_bizintel'] = biz
 
@@ -442,7 +499,7 @@ def compute_pain_score_v1(row: dict, niche_slug: str) -> dict:
         scores['pain_score_bizintel']   * weights['bizintel']
     )
     scores['pain_score'] = round(composite, 1)
-    scores['pain_score_version'] = 1
+    scores['pain_score_version'] = 2
     scores['pain_score_computed_at'] = datetime.utcnow().isoformat()
 
     return scores
