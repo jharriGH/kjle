@@ -242,24 +242,26 @@ async def job_classify_segments() -> dict:
 
     async def _classify_one(label: str) -> int:
         """
-        Cursor-paginate through every active lead in the target pain band and
-        UPDATE-by-id-list to set segment_label. We deliberately do NOT filter
-        out rows that already carry the target label — overwriting them is
-        cheap (PK index hit) and dodges PostgREST's "neq omits NULLs" bug
-        which would leave unclassified rows unlabeled.
-        Cursor on id makes the loop converge without needing the neq filter.
-        Chain order matches the working pattern in routes/leads.py:
-        filters first, then order, then range (range, not limit, because
-        limit + cursor-style filters has been observed to 400 on this stack).
+        Cursor-paginate then range-UPDATE per chunk. We avoid IN(ids) on the
+        UPDATE because PostgREST/gateway URL length caps below 1000 UUIDs
+        (~37KB serialized) — a probe at /scheduler/diag/classify-select
+        confirmed UPDATE-by-IN-1000 returns "JSON could not be generated"
+        while UPDATE-by-id-range with the same pain filter succeeds.
+
+        Each chunk: SELECT 1000 ids in order, take first/last as bounds, then
+        UPDATE WHERE pain-filter AND id BETWEEN first AND last. Since the
+        pain filter is the same on SELECT and UPDATE, the row set is
+        identical — total += len(rows) is exact.
+        Cursor moves forward via gt(id, prev_last) so chunks don't overlap.
         """
         total = 0
         chunk_idx = 0
-        last_id: Optional[str] = None
+        last_id_cursor: Optional[str] = None
         while True:
             sel = db.table("leads").select("id").eq("is_active", True)
             sel = _apply_pain_filter(sel, label)
-            if last_id is not None:
-                sel = sel.gt("id", last_id)
+            if last_id_cursor is not None:
+                sel = sel.gt("id", last_id_cursor)
             sel = sel.order("id", desc=False).limit(CHUNK_SIZE)
             try:
                 rows = sel.execute().data or []
@@ -268,16 +270,22 @@ async def job_classify_segments() -> dict:
                 raise
             if not rows:
                 break
-            ids = [r["id"] for r in rows]
+            first_id = rows[0]["id"]
+            last_id  = rows[-1]["id"]
             try:
-                db.table("leads").update(
-                    {"segment_label": label, "segmented_at": now_iso}
-                ).in_("id", ids).execute()
+                upd = (
+                    db.table("leads")
+                    .update({"segment_label": label, "segmented_at": now_iso})
+                    .eq("is_active", True)
+                )
+                upd = _apply_pain_filter(upd, label)
+                upd = upd.gte("id", first_id).lte("id", last_id)
+                upd.execute()
             except Exception as e:
                 logger.error(f"[{job_name}] {label.upper()} UPDATE chunk {chunk_idx} failed: {e}")
                 raise
-            total += len(ids)
-            last_id = ids[-1]
+            total += len(rows)
+            last_id_cursor = last_id
             chunk_idx += 1
             if chunk_idx % 25 == 0:
                 logger.info(f"[{job_name}] {label.upper()} progress: {total:,} rows ({chunk_idx} chunks)")
