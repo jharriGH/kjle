@@ -260,7 +260,7 @@ async def job_classify_segments() -> dict:
             sel = _apply_pain_filter(sel, label)
             if last_id is not None:
                 sel = sel.gt("id", last_id)
-            sel = sel.order("id", desc=False).range(0, CHUNK_SIZE - 1)
+            sel = sel.order("id", desc=False).limit(CHUNK_SIZE)
             try:
                 rows = sel.execute().data or []
             except Exception as e:
@@ -1672,6 +1672,43 @@ async def get_scheduler_status():
         "status": "success",
         "jobs":   jobs_out,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /scheduler/diag/classify-select  (TEMP DIAG — remove after debug)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/scheduler/diag/classify-select")
+async def diag_classify_select():
+    """Debug variants of the classify SELECT to isolate the 400 error."""
+    db = get_db()
+    out = {}
+
+    def try_query(name, fn):
+        try:
+            r = fn()
+            out[name] = {"ok": True, "rows": len(r.data or [])}
+        except Exception as e:
+            out[name] = {"ok": False, "error": repr(e)[:400]}
+
+    try_query("v1_only_eq_active", lambda:
+        db.table("leads").select("id").eq("is_active", True).limit(5).execute())
+    try_query("v2_active_pain_gte", lambda:
+        db.table("leads").select("id").eq("is_active", True).gte("pain_score", 30).limit(5).execute())
+    try_query("v3_order_pain_desc", lambda:
+        db.table("leads").select("id").eq("is_active", True).gte("pain_score", 30).order("pain_score", desc=True).limit(5).execute())
+    try_query("v4_order_id_asc", lambda:
+        db.table("leads").select("id").eq("is_active", True).gte("pain_score", 30).order("id").limit(5).execute())
+    try_query("v5_order_id_explicit_asc", lambda:
+        db.table("leads").select("id").eq("is_active", True).gte("pain_score", 30).order("id", desc=False).limit(5).execute())
+    try_query("v6_order_id_range", lambda:
+        db.table("leads").select("id").eq("is_active", True).gte("pain_score", 30).order("id", desc=False).range(0, 4).execute())
+    try_query("v7_chunk_1000_id_asc_limit", lambda:
+        db.table("leads").select("id").eq("is_active", True).gte("pain_score", 30).order("id", desc=False).limit(1000).execute())
+    try_query("v8_chunk_1000_id_asc_range", lambda:
+        db.table("leads").select("id").eq("is_active", True).gte("pain_score", 30).order("id", desc=False).range(0, 999).execute())
+
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
