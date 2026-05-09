@@ -171,6 +171,24 @@ async def _perform_check(
     db = get_db()
     src = source or "unknown"
 
+    # 0. Whitelist short-circuit — overrides suppressions, cache, budget cap,
+    #    and provider. A whitelist hit means "always allow this number."
+    try:
+        wl = db.table("dnc_whitelist").select("phone").eq("phone", phone).execute()
+        if wl.data:
+            _audit(
+                phone=phone, source=src, result="whitelist",
+                is_dnc=False, requesting_lead_id=lead_id,
+            )
+            return _serialize_response(
+                result_source="whitelist",
+                phone_normalized=phone, is_dnc=False,
+                reason="whitelisted",
+            )
+    except Exception as e:
+        logger.warning(f"dnc: whitelist read failed for {phone}: {e}")
+        # Fall through — better to consult suppressions/cache/provider than 500.
+
     # 1. Internal suppression list — free, fastest path
     try:
         sup = db.table("dnc_suppressions").select("phone, reason").eq("phone", phone).execute()
