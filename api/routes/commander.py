@@ -74,9 +74,9 @@ RESPONSE STYLE:
 - Keep responses concise — this is a command center not a chatbot
 
 KNOWLEDGE BASE:
-- HOT leads = pain score >= 70
-- WARM leads = pain score 40-69
-- COLD leads = pain score < 40
+- HOT leads = pain score >= 30  (v2 threshold, realigned 2026-05-09)
+- WARM leads = pain score 15-29
+- COLD leads = pain score < 15
 - Stage 1 = free website scrape (runs every 12hrs, 200 leads)
 - Stage 3 = Outscraper Google Maps ($0.002/lead, pain >= 60)
 - Stage 4 = Firecrawl deep crawl ($0.005/lead, pain >= 75)

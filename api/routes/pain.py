@@ -3,7 +3,7 @@ KJLE API — Pain Score Intelligence Routes
 GET /kjle/v1/pain/top            — top N leads by pain score
 GET /kjle/v1/pain/distribution   — bucket counts (0-20, 21-40, etc.)
 GET /kjle/v1/pain/by-niche       — avg pain + hot lead count per niche
-GET /kjle/v1/pain/hot-leads      — unenriched DemoEnginez-fit leads pain>=70
+GET /kjle/v1/pain/hot-leads      — unenriched DemoEnginez-fit leads pain>=30
 GET /kjle/v1/pain/benchmarks     — full stats for a specific niche
 """
 from fastapi import APIRouter, HTTPException, Query
@@ -96,7 +96,7 @@ async def get_pain_by_niche(
             niches[slug] = {"niche_slug": slug, "lead_count": 0, "total_pain": 0, "hot_lead_count": 0}
         niches[slug]["lead_count"] += 1
         niches[slug]["total_pain"] += score
-        if score >= 70:
+        if score >= 30:
             niches[slug]["hot_lead_count"] += 1
 
     output = []
@@ -130,7 +130,7 @@ async def get_hot_leads(
             "website, pain_score, enrichment_stage, fit_demoenginez, created_at"
         )
         .eq("is_active", True)
-        .gte("pain_score", 70)
+        .gte("pain_score", 30)
         .eq("fit_demoenginez", True)
         .eq("enrichment_stage", 0)
         .order("pain_score", desc=True)
@@ -144,7 +144,7 @@ async def get_hot_leads(
     result = query.execute()
     return {
         "filters": {"niche_slug": niche_slug, "state": state, "limit": limit},
-        "description": "Unenriched, DemoEnginez-fit leads with pain_score >= 70",
+        "description": "Unenriched, DemoEnginez-fit leads with pain_score >= 30",
         "count": len(result.data),
         "hot_leads": result.data,
     }
@@ -179,8 +179,8 @@ async def get_pain_benchmarks(
             "median_pain": round(median, 2),
             "min_pain":    scores[0],
             "max_pain":    scores[-1],
-            "hot_leads":   sum(1 for s in scores if s >= 70),
-            "warm_leads":  sum(1 for s in scores if 40 <= s < 70),
-            "cold_leads":  sum(1 for s in scores if s < 40),
+            "hot_leads":   sum(1 for s in scores if s >= 30),
+            "warm_leads":  sum(1 for s in scores if 15 <= s < 30),
+            "cold_leads":  sum(1 for s in scores if s < 15),
         },
     }

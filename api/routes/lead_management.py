@@ -30,16 +30,20 @@ def verify_api_key(x_api_key: str = Header(...)):
 
 
 def score_to_segment(pain_score) -> str:
-    """Inline threshold logic — mirrors segments_engine.py. No import to avoid circular deps."""
+    """Inline threshold logic — mirrors segments_engine.py::_classify_lead.
+    No import to avoid circular deps. Keep in sync.
+
+    v2 thresholds (2026-05-09): HOT >= 30 | WARM 15-29 | COLD < 15.
+    """
     if pain_score is None:
         return "unclassified"
     try:
         score = float(pain_score)
     except (ValueError, TypeError):
         return "unclassified"
-    if score >= 70:
+    if score >= 30:
         return "hot"
-    elif score >= 40:
+    elif score >= 15:
         return "warm"
     else:
         return "cold"

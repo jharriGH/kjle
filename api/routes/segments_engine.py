@@ -22,46 +22,43 @@ router = APIRouter()
 # Classification Logic
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PAIN SEGMENTATION (v2 thresholds, 2026-05-09):
+#   HOT >= 30 | WARM 15-29 | COLD < 15
+# Set by _classify_lead. If you change thresholds here, also update:
+#   - api/routes/lead_management.py::score_to_segment  (duplicate logic)
+#   - api/routes/pain.py                               (5 spots: lines around hot/warm bucketing + docstrings)
+#   - api/routes/push_demoenginez.py                   (hot_lead flag)
+#   - api/routes/commander.py system prompt            (HOT/WARM/COLD knowledge base)
+# Cross-file dependency — no central constant. Keep them in sync.
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _classify_lead(lead: dict) -> str:
     """
     Returns 'hot', 'warm', or 'cold' for a single lead dict.
 
-    Hot (ALL must be true):
-      - pain_score >= 70
-      - fit_demoenginez = true
-      - enrichment_stage >= 1
-      - website_reachable = true OR enrichment_stage = 0
+    Pure pain_score thresholds (v2 distribution realignment, 2026-05-09):
+      HOT:  pain_score >= 30   (~13% of leads under v2 distribution)
+      WARM: 15 <= pain_score < 30   (~13%)
+      COLD: pain_score < 15   (~74%)
 
-    Warm (ANY of these):
-      - pain_score >= 40 AND pain_score < 70
-      - pain_score >= 70 AND fit_demoenginez = false
-      - pain_score >= 70 AND enrichment_stage = 0
+    Threshold rationale: v2 formula's null-aware design produced a sparser
+    raw distribution than v1. Thresholds realigned from v1's 70/40 (which
+    targeted v1's collapsed-at-50-59 shape) to track v2's actual shape while
+    preserving relative ranking. Will be re-validated against first-campaign
+    reply rate (Session 2).
 
-    Cold: everything else
+    Note: v1 had additional gates on HOT (fit_demoenginez, enrichment_stage,
+    website_reachable). Removed in v2 — those are actionability filters
+    that belong at campaign-build time, not at segmentation time. HOT now
+    means high pain, full stop. Campaign-build queries filter further on
+    has_email / email_state / fit_demoenginez / etc. as needed.
     """
-    pain    = lead.get("pain_score") or 0
-    fit     = bool(lead.get("fit_demoenginez"))
-    stage   = lead.get("enrichment_stage") or 0
-    reach   = bool(lead.get("website_reachable"))
-
-    # ── Hot gate ─────────────────────────────────────────────────────────────
-    if (
-        pain >= 70
-        and fit
-        and stage >= 1
-        and (reach or stage == 0)
-    ):
+    pain = lead.get("pain_score") or 0
+    if pain >= 30:
         return "hot"
-
-    # ── Warm gate ────────────────────────────────────────────────────────────
-    if (40 <= pain < 70):
+    if pain >= 15:
         return "warm"
-    if pain >= 70 and not fit:
-        return "warm"
-    if pain >= 70 and stage == 0:
-        return "warm"
-
-    # ── Cold fallback ─────────────────────────────────────────────────────────
     return "cold"
 
 

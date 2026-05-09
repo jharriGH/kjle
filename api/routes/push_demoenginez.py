@@ -65,7 +65,7 @@ def _map_lead_to_de(lead: dict) -> dict:
         "zip":           lead.get("zip") or "",
         "niche":         lead.get("niche_slug") or "",
         "source":        PUSH_SOURCE,
-        "hot_lead":      pain >= 70,
+        "hot_lead":      pain >= 30,   # v2 threshold (was 70 under v1, realigned 2026-05-09)
         "viewed":        False,
         "converted":     False,
         "outreach_sent": False,
