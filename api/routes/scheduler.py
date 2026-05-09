@@ -203,58 +203,109 @@ def _map_ri_status(ri_status: Optional[str]) -> Optional[str]:
 
 async def job_classify_segments() -> dict:
     """
-    Fetches all active leads (up to 10,000), runs _classify_lead() on each,
-    writes segment_label + segmented_at back to leads table.
+    Bulk-UPDATE classifier (v2 — rewritten 2026-05-09).
+
+    Three Postgres UPDATE statements, one per segment, executed via Supabase
+    REST PATCH. Replaces the v1 per-row-REST-update loop which took ~15 hours
+    for 549K leads at ~10 rows/sec. Now completes in seconds for the same
+    workload because Postgres handles each segment as a single SQL UPDATE.
+
+    Threshold logic MIRRORS api/routes/segments_engine.py::_classify_lead:
+      HOT:  pain_score >= 30
+      WARM: 15 <= pain_score < 30
+      COLD: pain_score < 15
+    Leads with NULL pain_score are NOT classified by this job (they're
+    skipped — no filter matches them — and segment_label stays unchanged).
+    Cross-file dependency: thresholds are duplicated here for bulk-UPDATE
+    compatibility. If you change thresholds in segments_engine.py, update
+    these UPDATEs too. See the cross-file landmine breadcrumb in
+    segments_engine.py for the full list.
     """
     job_name = "classify_segments"
-    logger.info(f"[{job_name}] Starting...")
+    logger.info(f"[{job_name}] Starting (bulk-UPDATE mode)...")
     t_start = time.monotonic()
 
     db = get_db()
+    now_iso = _now_iso()
     counts = {"hot": 0, "warm": 0, "cold": 0}
     failed = 0
 
-    classify_limit = int(await _get_admin_setting("classify_batch_size", 100_000))
+    try:
+        # HOT: pain_score >= 30 → segment_label='hot'
+        r = (
+            db.table("leads")
+            .update({"segment_label": "hot", "segmented_at": now_iso})
+            .eq("is_active", True)
+            .gte("pain_score", 30)
+            .execute()
+        )
+        counts["hot"] = len(r.data) if r.data else 0
+        logger.info(f"[{job_name}] HOT bulk-update: {counts['hot']:,} rows")
 
-    leads = (
-        db.table("leads")
-        .select("id, pain_score, fit_demoenginez, enrichment_stage, website_reachable")
-        .eq("is_active", True)
-        .limit(classify_limit)
-        .execute()
-        .data or []
-    )
+        # WARM: 15 <= pain_score < 30 → segment_label='warm'
+        r = (
+            db.table("leads")
+            .update({"segment_label": "warm", "segmented_at": now_iso})
+            .eq("is_active", True)
+            .gte("pain_score", 15)
+            .lt("pain_score", 30)
+            .execute()
+        )
+        counts["warm"] = len(r.data) if r.data else 0
+        logger.info(f"[{job_name}] WARM bulk-update: {counts['warm']:,} rows")
 
-    for lead in leads:
-        label = _classify_lead(lead)
-        counts[label] += 1
-        try:
-            db.table("leads").update({
-                "segment_label": label,
-                "segmented_at":  _now_iso(),
-            }).eq("id", lead["id"]).execute()
-        except Exception as e:
-            failed += 1
-            logger.error(f"[{job_name}] Update failed for lead {lead['id']}: {e}")
+        # COLD: pain_score < 15 → segment_label='cold'
+        r = (
+            db.table("leads")
+            .update({"segment_label": "cold", "segmented_at": now_iso})
+            .eq("is_active", True)
+            .lt("pain_score", 15)
+            .execute()
+        )
+        counts["cold"] = len(r.data) if r.data else 0
+        logger.info(f"[{job_name}] COLD bulk-update: {counts['cold']:,} rows")
+
+    except Exception as e:
+        # Bulk-UPDATE failure (likely Postgres statement_timeout on COLD's
+        # large row set). Log + bail; segment_label may be partially updated.
+        duration = time.monotonic() - t_start
+        logger.error(f"[{job_name}] Bulk UPDATE failed: {e}")
+        await _log_job(
+            job_name,
+            leads_processed=sum(counts.values()),
+            hot=counts["hot"],
+            warm=counts["warm"],
+            cold=counts["cold"],
+            duration_seconds=duration,
+            status="failed",
+            notes=f"bulk_update_error: {str(e)[:300]}",
+        )
+        return {
+            "job": job_name,
+            "status": "failed",
+            "error": str(e),
+            "partial_counts": counts,
+            "duration_seconds": round(duration, 3),
+        }
 
     duration = time.monotonic() - t_start
-    notes = f"failed_writes={failed}" if failed else None
-    status = "partial" if failed > 0 else "success"
+    total = sum(counts.values())
+    notes = f"hot={counts['hot']}, warm={counts['warm']}, cold={counts['cold']}, total={total}, duration={duration:.1f}s"
 
     await _log_job(
         job_name,
-        leads_processed=len(leads),
+        leads_processed=total,
         hot=counts["hot"],
         warm=counts["warm"],
         cold=counts["cold"],
         duration_seconds=duration,
-        status=status,
+        status="success",
         notes=notes,
     )
 
     result = {
         "job": job_name,
-        "leads_processed": len(leads),
+        "leads_processed": total,
         "hot":   counts["hot"],
         "warm":  counts["warm"],
         "cold":  counts["cold"],
