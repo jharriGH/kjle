@@ -241,12 +241,28 @@ async def job_classify_segments() -> dict:
         return query.lt("pain_score", 15)  # cold
 
     async def _classify_one(label: str) -> int:
-        """Loop chunks until no rows match (label still wrong + pain in band)."""
+        """
+        Cursor-paginate through every active lead in the target pain band and
+        UPDATE-by-id-list to set segment_label. We deliberately do NOT filter
+        out rows that already carry the target label — overwriting them is
+        cheap (PK index hit) and dodges PostgREST's "neq omits NULLs" bug
+        which would leave unclassified rows unlabeled.
+        Cursor on id makes the loop converge without needing the neq filter.
+        """
         total = 0
         chunk_idx = 0
+        last_id: Optional[str] = None
         while True:
-            sel = db.table("leads").select("id").eq("is_active", True).neq("segment_label", label)
-            sel = _apply_pain_filter(sel, label).limit(CHUNK_SIZE)
+            sel = (
+                db.table("leads")
+                .select("id")
+                .eq("is_active", True)
+                .order("id")
+                .limit(CHUNK_SIZE)
+            )
+            sel = _apply_pain_filter(sel, label)
+            if last_id is not None:
+                sel = sel.gt("id", last_id)
             try:
                 rows = sel.execute().data or []
             except Exception as e:
@@ -263,6 +279,7 @@ async def job_classify_segments() -> dict:
                 logger.error(f"[{job_name}] {label.upper()} UPDATE chunk {chunk_idx} failed: {e}")
                 raise
             total += len(ids)
+            last_id = ids[-1]
             chunk_idx += 1
             if chunk_idx % 25 == 0:
                 logger.info(f"[{job_name}] {label.upper()} progress: {total:,} rows ({chunk_idx} chunks)")
