@@ -203,73 +203,80 @@ def _map_ri_status(ri_status: Optional[str]) -> Optional[str]:
 
 async def job_classify_segments() -> dict:
     """
-    Bulk-UPDATE classifier (v2 — rewritten 2026-05-09).
+    Chunked-UPDATE classifier (v3 — rewritten 2026-05-09).
 
-    Three Postgres UPDATE statements, one per segment, executed via Supabase
-    REST PATCH. Replaces the v1 per-row-REST-update loop which took ~15 hours
-    for 549K leads at ~10 rows/sec. Now completes in seconds for the same
-    workload because Postgres handles each segment as a single SQL UPDATE.
+    For each target segment we run a SELECT→UPDATE-by-id loop until convergence.
+    Each chunk SELECTs up to CHUNK_SIZE ids that match the pain filter AND do
+    NOT already carry the target label, then issues an UPDATE-by-id-list. This
+    avoids the Postgres statement_timeout that killed an earlier "single bulk
+    UPDATE per segment" attempt on the ~400K COLD row set: by-id UPDATEs hit
+    the primary-key index and complete in well under the per-statement budget.
+
+    The negative-label filter (`neq("segment_label", target)`) is what makes the
+    loop converge — once a row is updated it falls out of subsequent SELECTs.
 
     Threshold logic MIRRORS api/routes/segments_engine.py::_classify_lead:
       HOT:  pain_score >= 30
       WARM: 15 <= pain_score < 30
       COLD: pain_score < 15
-    Leads with NULL pain_score are NOT classified by this job (they're
-    skipped — no filter matches them — and segment_label stays unchanged).
-    Cross-file dependency: thresholds are duplicated here for bulk-UPDATE
-    compatibility. If you change thresholds in segments_engine.py, update
-    these UPDATEs too. See the cross-file landmine breadcrumb in
-    segments_engine.py for the full list.
+    Leads with NULL pain_score are skipped (no filter matches them) and their
+    segment_label stays unchanged. Cross-file dependency: thresholds are
+    duplicated here. If you change thresholds in segments_engine.py, update
+    these chunks too. See the landmine breadcrumb in segments_engine.py.
     """
     job_name = "classify_segments"
-    logger.info(f"[{job_name}] Starting (bulk-UPDATE mode)...")
+    CHUNK_SIZE = 1000
+    logger.info(f"[{job_name}] Starting (chunked-UPDATE mode, chunk={CHUNK_SIZE})...")
     t_start = time.monotonic()
 
     db = get_db()
     now_iso = _now_iso()
     counts = {"hot": 0, "warm": 0, "cold": 0}
-    failed = 0
+
+    def _apply_pain_filter(query, label: str):
+        if label == "hot":
+            return query.gte("pain_score", 30)
+        if label == "warm":
+            return query.gte("pain_score", 15).lt("pain_score", 30)
+        return query.lt("pain_score", 15)  # cold
+
+    async def _classify_one(label: str) -> int:
+        """Loop chunks until no rows match (label still wrong + pain in band)."""
+        total = 0
+        chunk_idx = 0
+        while True:
+            sel = db.table("leads").select("id").eq("is_active", True).neq("segment_label", label)
+            sel = _apply_pain_filter(sel, label).limit(CHUNK_SIZE)
+            try:
+                rows = sel.execute().data or []
+            except Exception as e:
+                logger.error(f"[{job_name}] {label.upper()} SELECT chunk {chunk_idx} failed: {e}")
+                raise
+            if not rows:
+                break
+            ids = [r["id"] for r in rows]
+            try:
+                db.table("leads").update(
+                    {"segment_label": label, "segmented_at": now_iso}
+                ).in_("id", ids).execute()
+            except Exception as e:
+                logger.error(f"[{job_name}] {label.upper()} UPDATE chunk {chunk_idx} failed: {e}")
+                raise
+            total += len(ids)
+            chunk_idx += 1
+            if chunk_idx % 25 == 0:
+                logger.info(f"[{job_name}] {label.upper()} progress: {total:,} rows ({chunk_idx} chunks)")
+            await asyncio.sleep(0)  # cooperative yield
+        logger.info(f"[{job_name}] {label.upper()} done: {total:,} rows in {chunk_idx} chunks")
+        return total
 
     try:
-        # HOT: pain_score >= 30 → segment_label='hot'
-        r = (
-            db.table("leads")
-            .update({"segment_label": "hot", "segmented_at": now_iso})
-            .eq("is_active", True)
-            .gte("pain_score", 30)
-            .execute()
-        )
-        counts["hot"] = len(r.data) if r.data else 0
-        logger.info(f"[{job_name}] HOT bulk-update: {counts['hot']:,} rows")
-
-        # WARM: 15 <= pain_score < 30 → segment_label='warm'
-        r = (
-            db.table("leads")
-            .update({"segment_label": "warm", "segmented_at": now_iso})
-            .eq("is_active", True)
-            .gte("pain_score", 15)
-            .lt("pain_score", 30)
-            .execute()
-        )
-        counts["warm"] = len(r.data) if r.data else 0
-        logger.info(f"[{job_name}] WARM bulk-update: {counts['warm']:,} rows")
-
-        # COLD: pain_score < 15 → segment_label='cold'
-        r = (
-            db.table("leads")
-            .update({"segment_label": "cold", "segmented_at": now_iso})
-            .eq("is_active", True)
-            .lt("pain_score", 15)
-            .execute()
-        )
-        counts["cold"] = len(r.data) if r.data else 0
-        logger.info(f"[{job_name}] COLD bulk-update: {counts['cold']:,} rows")
-
+        counts["hot"]  = await _classify_one("hot")
+        counts["warm"] = await _classify_one("warm")
+        counts["cold"] = await _classify_one("cold")
     except Exception as e:
-        # Bulk-UPDATE failure (likely Postgres statement_timeout on COLD's
-        # large row set). Log + bail; segment_label may be partially updated.
         duration = time.monotonic() - t_start
-        logger.error(f"[{job_name}] Bulk UPDATE failed: {e}")
+        logger.error(f"[{job_name}] Chunked UPDATE failed: {e}")
         await _log_job(
             job_name,
             leads_processed=sum(counts.values()),
@@ -278,7 +285,7 @@ async def job_classify_segments() -> dict:
             cold=counts["cold"],
             duration_seconds=duration,
             status="failed",
-            notes=f"bulk_update_error: {str(e)[:300]}",
+            notes=f"chunked_update_error: {str(e)[:300]}",
         )
         return {
             "job": job_name,
@@ -309,9 +316,8 @@ async def job_classify_segments() -> dict:
         "hot":   counts["hot"],
         "warm":  counts["warm"],
         "cold":  counts["cold"],
-        "failed_writes": failed,
         "duration_seconds": round(duration, 3),
-        "status": status,
+        "status": "success",
     }
     logger.info(f"[{job_name}] Done. {result}")
     return result
