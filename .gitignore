@@ -1,4 +1,8 @@
-.env 
-venv311/ 
-__pycache__/ 
-*.pyc 
+.env
+venv311/
+__pycache__/
+*.pyc
+
+# Backfill / runtime checkpoint state — never commit
+scripts/.recompute_pain_checkpoint.json
+scripts/.recompute_pain_checkpoint.json.tmp
