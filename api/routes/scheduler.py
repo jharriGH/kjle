@@ -1708,6 +1708,24 @@ async def diag_classify_select():
     try_query("v8_chunk_1000_id_asc_range", lambda:
         db.table("leads").select("id").eq("is_active", True).gte("pain_score", 30).order("id", desc=False).range(0, 999).execute())
 
+    # UPDATE variants — fetch a small id sample first
+    try:
+        sample = db.table("leads").select("id").eq("is_active", True).gte("pain_score", 30).limit(5).execute().data
+        sample_ids = [r["id"] for r in (sample or [])]
+        out["sample_ids_count"] = len(sample_ids)
+    except Exception as e:
+        out["sample_ids_count"] = 0
+        out["sample_error"] = repr(e)[:400]
+        sample_ids = []
+
+    if sample_ids:
+        try_query("u1_update_by_in_ids_no_select", lambda:
+            db.table("leads").update({"segment_label": "hot"}).in_("id", sample_ids).execute())
+        try_query("u2_update_single_eq_id", lambda:
+            db.table("leads").update({"segment_label": "hot"}).eq("id", sample_ids[0]).execute())
+        try_query("u3_update_with_segmented_at", lambda:
+            db.table("leads").update({"segment_label": "hot", "segmented_at": _now_iso()}).in_("id", sample_ids).execute())
+
     return out
 
 
