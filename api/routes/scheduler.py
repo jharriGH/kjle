@@ -1768,11 +1768,18 @@ async def diag_classify_select():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/scheduler/run/{job_name}")
-async def run_job_manually(job_name: str):
+async def run_job_manually(job_name: str, background: bool = False):
     """
-    Manually trigger a specific scheduled job by name.
-    Valid names: classify_segments, enrich_stage1, cost_digest, stale_cleanup, email_clean_nightly, enrich_stage3_nightly, enrich_stage4_nightly.
-    Runs synchronously and returns the job result immediately.
+    Manually trigger a scheduled job by name.
+
+    Default: runs synchronously and returns the job result.
+    Pass ?background=true to fire-and-forget — useful for jobs that may
+    exceed the Render ingress timeout (e.g. classify_segments on the full
+    549K row table). Poll /scheduler/status afterward to see completion.
+
+    Valid names: classify_segments, enrich_stage1, cost_digest,
+    stale_cleanup, email_clean_nightly, enrich_stage3_nightly,
+    enrich_stage4_nightly.
     """
     if job_name not in JOB_FUNCTIONS:
         raise HTTPException(
@@ -1783,9 +1790,23 @@ async def run_job_manually(job_name: str):
             ),
         )
 
-    logger.info(f"Manual trigger: {job_name}")
-    result = await JOB_FUNCTIONS[job_name]()
+    logger.info(f"Manual trigger: {job_name} (background={background})")
 
+    if background:
+        async def _runner():
+            try:
+                await JOB_FUNCTIONS[job_name]()
+            except Exception as e:
+                logger.exception(f"Background job {job_name} crashed: {e}")
+        asyncio.create_task(_runner())
+        return {
+            "status":       "accepted",
+            "triggered_by": "manual",
+            "mode":         "background",
+            "message":      f"Job '{job_name}' started in background. Poll /scheduler/status for completion.",
+        }
+
+    result = await JOB_FUNCTIONS[job_name]()
     return {
         "status":       "success",
         "triggered_by": "manual",
