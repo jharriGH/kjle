@@ -248,21 +248,19 @@ async def job_classify_segments() -> dict:
         cheap (PK index hit) and dodges PostgREST's "neq omits NULLs" bug
         which would leave unclassified rows unlabeled.
         Cursor on id makes the loop converge without needing the neq filter.
+        Chain order matches the working pattern in routes/leads.py:
+        filters first, then order, then range (range, not limit, because
+        limit + cursor-style filters has been observed to 400 on this stack).
         """
         total = 0
         chunk_idx = 0
         last_id: Optional[str] = None
         while True:
-            sel = (
-                db.table("leads")
-                .select("id")
-                .eq("is_active", True)
-                .order("id")
-                .limit(CHUNK_SIZE)
-            )
+            sel = db.table("leads").select("id").eq("is_active", True)
             sel = _apply_pain_filter(sel, label)
             if last_id is not None:
                 sel = sel.gt("id", last_id)
+            sel = sel.order("id", desc=False).range(0, CHUNK_SIZE - 1)
             try:
                 rows = sel.execute().data or []
             except Exception as e:
