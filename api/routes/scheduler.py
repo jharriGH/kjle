@@ -1726,6 +1726,32 @@ async def diag_classify_select():
         try_query("u3_update_with_segmented_at", lambda:
             db.table("leads").update({"segment_label": "hot", "segmented_at": _now_iso()}).in_("id", sample_ids).execute())
 
+    # u4: pull 1000 ids and try to UPDATE-by-in — verify URL-length hypothesis
+    try:
+        big_sample = (
+            db.table("leads").select("id")
+            .eq("is_active", True).gte("pain_score", 30)
+            .order("id", desc=False).limit(1000).execute().data
+        )
+        big_ids = [r["id"] for r in (big_sample or [])]
+        out["big_sample_ids_count"] = len(big_ids)
+    except Exception as e:
+        big_ids = []
+        out["big_sample_error"] = repr(e)[:400]
+
+    if big_ids:
+        try_query("u4_update_by_in_1000_ids", lambda:
+            db.table("leads").update({"segment_label": "hot", "segmented_at": _now_iso()}).in_("id", big_ids).execute())
+        # u5: range-update — no IN clause, range filter
+        first = big_ids[0]
+        last = big_ids[-1]
+        try_query("u5_update_by_id_range", lambda:
+            db.table("leads")
+            .update({"segment_label": "hot", "segmented_at": _now_iso()})
+            .eq("is_active", True).gte("pain_score", 30)
+            .gte("id", first).lte("id", last)
+            .execute())
+
     return out
 
 
