@@ -260,8 +260,12 @@ def select_uncleaned_leads(db, limit: int) -> list[dict]:
     partial index idx_leads_email_uncleaned makes each one cheap.
 
     Predicate: is_active=True, email present, email_cleaned_at IS NULL,
-    email_status IS DISTINCT FROM 'pending_batch'. The pending_batch check
-    prevents the same lead from being submitted to two concurrent batches.
+    email_truelist_batch_id IS NULL. The batch-id check prevents the same
+    lead from being submitted to two concurrent batches. We filter on
+    batch_id (not email_status='pending_batch') because PostgREST's neq
+    operator OMITS NULL-valued rows — and the 469K uncleaned leads have
+    email_status=NULL, so a neq filter would silently exclude them all.
+    See memory/project_postgrest_in_url_cap.md neighbor: NULL semantics in PostgREST.
     """
     remaining = limit
     out: list[dict] = []
@@ -276,7 +280,7 @@ def select_uncleaned_leads(db, limit: int) -> list[dict]:
             .not_.is_("email", "null")
             .neq("email", "")
             .is_("email_cleaned_at", "null")
-            .neq("email_status", "pending_batch")
+            .is_("email_truelist_batch_id", "null")
             .order("pain_score", desc=True)
             .limit(remaining)
         )
@@ -298,7 +302,7 @@ def select_uncleaned_leads(db, limit: int) -> list[dict]:
             .not_.is_("email", "null")
             .neq("email", "")
             .is_("email_cleaned_at", "null")
-            .neq("email_status", "pending_batch")
+            .is_("email_truelist_batch_id", "null")
             .order("pain_score", desc=True)
             .limit(remaining)
         )
