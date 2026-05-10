@@ -5,13 +5,25 @@ Deployed on Render: https://kjle-api.onrender.com
 """
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
 from .database import init_db
+from .notify import notify, NotifyRequest
+
+
+# ── Empire-wide brain key auth (shared across all KJ services) ────────────────
+EMPIRE_BRAIN_KEY = os.environ.get("EMPIRE_BRAIN_KEY", "jim-brain-kje-2026-kingjames")
+
+
+def verify_brain_key(x_brain_key: str = Header(...)):
+    if x_brain_key != EMPIRE_BRAIN_KEY:
+        raise HTTPException(status_code=401, detail="Invalid x-brain-key")
+    return x_brain_key
 
 # ── Route Imports ─────────────────────────────────────────────────────────────
 from .routes import health
@@ -149,3 +161,18 @@ app.include_router(dnc.router,                    prefix=PREFIX,                
 app.include_router(dnc_webhooks.router,           prefix=PREFIX,                  tags=["DNC Webhooks"])
 app.include_router(admin_settings.router,         prefix=PREFIX,                  tags=["Admin Settings"])
 app.include_router(campaigns.router,              prefix=PREFIX,                  tags=["Campaign Performance"])
+
+
+# ── Empire-wide notification endpoints (top-level, x-brain-key auth) ──────────
+@app.post("/notify", dependencies=[Depends(verify_brain_key)], tags=["Notify"])
+async def post_notify(req: NotifyRequest):
+    return await notify(req)
+
+
+@app.post("/notify/test", dependencies=[Depends(verify_brain_key)], tags=["Notify"])
+async def notify_test():
+    return await notify(NotifyRequest(
+        severity="info",
+        message="P2 notify smoke test — endpoint live on kjle",
+        channel="both",
+    ))
