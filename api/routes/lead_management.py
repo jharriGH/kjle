@@ -80,6 +80,7 @@ async def lead_stats(x_api_key: str = Header(...)):
         invalid_res = supabase.table("leads").select("id", count="exact").eq("email_status", "invalid").execute()
         unknown_res = supabase.table("leads").select("id", count="exact").eq("email_status", "unknown").execute()
         error_res   = supabase.table("leads").select("id", count="exact").eq("email_status", "error").execute()
+        pending_res = supabase.table("leads").select("id", count="exact").eq("email_status", "pending_batch").execute()
 
         hot  = hot_res.count  or 0
         warm = warm_res.count or 0
@@ -90,6 +91,7 @@ async def lead_stats(x_api_key: str = Header(...)):
         invalid_email = invalid_res.count or 0
         unknown_email = unknown_res.count or 0
         error_email   = error_res.count   or 0
+        pending_email = pending_res.count or 0
 
         # DNC count — graceful fallback if column doesn't exist yet
         dnc_count = 0
@@ -111,10 +113,11 @@ async def lead_stats(x_api_key: str = Header(...)):
                 "unclassified": unclassified,
             },
             "by_email_status": {
-                "valid": valid_email,
-                "invalid": invalid_email,
-                "unknown": unknown_email,
-                "error": error_email,
+                "valid":         valid_email,
+                "invalid":       invalid_email,
+                "unknown":       unknown_email,
+                "error":         error_email,
+                "pending_batch": pending_email,
             },
             "dnc_count": dnc_count,
             "has_phone": phone_res.count or 0,

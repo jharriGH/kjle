@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     # ── Truelist.io — email cleaning ──────────────────────────────────────────
     # Optional fallback — preferred source is admin_settings table key 'truelist_api_key'
     TRUELIST_API_KEY: str = ""
+    # Shared secret for /webhooks/truelist/batch-complete?secret=... query-param auth.
+    # Until Truelist's dashboard webhook is configured, the 30-min poller handles
+    # ingestion; this env var only matters when the webhook is wired.
+    TRUELIST_WEBHOOK_SECRET: str = ""
 
     # ── DemoEnginez Push ──────────────────────────────────────────────────────
     DEMOENGINEZ_SUPABASE_URL: str = ""

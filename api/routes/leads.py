@@ -26,6 +26,7 @@ async def list_leads(
     fit_voicedrop:      Optional[bool] = Query(None),
     enrichment_stage:   Optional[int]  = Query(None, description="0-4"),
     email_state:        Optional[str]  = Query(None, description="ok|risky"),
+    email_sub_state:    Optional[str]  = Query(None, description="Truelist sub-state (e.g. is_role, accept_all, failed_mx_check)"),
     is_active:          bool           = Query(True),
     page:           int             = Query(1, ge=1),
     page_size:      int             = Query(50, ge=1, le=500),
@@ -39,7 +40,7 @@ async def list_leads(
         "id, business_name, phone, email, website, city, state, niche_slug, "
         "pain_score, fit_demoenginez, fit_reputation, fit_schema_ranker, fit_voicedrop, "
         "google_stars, google_review_count, g_maps_claimed, enrichment_stage, "
-        "data_quality_score, email_state, is_active, created_at"
+        "data_quality_score, email_state, email_sub_state, email_status, email_valid, is_active, created_at"
     ).eq("is_active", is_active)
 
     count_query = db.table("leads").select("id", count="exact").eq("is_active", is_active)
@@ -78,6 +79,9 @@ async def list_leads(
     if email_state:
         query = query.eq("email_state", email_state)
         count_query = count_query.eq("email_state", email_state)
+    if email_sub_state:
+        query = query.eq("email_sub_state", email_sub_state)
+        count_query = count_query.eq("email_sub_state", email_sub_state)
 
     # Get total count
     count_result = count_query.execute()

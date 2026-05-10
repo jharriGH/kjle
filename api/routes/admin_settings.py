@@ -24,7 +24,9 @@ DEFAULTS: Dict[str, str] = {
     "enrich_batch_size":            "1000",
     "stale_cutoff_days":            "180",
     "email_clean_enabled":          "false",
-    "email_clean_batch_size":       "100",
+    "email_clean_batch_size":       "100",          # legacy — verify_inline path, retained for backcompat
+    "email_clean_batch_size_emails":"25000",        # v2 batch architecture (Truelist /batches)
+    "email_clean_max_batches_per_night": "4",       # v2 batch architecture
     "truelist_api_key":             "",
     "cost_alert_threshold_warn":    "5.00",
     "cost_alert_threshold_critical":"8.00",
@@ -33,7 +35,11 @@ DEFAULTS: Dict[str, str] = {
 
 # Keys whose type should be cast on read
 _FLOAT_KEYS = {"budget_cap_usd", "cost_alert_threshold_warn", "cost_alert_threshold_critical"}
-_INT_KEYS   = {"classify_batch_size", "enrich_batch_size", "stale_cutoff_days", "email_clean_batch_size"}
+_INT_KEYS   = {
+    "classify_batch_size", "enrich_batch_size", "stale_cutoff_days",
+    "email_clean_batch_size",
+    "email_clean_batch_size_emails", "email_clean_max_batches_per_night",
+}
 _BOOL_KEYS  = {"email_clean_enabled", "scheduler_enabled"}
 _SECRET_KEYS = {"truelist_api_key"}
 
@@ -83,6 +89,8 @@ class SettingsUpdate(BaseModel):
     stale_cutoff_days:            Optional[int]   = None
     email_clean_enabled:          Optional[bool]  = None
     email_clean_batch_size:       Optional[int]   = None
+    email_clean_batch_size_emails:Optional[int]   = None
+    email_clean_max_batches_per_night: Optional[int] = None
     truelist_api_key:             Optional[str]   = None
     cost_alert_threshold_warn:    Optional[float] = None
     cost_alert_threshold_critical:Optional[float] = None

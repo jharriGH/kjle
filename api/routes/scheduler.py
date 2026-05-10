@@ -31,6 +31,13 @@ from ..lib import cost_guard
 from .segments_engine import _classify_lead
 from .enrichment import _fetch_and_parse
 from .webhooks import fire_event
+from .enrichment_email_clean import (
+    select_uncleaned_leads as ec_select_uncleaned_leads,
+    submit_batch as ec_submit_batch,
+    poll_batch as ec_poll_batch,
+    ingest_batch_result as ec_ingest_batch_result,
+    _get_truelist_api_key as ec_get_truelist_api_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +107,14 @@ JOB_DEFINITIONS = {
         "trigger":     "cron",
     },
     "email_clean_nightly": {
-        "description": "Nightly Truelist email validation — up to 2,500 leads/night at 1.5s/email (midnight UTC)",
+        "description": "Nightly Truelist bulk-batch submitter — submits N x 25K batches via POST /api/v1/batches (midnight UTC)",
         "schedule":    "Daily at 00:00 UTC",
         "trigger":     "cron",
+    },
+    "email_clean_poll_batches": {
+        "description": "Polls in-flight Truelist batches every 30 min, ingests annotated CSV when completed",
+        "schedule":    "Every 30 minutes",
+        "trigger":     "interval",
     },
     "enrich_stage3_nightly": {
         "description": "Nightly Outscraper Google Maps enrichment — Stage 1 leads, pain >= 60, budget-guarded",
@@ -618,183 +630,198 @@ async def job_stale_cleanup() -> dict:
 
 async def job_email_clean_nightly() -> dict:
     """
-    Nightly Truelist.io email validation job.
-    - Fires at midnight UTC
-    - Processes uncleaned leads up to 7-hour window (16,800 max)
-    - Rate: 1.5s per email (safely under 1 req/sec Truelist limit)
-    - Skips already-cleaned leads (only_uncleaned=True)
-    - Retries on 429 with exponential backoff
-    - Prioritizes HOT leads first, then WARM, then COLD
+    V2 nightly Truelist BATCH SUBMITTER (replaces v1 verify_inline loop).
+
+    Submits up to N batches/night to Truelist /api/v1/batches, where:
+      N         = admin_settings.email_clean_max_batches_per_night (default 4)
+      batchsize = admin_settings.email_clean_batch_size_emails    (default 25000)
+
+    Priority: HOT → WARM → COLD → unclassified, pain_score DESC within each.
+
+    Result CSV ingestion happens via the separate poller cron
+    (job_email_clean_poll_batches) or via the /webhooks/truelist/batch-complete
+    receiver when Truelist's dashboard webhook is configured. Both paths
+    converge on enrichment_email_clean.ingest_batch_result.
     """
     job_name = "email_clean_nightly"
-    logger.info(f"[{job_name}] Starting nightly email clean — up to {EMAIL_CLEAN_NIGHTLY_LIMIT:,} leads")
     t_start = time.monotonic()
-
     db = get_db()
 
-    # Load Truelist API key from admin_settings
-    api_key = None
-    try:
-        res = db.table("admin_settings").select("value").eq("key", "truelist_api_key").execute()
-        if res.data and res.data[0].get("value"):
-            api_key = res.data[0]["value"].strip() or None
-    except Exception as e:
-        logger.warning(f"[{job_name}] Could not load truelist_api_key: {e}")
-
-    if not api_key:
-        notes = "SKIPPED — truelist_api_key not set in admin_settings"
-        logger.warning(f"[{job_name}] {notes}")
-        await _log_job(job_name, status="skipped", notes=notes)
-        return {"job": job_name, "status": "skipped", "reason": notes}
-
-    # Check email_clean_enabled setting
+    # Enabled gate
     try:
         enabled_res = db.table("admin_settings").select("value").eq("key", "email_clean_enabled").execute()
         enabled = (enabled_res.data or [{}])[0].get("value", "false").lower() in ("true", "1", "yes")
     except Exception:
         enabled = False
-
     if not enabled:
-        notes = "SKIPPED — email_clean_enabled is false in admin_settings"
+        notes = "SKIPPED — email_clean_enabled is false"
         logger.warning(f"[{job_name}] {notes}")
         await _log_job(job_name, status="skipped", notes=notes)
         return {"job": job_name, "status": "skipped", "reason": notes}
 
-    # Fetch uncleaned leads in pages of 1,000 (Supabase default row limit)
-    # Paginate until we hit EMAIL_CLEAN_NIGHTLY_LIMIT or run out of leads
-    # Prioritize HOT leads first (highest pain_score DESC)
-    all_leads = []
-    offset = 0
-    while len(all_leads) < EMAIL_CLEAN_NIGHTLY_LIMIT:
-        remaining = EMAIL_CLEAN_NIGHTLY_LIMIT - len(all_leads)
-        batch_size = min(EMAIL_CLEAN_PAGE_SIZE, remaining)
-        batch = (
-            db.table("leads")
-            .select("id, email, segment_label")
-            .eq("is_active", True)
-            .not_.is_("email", "null")
-            .neq("email", "")
-            .is_("email_cleaned_at", "null")
-            .order("pain_score", desc=True)
-            .range(offset, offset + batch_size - 1)
-            .execute()
-            .data or []
-        )
-        if not batch:
+    # API key (raises HTTPException if missing — we convert to clean skip)
+    try:
+        api_key = ec_get_truelist_api_key(db)
+    except Exception as e:
+        notes = f"SKIPPED — truelist_api_key not configured ({e})"
+        logger.warning(f"[{job_name}] {notes}")
+        await _log_job(job_name, status="skipped", notes=notes)
+        return {"job": job_name, "status": "skipped", "reason": notes}
+
+    # Load v2 batch sizing from admin_settings (with safe defaults)
+    def _get_int(key: str, default: int) -> int:
+        try:
+            r = db.table("admin_settings").select("value").eq("key", key).execute()
+            return int((r.data or [{}])[0].get("value") or default)
+        except Exception:
+            return default
+
+    max_batches = max(1, min(_get_int("email_clean_max_batches_per_night", 4), 50))
+    batch_size  = max(1, min(_get_int("email_clean_batch_size_emails", 25_000), 250_000))
+
+    logger.info(f"[{job_name}] V2 starting — max_batches={max_batches}, batch_size={batch_size}")
+
+    submitted_batches: list[dict] = []
+    for i in range(max_batches):
+        leads = ec_select_uncleaned_leads(db, batch_size)
+        if not leads:
+            logger.info(f"[{job_name}] No more uncleaned leads after {i} batches — stopping early")
             break
-        all_leads.extend(batch)
-        if len(batch) < batch_size:
-            break
-        offset += batch_size
-
-    leads = all_leads
-    total         = len(leads)
-    valid_count   = 0
-    invalid_count = 0
-    unknown_count = 0
-    failed_count  = 0
-
-    logger.info(f"[{job_name}] Found {total:,} uncleaned leads to process (limit={EMAIL_CLEAN_NIGHTLY_LIMIT:,})")
-
-    async with httpx.AsyncClient() as client:
-        for i, lead in enumerate(leads):
-            lead_id = lead["id"]
-            email   = lead["email"]
-
-            try:
-                # POST with retry on 429
-                data = None
-                for attempt in range(1, EMAIL_CLEAN_MAX_RETRIES + 1):
-                    r = await client.post(
-                        EMAIL_CLEAN_TRUELIST_URL,
-                        headers={"Authorization": f"Bearer {api_key}"},
-                        params={"email": email},
-                        timeout=15.0,
-                    )
-                    if r.status_code == 429:
-                        wait = EMAIL_CLEAN_RETRY_BACKOFF * attempt
-                        logger.warning(f"[{job_name}] 429 rate limit — attempt {attempt}/{EMAIL_CLEAN_MAX_RETRIES}, waiting {wait}s")
-                        await asyncio.sleep(wait)
-                        continue
-                    if r.status_code == 200:
-                        data = r.json()
-                        break
-                    else:
-                        logger.error(f"[{job_name}] HTTP {r.status_code} for {email}")
-                        break
-
-                if data is None:
-                    raise Exception(f"No valid response after {EMAIL_CLEAN_MAX_RETRIES} attempts")
-
-                # Parse response — flat emails[] array
-                email_obj = data["emails"][0]
-                state = email_obj.get("email_state", "unknown")
-
-                if state == "ok":
-                    email_valid, email_status = True, "valid"
-                    valid_count += 1
-                elif state == "bad":
-                    email_valid, email_status = False, "invalid"
-                    invalid_count += 1
-                else:
-                    email_valid, email_status = None, "unknown"
-                    unknown_count += 1
-
-                db.table("leads").update({
-                    "email_valid":      email_valid,
-                    "email_status":     email_status,
-                    "email_cleaned_at": _now_iso(),
-                }).eq("id", lead_id).execute()
-
-                if (i + 1) % 500 == 0:
-                    logger.info(
-                        f"[{job_name}] Progress: {i+1:,}/{total:,} — "
-                        f"valid={valid_count}, invalid={invalid_count}, "
-                        f"unknown={unknown_count}, failed={failed_count}"
-                    )
-
-            except Exception as e:
-                failed_count += 1
-                logger.error(f"[{job_name}] FAILED lead={lead_id} email={email} error={e}")
-                try:
-                    db.table("leads").update({
-                        "email_valid":      None,
-                        "email_status":     "error",
-                        "email_cleaned_at": _now_iso(),
-                    }).eq("id", lead_id).execute()
-                except Exception:
-                    pass
-
-            await asyncio.sleep(EMAIL_CLEAN_NIGHTLY_SLEEP)
+        try:
+            r = await ec_submit_batch(
+                db, api_key, leads,
+                submitted_by="nightly_cron",
+                notes=f"nightly_{i+1}_of_{max_batches}",
+            )
+            r["index"] = i
+            submitted_batches.append(r)
+            logger.info(
+                f"[{job_name}] Batch {i+1}/{max_batches}: submitted={r.get('submitted')}, "
+                f"batch_id={r.get('batch_id')}"
+            )
+        except Exception as e:
+            logger.error(f"[{job_name}] Batch {i+1} submit FAILED: {e}")
+            submitted_batches.append({"index": i, "submitted": 0, "error": str(e)})
+            break  # don't hammer Truelist if first one failed
 
     duration = time.monotonic() - t_start
+    total_emails = sum((b.get("submitted") or 0) for b in submitted_batches)
     notes = (
-        f"processed={total}, valid={valid_count}, invalid={invalid_count}, "
-        f"unknown={unknown_count}, failed={failed_count}, "
-        f"elapsed={round(duration/3600, 2)}hrs"
+        f"batches_submitted={len([b for b in submitted_batches if b.get('submitted', 0) > 0])}, "
+        f"total_emails={total_emails}, "
+        f"batch_ids={[b.get('batch_id') for b in submitted_batches if b.get('batch_id')]}"
     )
-    status = "partial" if failed_count > 0 and (valid_count + invalid_count + unknown_count) > 0 else "success"
-
-    await _log_job(
-        job_name,
-        leads_processed=total,
-        duration_seconds=duration,
-        status=status,
-        notes=notes,
+    status = "success" if any(b.get("submitted", 0) > 0 for b in submitted_batches) else (
+        "skipped" if not submitted_batches else "failed"
     )
+    await _log_job(job_name, leads_processed=total_emails, duration_seconds=duration,
+                   status=status, notes=notes)
 
     result = {
-        "job":              job_name,
-        "total_processed":  total,
-        "valid":            valid_count,
-        "invalid":          invalid_count,
-        "unknown":          unknown_count,
-        "failed":           failed_count,
-        "duration_hours":   round(duration / 3600, 2),
-        "status":           status,
+        "job":         job_name,
+        "batches":     submitted_batches,
+        "total_emails":total_emails,
+        "duration_s":  round(duration, 2),
+        "status":      status,
     }
     logger.info(f"[{job_name}] Done. {result}")
     return result
+
+
+async def job_email_clean_poll_batches() -> dict:
+    """
+    Poll all in-flight truelist_batches rows (status in pending/processing)
+    every 30 min. When a batch transitions to `completed`, ingest its
+    annotated CSV into the leads table.
+
+    Safe to run concurrently with the submitter — ingest_batch_result is
+    idempotent (already-ingested batches return a cached summary).
+    """
+    job_name = "email_clean_poll_batches"
+    t_start = time.monotonic()
+    db = get_db()
+
+    try:
+        api_key = ec_get_truelist_api_key(db)
+    except Exception as e:
+        notes = f"SKIPPED — truelist_api_key not configured ({e})"
+        await _log_job(job_name, status="skipped", notes=notes)
+        return {"job": job_name, "status": "skipped", "reason": notes}
+
+    try:
+        rows = (
+            db.table("truelist_batches")
+            .select("id, status, submitted_at, email_count")
+            .in_("status", ["pending", "processing"])
+            .order("submitted_at", desc=False)
+            .execute()
+            .data or []
+        )
+    except Exception as e:
+        notes = f"in_flight_query_failed: {e}"
+        await _log_job(job_name, status="failed", notes=notes)
+        return {"job": job_name, "status": "failed", "reason": notes}
+
+    if not rows:
+        await _log_job(job_name, leads_processed=0, status="success",
+                       notes="no in-flight batches")
+        return {"job": job_name, "status": "success", "in_flight": 0}
+
+    ingested = 0
+    still_running = 0
+    ingest_summaries: list[dict] = []
+    errors: list[dict] = []
+
+    for r in rows:
+        batch_id = r["id"]
+        try:
+            raw = await ec_poll_batch(api_key, batch_id)
+            real_state = raw.get("batch_state")
+            db.table("truelist_batches").update({
+                "status":                    real_state,
+                "annotated_csv_url":         raw.get("annotated_csv_url"),
+                "safest_bet_csv_url":        raw.get("safest_bet_csv_url"),
+                "highest_reach_csv_url":     raw.get("highest_reach_csv_url"),
+                "only_invalid_csv_url":      raw.get("only_invalid_csv_url"),
+                "ok_count":                  raw.get("ok_count"),
+                "ok_for_all_count":          raw.get("ok_for_all_count"),
+                "role_count":                raw.get("role_count"),
+                "disposable_count":          raw.get("disposable_count"),
+                "failed_syntax_check_count": raw.get("failed_syntax_check_count"),
+                "failed_mx_check_count":     raw.get("failed_mx_check_count"),
+                "failed_no_mailbox_count":   raw.get("failed_no_mailbox_count"),
+                "completed_at":              _now_iso() if real_state == "completed" else None,
+            }).eq("id", batch_id).execute()
+
+            if real_state == "completed":
+                summary = await ec_ingest_batch_result(db, api_key, batch_id)
+                ingest_summaries.append(summary)
+                ingested += 1
+            else:
+                still_running += 1
+        except Exception as e:
+            logger.error(f"[{job_name}] {batch_id} poll/ingest error: {e}")
+            errors.append({"batch_id": batch_id, "error": str(e)[:300]})
+
+    duration = time.monotonic() - t_start
+    notes = (
+        f"in_flight={len(rows)}, ingested={ingested}, still_running={still_running}, "
+        f"errors={len(errors)}"
+    )
+    status = "success" if not errors else ("partial" if ingested > 0 else "failed")
+    await _log_job(job_name, leads_processed=sum(s.get("leads_processed", 0) for s in ingest_summaries),
+                   duration_seconds=duration, status=status, notes=notes)
+
+    return {
+        "job":           job_name,
+        "in_flight":     len(rows),
+        "ingested":      ingested,
+        "still_running": still_running,
+        "errors":        errors,
+        "summaries":     ingest_summaries,
+        "duration_s":    round(duration, 2),
+        "status":        status,
+    }
 
 
 
@@ -1521,8 +1548,9 @@ JOB_FUNCTIONS = {
     "enrich_stage1":        job_enrich_stage1,
     "cost_digest":          job_cost_digest,
     "stale_cleanup":        job_stale_cleanup,
-    "email_clean_nightly":  job_email_clean_nightly,
-    "enrich_stage3_nightly": job_enrich_stage3_nightly,
+    "email_clean_nightly":      job_email_clean_nightly,
+    "email_clean_poll_batches": job_email_clean_poll_batches,
+    "enrich_stage3_nightly":    job_enrich_stage3_nightly,
     "enrich_stage4_nightly": job_enrich_stage4_nightly,
     "daily_cost_report":    job_daily_cost_report,
     "campaign_sync_hourly": job_campaign_sync_hourly,
@@ -1580,16 +1608,31 @@ def setup_scheduler() -> AsyncIOScheduler:
         misfire_grace_time=1800,
     )
 
-    # Job 5: email_clean_nightly — daily at 00:00 UTC (midnight)
-    # Processes up to 16,800 uncleaned leads at 1.5s/email over 7-hour window
-    # Prioritizes HOT leads first, skips already-cleaned leads
+    # Job 5: email_clean_nightly (V2) — daily at 00:00 UTC (midnight)
+    # Submits N x 25K-email batches via POST /api/v1/batches. Defaults to 4
+    # batches/night (configurable via admin_settings). Prioritizes HOT > WARM
+    # > COLD > unclassified, pain_score DESC.
     scheduler.add_job(
         job_email_clean_nightly,
         trigger=CronTrigger(hour=0, minute=0),
         id="email_clean_nightly",
-        name="Nightly Email Clean (Truelist)",
+        name="Nightly Email Clean Submit (Truelist v2)",
         replace_existing=True,
         misfire_grace_time=3600,  # 1-hour grace window
+    )
+
+    # Job 5b: email_clean_poll_batches — every 30 minutes
+    # Companion poller to the nightly submitter. Picks up in-flight
+    # truelist_batches rows, persists state, and ingests annotated CSV
+    # once Truelist marks a batch `completed`. Idempotent — also runs as
+    # the webhook-fallback when /webhooks/truelist/batch-complete misses.
+    scheduler.add_job(
+        job_email_clean_poll_batches,
+        trigger=IntervalTrigger(minutes=30),
+        id="email_clean_poll_batches",
+        name="Truelist Batch Poller (30min)",
+        replace_existing=True,
+        misfire_grace_time=900,
     )
 
     # Job 6: enrich_stage3_nightly — daily at 01:00 UTC
