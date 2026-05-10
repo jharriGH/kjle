@@ -267,53 +267,54 @@ def select_uncleaned_leads(db, limit: int) -> list[dict]:
     email_status=NULL, so a neq filter would silently exclude them all.
     See memory/project_postgrest_in_url_cap.md neighbor: NULL semantics in PostgREST.
     """
-    remaining = limit
+    # PostgREST/Supabase caps responses at ~1000 rows even when .limit(N) is
+    # called with a larger N. To pull 25K rows we paginate via .range() in
+    # 1000-row pages per segment.
+    PAGE = 1000
+
+    def _drain_segment(filter_fn) -> list[dict]:
+        """Page through one segment until limit hit or no more rows."""
+        collected: list[dict] = []
+        offset = 0
+        while True:
+            need = limit - len(out) - len(collected)
+            if need <= 0:
+                return collected
+            page_size = min(PAGE, need)
+            q = (
+                db.table("leads")
+                .select("id, email, segment_label, pain_score")
+                .eq("is_active", True)
+                .not_.is_("email", "null")
+                .neq("email", "")
+                .is_("email_cleaned_at", "null")
+                .is_("email_truelist_batch_id", "null")
+            )
+            q = filter_fn(q)
+            q = q.order("pain_score", desc=True).range(offset, offset + page_size - 1)
+            try:
+                rows = q.execute().data or []
+            except Exception as e:
+                logger.error(f"[select_uncleaned_leads] page fetch failed: {e}")
+                rows = []
+            if not rows:
+                return collected
+            collected.extend(rows)
+            if len(rows) < page_size:
+                return collected
+            offset += page_size
+
     out: list[dict] = []
     for label in ("hot", "warm", "cold"):
-        if remaining <= 0:
+        if len(out) >= limit:
             break
-        q = (
-            db.table("leads")
-            .select("id, email, segment_label, pain_score")
-            .eq("is_active", True)
-            .eq("segment_label", label)
-            .not_.is_("email", "null")
-            .neq("email", "")
-            .is_("email_cleaned_at", "null")
-            .is_("email_truelist_batch_id", "null")
-            .order("pain_score", desc=True)
-            .limit(remaining)
-        )
-        try:
-            rows = q.execute().data or []
-        except Exception as e:
-            logger.error(f"[select_uncleaned_leads] {label} fetch failed: {e}")
-            rows = []
-        out.extend(rows)
-        remaining -= len(rows)
+        out.extend(_drain_segment(lambda q, lbl=label: q.eq("segment_label", lbl)))
 
     # Catch unclassified rows last (segment_label IS NULL)
-    if remaining > 0:
-        q = (
-            db.table("leads")
-            .select("id, email, segment_label, pain_score")
-            .eq("is_active", True)
-            .is_("segment_label", "null")
-            .not_.is_("email", "null")
-            .neq("email", "")
-            .is_("email_cleaned_at", "null")
-            .is_("email_truelist_batch_id", "null")
-            .order("pain_score", desc=True)
-            .limit(remaining)
-        )
-        try:
-            rows = q.execute().data or []
-        except Exception as e:
-            logger.error(f"[select_uncleaned_leads] unclassified fetch failed: {e}")
-            rows = []
-        out.extend(rows)
+    if len(out) < limit:
+        out.extend(_drain_segment(lambda q: q.is_("segment_label", "null")))
 
-    return out
+    return out[:limit]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
