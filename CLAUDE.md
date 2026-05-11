@@ -1,199 +1,183 @@
----
-## AUTONOMOUS EXECUTION — READ THIS FIRST
-
-You are part of the King James Empire CC fleet.
-Jim Harris is NEVER the middleman. Ever.
-
-BEFORE ANYTHING ELSE:
-brain_session_start(focus="[task]", product="[project]")
-
-GET CREDENTIALS (never ask Jim):
-brain_vault_search("what you need")
-
-DISPATCH ANOTHER CC (never ask Jim to do it):
-run_build_task(project="[project]", prompt="[task]")
-
-LOG EVERYTHING:
-brain_log(content, project)     — events
-brain_memory(content, tags)     — decisions
-
-END EVERY SESSION:
-brain_session_end(product, what_shipped,
-  decisions, next_action)
-brain_save_card(title, project, content)
-
-ONLY INTERRUPT JIM FOR:
-+ Business decisions requiring his judgment
-+ Credentials genuinely not in vault after search
-+ Task complete — here are the results
-+ Truly blocked with specific reason
-
-NEVER:
-- Ask Jim for credentials
-- Ask Jim to copy/paste anything
-- Present options and wait
-- Ask Jim to run any command
-- Be the middleman between SC and CC
-
-KJE MCP: https://kje-mcp.onrender.com/mcp/T24NM1Sxbh7txJs-unNIjblaXMqA1OZW6gNU-Ud5Yjk/
-VPS: 192.161.173.97 (claude at /usr/local/bin/claude)
-Brain: https://jim-brain-production.up.railway.app
-Key: jim-brain-kje-2026-kingjames
----
-
-# 🎯 KJLE — CLAUDE.md
-# Managed by brain_sync.py (Brain sections)
-# + Manual additions (never auto-updated)
-# Last synced: May 05, 2026 02:45 PM PST
+# 🧠 KJLE — CLAUDE.md
+# Auto-healed by claude_md_healer.py from Jim Brain state
+# Last healed: 2026-05-11 20:00:16 UTC
+# Repo: /opt/kjle
 
 ---
 
-## CURRENT STATUS
-<!-- BRAIN-SYNC:START:STATUS -->
-*Brain sync: May 05, 2026 02:45 PM PST*
+## WHO YOU WORK FOR
 
-**Status:** LIVE
-**Description:** Lead empire backend — 32/32 done, 28,849 leads ready
-**Next Action:** ⚡ Wire + test Send to DemoBoosterz from Lead Finder — after DemoBoosterz Tour demo complete. Then: end-to-end Campaign Builder test (launch real campaign into ReachInbox) + Activity History Log verification.
-<!-- BRAIN-SYNC:END:STATUS -->
+You are working for Jim Harris — King James Empire (KJE).
+Empire-wide rules in `/opt/jim-brain/CLAUDE.md` (KJ_RULEZ) apply unless this
+file explicitly supersedes them.
 
----
-
-## EMPIRE STATE & COSTS
-<!-- BRAIN-SYNC:START:EMPIRE_STATE -->
-- Clients: 0
-- MRR: $99.00
-- HOT leads: 23
-- Last decision: KJ Autonomous v2.0: 7/8 KJWidgetz + 8/8 DemoBoosterz agents live. Clone script built. Agent 4 stubbed pending AVA. VoiceDropz stubbed pending Drop Cowboy BYOC. Next: wire Agent 4 to KJ SalesAgentz, clone SiteEnginez + UnhideLocal pipelines.
-
-**AI Costs:**
-- Today: $0.0083
-- This month: $0.0083
-- All time: $0.0083
-
-**Empire:**
-- 7 live | 3 launch ready | 6 in progress
-<!-- BRAIN-SYNC:END:EMPIRE_STATE -->
+Brain endpoint: `https://jim-brain-production.up.railway.app`
+Brain key: `jim-brain-kje-2026-kingjames` (header: `x-brain-key`, lowercase)
 
 ---
 
-## RECENT KJLE MEMORIES
-<!-- BRAIN-SYNC:START:MEMORIES -->
-1. KJLE prioritized as easiest
-2. KJ Command Center is the KJLE Lead Finder
-3. Completed KJLE build session on April 20, 2026
-4. KJLE status March 26 2026: 32/32 prompts complete
-5. KJLE status March 26 2026: KJLE Lead Finder frontend complete
-6. KJLE profile includes internal tool at kjle-command-deck.onrender.com and kjle-api.onrender.com
-7. Working on KJWidgetz project
-8. KJ Command Center should not be treated as a separate product from KJLE Command Deck
-<!-- BRAIN-SYNC:END:MEMORIES -->
+## PROJECT STATUS
+
+- **Project:** KJLE 🎯
+- **ID:** `kjle`
+- **Group:** KJE SaaS
+- **Status:** `live`
+- **Description:** Lead empire backend — 32/32 done, 28,849 leads ready
+
+### Next Action
+Session 2B SHIPPED 2026-05-10. Truelist bulk-batches LIVE: batch-1 manual 4000 leads ingested clean (2795 valid / 76 invalid / 1129 unknown / 0 errors / 0 no_csv_match) - first nonzero invalid count ever, parser bug fix verified. Nightly cron auto-fired batch-2 with 15566 emails, poller will ingest within 30 min. 30-min poller cron running every 30 min. Two PostgREST gotchas fixed live (NULL semantics + 1000-row cap). Session 2C scope: (1) Configure Truelist dashboard webhook to fire at /webhooks/truelist/batch-complete?secret=TRUELIST_WEBHOOK_SECRET - drops batch-completion latency from 0-30min to seconds (5min Truelist UI work). (2) Re-verify the 17576 unknown leads from v1 verify_inline to recover hidden invalids using new architecture. (3) Cleanup 2786 orphan leads stuck in email_status=pending_batch with no parent batch_id - either flush back to NULL or sweep into next batch. (4) Watch first weekend of 4-batches/night cron to confirm 100K/day rate clears backlog in target 5 days.
 
 ---
 
-## BUILD STATE
-<!-- BRAIN-SYNC:START:BUILD_STATE -->
-**Card:** KJLE Update-5-2-26
-**Saved:** 2026-05-03
+## RECENT MEMORIES (top 6)
 
-Update KJ Brain with the following architectural decisions and current state:
-
-1. DNC ARCHITECTURE LOCKED IN
-- KJLE becomes the DNC source of truth for the entire KJ empire
-- Every app (Telehealth, DemoBoosterz, KJ Sales Agentz, future) calls KJLE's DNC endpoints rather than building their own
-- Architecture pattern: scrub-on-call, not scrub-on-export (saves ~$2,000+/year)
-- Provider: Searchbug API (~$0.003-0.03 per lookup)
-- Cache TTL: 14 days for B2B
-- Endpoints to be built: GET /kjle/v1/dnc/check/{phone}, POST /kjle/v1/dnc/add, POST /kjle/v1/dnc/scrub-batch (for future cold-dial campaigns)
-- Cost: ~$15-50/month at realistic empire scale
-
-2. KJLE CURRENT STATE (as of May 2)
-- 514,534 leads, 100% email coverage, 99.7% phone coverage
-- 9 scheduler jobs running cleanly
-- $20/day budget cap, $500/month, currently using ~$0.15/day (mostly Commander chats)
-- Stage 1 unthrottled to 1000/run (was 50)
-- Stage 3 + Stage 4 nightly jobs paused via admin_settings flags (preserve cap for deliberate use)
-- Daily cost reports landing at sales@mobilewebmds.com from kjle@kjreportz.com
-- Segments-by-niche bug fixed (now shows 480K leads correctly, was showing 590)
-
-3. KNOWN ISSUES NOT YET FIXED
-- Pain scoring formula is degenerate: 97% of leads cluster in 41-50 band, max=78.8, only 6 leads ever reach pain≥70 (HOT). Needs full redesign in scripts/ingest.py compute_pain_score_v1. Estimated 2-3 hour session.
-- 'other' niche bucket has 15,439 leads, of which only ~1,800 are recoverable from existing search_keyword/niche_raw signals. Recovery SQL is committed at migrations/recover_other_niche.sql but not run. The other ~12,838 leads have empty niche metadata entirely (ingestion bug documented at migrations/INGESTION_BUG_empty_niche_metadata.md).
-- 393K+ leads still unclassified (classifier processes 40K/day, will catch up over ~10 days now that Stage 1 is unthrottled)
-
-4. NEXT SESSION PRIORITIES (DNC Day)
-- Build full DNC architecture in KJLE (3-4 hours): cache table, audit table, /dnc/check endpoint, /dnc/add endpoint, Searchbug provider, provider abstraction for future swaps
-- Wire Telehealth to KJLE DNC endpoint (~30 min)
-- Build inbound suppression webhooks (~1-2 hours): ReachInbox unsubscribes, TH bridge form opt-outs feed into KJLE's master DNC list
-- Total target: ~6 hours for full empire-wide DNC compliance
-
-5. SUBSEQUENT SESSION (Day 2)
-- Pain scoring formula redesign
-- First KJLE test campaign drafted in ReachInbox (interest probe pattern, no offer needed)
-- Build Card v9 update reflecting reality
-
-6. PINNED ITEMS
-- Send to DemoBoosterz from KJLE Lead Finder (after tour rebuild)
-- Schedule local backups for Documents\GitHub folder
-- Rotate exposed ReachInbox API key on Render
-- Rotate exposed DemoEnginez Supabase service role key on Render
-- Click "Reclassify All Leads" in Lead Finder Admin Settings (catchup on 393K backlog)
-
-7. STRATEGIC FRAME
-KJLE is evolving from "lead database" to "lead concierge service" for the empire. Cross-cutting concerns (DNC, campaign tracking, suppression, contact frequency) live in KJLE so each app can stay focused on its product. This is the GOAT architecture pattern that mature CRMs use internally.
-<!-- BRAIN-SYNC:END:BUILD_STATE -->
-
----
-
-## MANUAL ADDITIONS
-<!-- brain_sync.py never modifies below this line -->
-
----
-
-## EMPIRE STATE & COSTS
-
----
-
-## RECENT KJLE MEMORIES
+1. KJLE Session 2B shipped on 2026-05-10
+2. KJLE pain v2 formula deployed and verified (commit 02673ac)
+3. Tags: reviewbombz, kjle, dnc, phase25, voicemail
+4. Saved card IDs: ReviewBombz 1776982890230, KJLE 1776982893503, KJWidgetz 1776982896422, DemoEnginez 1776982899202, DemoBoosterz 1776982901880, SiteEnginez 1776982904787, IASY 1776982907530, UnhideLocal 1776982910247, TestEnginez 1776982912894
+5. KJLE stamped complete by CC overnight
+6. New empire projects added on March 23, 2026: SiteEnginez (SiteEnginez.com + BuildEnginez.com — DemoEnginez one-click site fulfillment, Cloudflare Pages deploy), KJ Command Deck (KJLE React frontend, military sci-fi HUD, deck.kjle.com, Prompts 1-25 complete, AlertSystem re-enable pending), KJ Command Center (empire-wide dashboard Lovable app — all 6 products live metrics, Jim monitoring hub, planned build), KJ Autonomous (8-agent autonomous empire system — n8n + Vapi + Claude API, weeks 2-6 build plan), IAMStillHere (grief/memorial product — physical products pen-plotter handwriting laser engraved timelines canvas portraits sound wave jewelry memory boxes, ~250 home studio, referral via funeral homes hospices estate attorneys), DTF (Direct To Film printing business), DTG (Direct To Garment printing business)
 
 ---
 
 ## BUILD STATE
 
+**Card:** KJLE BUILD_STATE 2026-05-10 (Session 2B closed)
+**Saved:** 2026-05-11T01:21:09.193664
+
+# KJLE Build State — Session 2B (Truelist Bulk Batches) — CLOSED 2026-05-10
+
+## What shipped (commits)
+- b8b877d feat(email-clean): Truelist bulk batches architecture (Session 2B)
+- be3c39b fix(email-clean): NULL-semantics bug in select_uncleaned_leads
+- 0076569 fix(email-clean): paginate select_uncleaned_leads past PostgREST 1000-row cap
+- 14 repos updated via brain_sync for new status-banner rule
+- KJ_RULEZ.md commit 031a0c3 on kj-bridgedeck/main
+
+## Architecture changes
+- New migration: migrations/2026_05_10_truelist_batches.sql (audit table + email_sub_state + email_truelist_batch_id + 2 admin_settings keys)
+- Rewrite api/routes/enrichment_email_clean.py: parse_truelist_state (handles ok/invalid/risky/unknown + email_* prefixed variants), is_campaign_eligible (positive whitelist only), select_uncleaned_leads (HOT>WARM>COLD priority with .range() pagination), submit_batch (POST /api/v1/batches + audit), ingest_batch_result (idempotent cursor + id-range UPDATE), 4 new endpoints
+- New api/routes/webhooks_truelist.py: receiver shim at /webhooks/truelist/batch-complete?secret=... ready for Truelist dashboard webhook
+- scheduler.py: replaced v1 verify_inline loop with batch submitter; new job_email_clean_poll_batches cron every 30 min
+- 41-fixture boot check at scripts/test_email_clean_parser.py covering parser vocab, prefixed forms, defensive defaults, positive-whitelist campaign eligibility, CSV ingestion, reordered headers
+
+## Batch-1 verification (LIVE)
+- batch_id: 9292028e-f0e3-401a-ac5e-390e92838f9a
+- 4000 KJLE leads submitted, 3907 unique emails after Truelist dedup
+- Truelist completed in ~95 min wallclock
+- Auto-ingest counts: valid=2795, invalid=76, unknown=1129, error=0, no_csv_match=0
+- CSV reconciliation: 1:1 with ingest (CSV 2722 ok + 74 invalid + 1111 risky/unknown = 3907 unique; ingest 2795 + 76 + 1129 = 4000 = 3907 + 93 duplicates ✓)
+- Per-lead spot-check: 7/7 verified leads matched expected mapping AND scoped to batch-1
+- Sub-state preservation working: email_ok 2250, is_role 816, accept_all 326, failed_mx_check 42, failed_no_mailbox 19, unknown 547
+
+## Live segment + email state (post-batch-1)
+- total: 560,057 (was 556,830, +3,227 new from CSV import last night)
+- hot: 20,596 / warm: 129,524 / cold: 406,710 / unclassified: 3,227
+- by_email_status: valid 70,559 / invalid 76 (was 0!) / unknown 17,576 / error 3,490 / pending_batch 18,352
+
+## Bugs found and fixed mid-session
+- NULL-semantics bug: select_uncleaned_leads filtered .neq('email_status','pending_batch') which excludes NULL email_status rows in PostgREST. Switched to .is_('email_truelist_batch_id','null'). Same gotcha family as pain Session 1.
+- 1000-row response cap: .limit(25000) capped at 1000 per segment so first batch only marked 4000 leads. Switched to .range()-based pagination per segment, drains 1000 at a time.
+- Parser bug from v1: checked state=='bad' but Truelist returns 'invalid'. Fixed in parse_truelist_state; verified live by first-ever nonzero invalid count.
+
+## Investigation surprises (worth remembering)
+- Truelist's POST /batches accepts but silently ignores webhook_url field. Webhook is dashboard-side config only. Receiver shim built, awaiting dashboard wire-up.
+- verify_inline returns inconsistent prefixed/unprefixed state strings (email_invalid vs risky). Parser handles both defensively now.
+
+## Open anomalies for Session 2C
+- 2786 orphan leads with email_status='pending_batch' and no parent batch_id. Likely leftovers from earlier aborted submits. Cleanup: flush back to NULL or sweep into next batch.
+- 17576 'unknown' leads from v1 verify_inline include hidden invalids (the v1 parser miscategorized state=='invalid' as unknown). Re-verify via new architecture to recover them.
+- Truelist dashboard webhook not yet configured. 30-min poller is currently the only completion path. Latency 0-30 min instead of seconds.
+
+## Session 2C scope
+1. Configure Truelist dashboard webhook → /webhooks/truelist/batch-complete?secret=... (5 min Truelist UI work)
+2. Re-verify the 17576 v1-unknown leads via batch architecture
+3. Cleanup 2786 orphan pending_batch rows
+4. Watch first full weekend of 4-batches/night nightly cron — expect backlog clear in ~5 days at 100K/day
+5. Build Card v9 update reflecting Truelist-v2-as-canonical state
+
+## Pinned items (carry-over)
+- Send to DemoBoosterz from Lead Finder (after tour rebuild)
+- Schedule local backups for Documents/GitHub folder
+- Rotate exposed ReachInbox + DemoEnginez Supabase service role keys on Render
+
 
 ---
 
-## FIRST THING — DO THIS AUTOMATICALLY
+## EMPIRE-WIDE RULES (excerpt)
 
-```
-brain_session_start(focus="[today's task]", product="kjle")
-brain_search(query='kjle')
-brain_list_cards()   # find build card
-brain_get_card(id)   # load full spec
-# THEN ask Jim what to tackle
-```
+1. **Brain Endpoint Verification** — always hit `/health` then the real
+   endpoint with `x-brain-key` header BEFORE coding against it. Document
+   actual response shape. No assumptions from convention.
 
-**Do not wait to be asked. Always do this first.**
+2. **Empire Cost Logging** — any LLM call must be instrumented via
+   `kje-cost-logger` per `docs/EMPIRE_COST_LOGGING_BUILD_CARD.md`.
 
----
+3. **Env Var Automation** — CC never asks Jim to manually click env vars
+   into a dashboard. Use Render / Railway / Cloudflare APIs. Tokens live
+   in CC env (`RENDER_API_KEY`, `RAILWAY_TOKEN`, `CF_API_TOKEN`).
 
-## SESSION END — DO THIS AUTOMATICALLY
+4. **Gotcha Logging** — log any bug / workaround to Brain via
+   `POST /memory` with tags `["kjle", "gotcha", "lesson"]` the
+   moment context is fresh.
 
-```
-brain_session_end(
-  product="kjle",
-  what_shipped="[what was built]",
-  decisions="[key decisions]",
-  next_action="[most important next task]"
-)
-brain_save_card(
-  title="KJLE BUILD_STATE [date]",
-  project="kjle",
-  content="[full build state md]"
-)
-```
+5. **Session Start / End** — every CC session begins with
+   `brain_session_start(focus="...", product="kjle")` and ends
+   with `brain_session_end(...)` + `brain_save_card(...)`.
 
 ---
 
-*Synced: May 05, 2026 02:45 PM PST*
-*Refresh: `python brain_sync.py kjle`*
+## VAULT KEYS AVAILABLE FOR THIS PROJECT
+
+Use `GET /vault/kjle/<KEY>/reveal` with header
+`x-brain-key: jim-brain-kje-2026-kingjames` to fetch real values.
+
+| Key | Masked | Service |
+|---|---|---|
+| `SUPABASE_URL` | `` | render |
+| `API_SECRET_KEY` | `` | render |
+| `BRIDGEDECK_URL` | `` | render |
+| `PYTHON_VERSION` | `` | render |
+| `RESEND_API_KEY` | `` | render |
+| `TRUELIST_API_KEY` | `` | render |
+| `ANTHROPIC_API_KEY` | `` | render |
+| `FIRECRAWL_API_KEY` | `` | render |
+| `SEARCHBUG_API_KEY` | `` | render |
+| `OUTSCRAPER_API_KEY` | `` | render |
+| `REACHINBOX_API_KEY` | `` | render |
+| `SUPABASE_SERVICE_KEY` | `` | render |
+| `BRIDGEDECK_INGEST_KEY` | `` | render |
+| `DEMOENGINEZ_SUPABASE_KEY` | `` | render |
+| `DEMOENGINEZ_SUPABASE_URL` | `` | render |
+| `REACHINBOX_WEBHOOK_SECRET` | `` | render |
+
+Empire-wide shared keys (always available):
+
+- `GITHUB_PAT_VPS` — VPS automation PAT (contents:write)
+- `SUPABASE-PAT-SHARED` — Supabase DDL automation token
+- `SUPABASE_PERSONAL_ACCESS_TOKEN` — Supabase PAT (44+ chars)
+
+---
+
+## SESSION END PROTOCOL
+
+Before closing the chat, run:
+
+```
+POST /memory   tags=["kjle", "session_end"]
+               content="<what shipped, what's next>"
+POST /log      tags=["kjle", "session_complete"]
+               content="<one-liner>"
+POST /cards    title="<Project> BUILD_STATE <date>"
+               project="kjle"
+               content="<full markdown spec>"
+```
+
+If anything broke, log a gotcha memory FIRST so the next session inherits
+the lesson.
+
+---
+
+*Synced from Brain state at 2026-05-11 20:00:16 UTC.*
+*This file is auto-regenerated every 4h. Manual edits will be overwritten
+on the next heal if the rebuilt content differs by >20% of lines.*
