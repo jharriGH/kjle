@@ -1,6 +1,6 @@
 # 🧠 KJLE — CLAUDE.md
 # Auto-healed by claude_md_healer.py from Jim Brain state
-# Last healed: 2026-05-11 20:00:16 UTC
+# Last healed: 2026-05-12 00:00:25 UTC
 # Repo: /opt/kjle
 
 ---
@@ -25,7 +25,7 @@ Brain key: `jim-brain-kje-2026-kingjames` (header: `x-brain-key`, lowercase)
 - **Description:** Lead empire backend — 32/32 done, 28,849 leads ready
 
 ### Next Action
-Session 2B SHIPPED 2026-05-10. Truelist bulk-batches LIVE: batch-1 manual 4000 leads ingested clean (2795 valid / 76 invalid / 1129 unknown / 0 errors / 0 no_csv_match) - first nonzero invalid count ever, parser bug fix verified. Nightly cron auto-fired batch-2 with 15566 emails, poller will ingest within 30 min. 30-min poller cron running every 30 min. Two PostgREST gotchas fixed live (NULL semantics + 1000-row cap). Session 2C scope: (1) Configure Truelist dashboard webhook to fire at /webhooks/truelist/batch-complete?secret=TRUELIST_WEBHOOK_SECRET - drops batch-completion latency from 0-30min to seconds (5min Truelist UI work). (2) Re-verify the 17576 unknown leads from v1 verify_inline to recover hidden invalids using new architecture. (3) Cleanup 2786 orphan leads stuck in email_status=pending_batch with no parent batch_id - either flush back to NULL or sweep into next batch. (4) Watch first weekend of 4-batches/night cron to confirm 100K/day rate clears backlog in target 5 days.
+KJLE n8n Phase 1 (bounced_hard) READY TO DEPLOY 2026-05-10. Workflow JSON drafted at kjle_n8n_phase1_bounced.json. DEPLOY SEQUENCE: (1) Import workflow JSON into n8n + set env vars REACHINBOX_WEBHOOK_SECRET / KJLE_API_BASE / KJLE_API_KEY. (2) Manual webhook fire test — verify email lands in email_suppressions with source=n8n_reachinbox_bounce; verify 401 on bad/missing secret; verify 200+processed=false on soft bounce. (3) Dispatch CC session to: (a) add parallel-run tap in dnc_webhooks.py — fire-and-forget async via asyncio.create_task, no-retry, no-block, ~6 lines; (b) fix API_SECRET_KEY hardcoded fallback to None in dnc_webhooks.py L71 + campaigns.py L37 so missing env fails loudly. (4) Deploy + observe 24-48h parallel-run; compare email_suppressions writes between KJLE direct path and n8n path — drift must be zero. (5) Cut over by updating ReachInbox dashboard webhook URL for the bounced event subscription to the n8n URL. Punch list (non-Phase-1): map_lead_to_ri firstName bug (reachinbox.py L170-172) must fix before Session 2 first campaign launch; multi-account RI deferred until DemoBoosterz rebuild; missing 2 of 8 events resolved at Phase 2 by inspecting RI dashboard event dropdown. Brain tags for retrieval: kjle_n8n_architecture_v1, kjle_n8n_code_review, kjle_n8n_phase_1_workflow, kjle_n8n_phase_1_decisions.
 
 ---
 
@@ -42,65 +42,73 @@ Session 2B SHIPPED 2026-05-10. Truelist bulk-batches LIVE: batch-1 manual 4000 l
 
 ## BUILD STATE
 
-**Card:** KJLE BUILD_STATE 2026-05-10 (Session 2B closed)
-**Saved:** 2026-05-11T01:21:09.193664
+**Card:** KJE Orchestrator BUILD_STATE 2026-05-11
+**Saved:** 2026-05-11T20:14:22.905640
 
-# KJLE Build State — Session 2B (Truelist Bulk Batches) — CLOSED 2026-05-10
+# KJE Orchestrator — BUILD_STATE 2026-05-11
 
-## What shipped (commits)
-- b8b877d feat(email-clean): Truelist bulk batches architecture (Session 2B)
-- be3c39b fix(email-clean): NULL-semantics bug in select_uncleaned_leads
-- 0076569 fix(email-clean): paginate select_uncleaned_leads past PostgREST 1000-row cap
-- 14 repos updated via brain_sync for new status-banner rule
-- KJ_RULEZ.md commit 031a0c3 on kj-bridgedeck/main
+**Status:** LIVE
+**URL:** https://kje-orchestrator.onrender.com
+**Render Service:** srv-d813bjvavr4c73b223b0
+**Repo:** https://github.com/jharriGH/kje-orchestrator
+**Build SHA:** cee25b8799de (P3 v1.0.0)
+**Plan:** starter ($7/mo)
+**Region:** oregon
 
-## Architecture changes
-- New migration: migrations/2026_05_10_truelist_batches.sql (audit table + email_sub_state + email_truelist_batch_id + 2 admin_settings keys)
-- Rewrite api/routes/enrichment_email_clean.py: parse_truelist_state (handles ok/invalid/risky/unknown + email_* prefixed variants), is_campaign_eligible (positive whitelist only), select_uncleaned_leads (HOT>WARM>COLD priority with .range() pagination), submit_batch (POST /api/v1/batches + audit), ingest_batch_result (idempotent cursor + id-range UPDATE), 4 new endpoints
-- New api/routes/webhooks_truelist.py: receiver shim at /webhooks/truelist/batch-complete?secret=... ready for Truelist dashboard webhook
-- scheduler.py: replaced v1 verify_inline loop with batch submitter; new job_email_clean_poll_batches cron every 30 min
-- 41-fixture boot check at scripts/test_email_clean_parser.py covering parser vocab, prefixed forms, defensive defaults, positive-whitelist campaign eligibility, CSV ingestion, reordered headers
+## Verified endpoints
+| Endpoint | Result |
+|----------|--------|
+| `GET /health` | HTTP 200 `{"status":"ok","version":"1.0.0"}` |
+| `GET /version` | HTTP 200 (build, poll_interval, stall_timeout) |
+| `GET /status` | HTTP 500 — pending `kjcodedeck.wave_manifest` table creation |
+| `POST /trigger-poll` | guarded by `x-trigger-key` header |
 
-## Batch-1 verification (LIVE)
-- batch_id: 9292028e-f0e3-401a-ac5e-390e92838f9a
-- 4000 KJLE leads submitted, 3907 unique emails after Truelist dedup
-- Truelist completed in ~95 min wallclock
-- Auto-ingest counts: valid=2795, invalid=76, unknown=1129, error=0, no_csv_match=0
-- CSV reconciliation: 1:1 with ingest (CSV 2722 ok + 74 invalid + 1111 risky/unknown = 3907 unique; ingest 2795 + 76 + 1129 = 4000 = 3907 + 93 duplicates ✓)
-- Per-lead spot-check: 7/7 verified leads matched expected mapping AND scoped to batch-1
-- Sub-state preservation working: email_ok 2250, is_role 816, accept_all 326, failed_mx_check 42, failed_no_mailbox 19, unknown 547
+## Files shipped (11)
+1. `main.py` — FastAPI app, lifespan boots BrainClient + WaveEngine + Poller
+2. `poller.py` — APScheduler 60s tick, calls `wave.process_logs(logs)`
+3. `wave_engine.py` — wave_manifest reader, complete/blocked/stalled detection, VPS dispatch
+4. `notify.py` — retry+backoff wrappers around `/notify`, `/memory`, `/log`
+5. `brain_client.py` — httpx async client with lowercase `x-brain-key`
+6. `requirements.txt` — fastapi 0.115.5, supabase 2.9.1, apscheduler 3.10.4, etc.
+7. `Procfile` — `web: uvicorn main:app --host 0.0.0.0 --port $PORT`
+8. `render.yaml` — service blueprint w/ `sync: false` secrets
+9. `Dockerfile` — python:3.11-slim, non-root user, healthcheck
+10. `.env.example` — every env var documented
+11. `README.md` — full runbook + schema + ops guide
+   (+ `.python-version` and `runtime.txt` pinning 3.11.10 after Render's default of 3.14 broke first deploy)
 
-## Live segment + email state (post-batch-1)
-- total: 560,057 (was 556,830, +3,227 new from CSV import last night)
-- hot: 20,596 / warm: 129,524 / cold: 406,710 / unclassified: 3,227
-- by_email_status: valid 70,559 / invalid 76 (was 0!) / unknown 17,576 / error 3,490 / pending_batch 18,352
+## Wave-chaining logic
+- Poll Brain `/logs?limit=50` every 60s (configurable).
+- Group entries by `tags + job_id`. Match against active wave's `jobs[]`.
+- **Complete:** every job logged `task_complete` → mark wave `done`, chain next queued.
+- **Blocked:** any job tagged `blocker`/`fatal`/`halt` → mark wave `blocked`, SMS + memory.
+- **Stalled:** >30 min without job-tagged log entries → mark `stalled`, SMS.
+- **Chain:** lowest-priority queued wave promoted to `active`, each job POSTed to VPS_DISPATCH_URL with X-Dispatch-Key.
 
-## Bugs found and fixed mid-session
-- NULL-semantics bug: select_uncleaned_leads filtered .neq('email_status','pending_batch') which excludes NULL email_status rows in PostgREST. Switched to .is_('email_truelist_batch_id','null'). Same gotcha family as pain Session 1.
-- 1000-row response cap: .limit(25000) capped at 1000 per segment so first batch only marked 4000 leads. Switched to .range()-based pagination per segment, drains 1000 at a time.
-- Parser bug from v1: checked state=='bad' but Truelist returns 'invalid'. Fixed in parse_truelist_state; verified live by first-ever nonzero invalid count.
+## Env vars on Render (14)
+PYTHON_VERSION=3.11.10, BRAIN_URL, BRAIN_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY,
+VPS_DISPATCH_URL=http://192.161.173.97:8091/dispatch, VPS_DISPATCH_KEY (64-char),
+TRIGGER_KEY (auto-generated, stored on VPS at /tmp/p3_orch_trigger.env),
+POLL_INTERVAL=60, POLL_LOG_LIMIT=50, STALL_TIMEOUT=1800, DISPATCH_TIMEOUT=20,
+PROJECT_SLUG=kje_orchestrator, LOG_LEVEL=INFO.
 
-## Investigation surprises (worth remembering)
-- Truelist's POST /batches accepts but silently ignores webhook_url field. Webhook is dashboard-side config only. Receiver shim built, awaiting dashboard wire-up.
-- verify_inline returns inconsistent prefixed/unprefixed state strings (email_invalid vs risky). Parser handles both defensively now.
+## Gotchas captured
+- **Render Python default:** first deploy used Python 3.14.3 (latest) and crashed — must pin via `.python-version` + `PYTHON_VERSION` env var + `runtime.txt`.
+- **Render envVars via POST /v1/services:** the envVars array inside serviceDetails was silently dropped on create. Fix: `PUT /v1/services/{id}/env-vars` separately, then trigger redeploy.
+- **Brain has no POST /projects:** new projects must be registered through the Brain UI; API exposes only GET/PATCH. `PATCH /projects` for kje_orchestrator currently 404s until Jim adds it.
+- **/status 500:** `kjcodedeck.wave_manifest` table does not yet exist in Supabase. Create it before promoting orchestrator to active duty (DDL in README.md).
 
-## Open anomalies for Session 2C
-- 2786 orphan leads with email_status='pending_batch' and no parent batch_id. Likely leftovers from earlier aborted submits. Cleanup: flush back to NULL or sweep into next batch.
-- 17576 'unknown' leads from v1 verify_inline include hidden invalids (the v1 parser miscategorized state=='invalid' as unknown). Re-verify via new architecture to recover them.
-- Truelist dashboard webhook not yet configured. 30-min poller is currently the only completion path. Latency 0-30 min instead of seconds.
+## Decisions
+- Starter plan, oregon, autoDeploy=yes — same shape as kjle/jim-brain.
+- 30-min stall timeout (configurable via env).
+- Trigger key generated via `secrets.token_urlsafe(40)`, not stored in repo.
+- Force-push to main per spec; competing P3v3 build script also pushed (commit 71aff4b7) — currently running container is still `cee25b87` build until a later redeploy promotes the newer commit.
 
-## Session 2C scope
-1. Configure Truelist dashboard webhook → /webhooks/truelist/batch-complete?secret=... (5 min Truelist UI work)
-2. Re-verify the 17576 v1-unknown leads via batch architecture
-3. Cleanup 2786 orphan pending_batch rows
-4. Watch first full weekend of 4-batches/night nightly cron — expect backlog clear in ~5 days at 100K/day
-5. Build Card v9 update reflecting Truelist-v2-as-canonical state
-
-## Pinned items (carry-over)
-- Send to DemoBoosterz from Lead Finder (after tour rebuild)
-- Schedule local backups for Documents/GitHub folder
-- Rotate exposed ReachInbox + DemoEnginez Supabase service role keys on Render
-
+## Next actions
+1. Register `kje_orchestrator` project in Brain UI so PATCH /projects works.
+2. Run DDL to create `kjcodedeck.wave_manifest` table.
+3. Insert first test wave (one harmless job) and watch `/status` cycle through queued → active → done.
+4. Tune `STALL_TIMEOUT` after observing first 24h of throughput.
 
 ---
 
@@ -178,6 +186,6 @@ the lesson.
 
 ---
 
-*Synced from Brain state at 2026-05-11 20:00:16 UTC.*
+*Synced from Brain state at 2026-05-12 00:00:25 UTC.*
 *This file is auto-regenerated every 4h. Manual edits will be overwritten
 on the next heal if the rebuilt content differs by >20% of lines.*
