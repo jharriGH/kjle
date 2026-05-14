@@ -1,0 +1,36 @@
+# KJLE CODEOWNERS — every protected file requires @jharriGH review.
+# Source of truth: PROTECTED.md in repo root. Keep these in lockstep.
+#
+# Last-match-wins, so the catch-all goes first and the specific rules below
+# override it for the protected paths.
+
+# Catch-all fallback
+* @jharriGH
+
+# ── DNC Compliance ───────────────────────────────────────────────────────────
+/api/routes/dnc.py                       @jharriGH
+/api/routes/dnc_webhooks.py              @jharriGH
+/api/lib/dnc_provider.py                 @jharriGH
+/api/lib/searchbug_provider.py           @jharriGH
+/api/lib/phone_utils.py                  @jharriGH
+/api/lib/reply_parser.py                 @jharriGH
+
+# ── Pain Scoring ─────────────────────────────────────────────────────────────
+/scripts/ingest.py                       @jharriGH
+/scripts/test_pain_score.py              @jharriGH
+/scripts/recompute_pain.py               @jharriGH
+/api/routes/segments_engine.py           @jharriGH
+
+# ── Email Cleaning — Truelist v2 ─────────────────────────────────────────────
+/api/routes/enrichment_email_clean.py    @jharriGH
+/api/routes/webhooks_truelist.py         @jharriGH
+/scripts/test_email_clean_parser.py      @jharriGH
+
+# ── ReachInbox Campaigns ─────────────────────────────────────────────────────
+/api/routes/reachinbox.py                @jharriGH
+/api/routes/campaigns.py                 @jharriGH
+/api/routes/webhooks.py                  @jharriGH
+
+# ── Protection layer itself ──────────────────────────────────────────────────
+/PROTECTED.md                            @jharriGH
+/.github/CODEOWNERS                      @jharriGH
