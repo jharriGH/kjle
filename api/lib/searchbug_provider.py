@@ -86,7 +86,13 @@ class SearchbugProvider(DNCProvider):
         }
 
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            # follow_redirects=False is httpx's default but we set it explicitly:
+            # Searchbug's account-denial path 302s to /access-denied.aspx?TYPE=F1
+            # (HTML body, not JSON). Following the redirect would silently downgrade
+            # this to a provider_bad_response, hiding the access-denial signature
+            # from log scanners. Keeping False lets us classify 3xx as a distinct
+            # error class with the Location header preserved.
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=False) as client:
                 r = await client.post(SEARCHBUG_URL, data=form)
         except httpx.TimeoutException:
             return DNCResult(
@@ -97,6 +103,24 @@ class SearchbugProvider(DNCProvider):
             return DNCResult(
                 is_dnc=True, reason="provider_network_error",
                 provider=self.name, error=f"provider_network_error: {type(e).__name__}: {e}",
+            )
+
+        if 300 <= r.status_code < 400:
+            # Searchbug-specific: account-level denial redirects to access-denied.aspx.
+            # Surface the Location target explicitly so one log line is enough to
+            # diagnose ("key revoked", "IP not whitelisted", etc.).
+            location = r.headers.get("Location") or r.headers.get("location") or ""
+            return DNCResult(
+                is_dnc=True, reason="provider_redirect_denied",
+                provider=self.name,
+                error=f"provider_http_{r.status_code}: redirect_to={location!r}",
+            )
+
+        if r.status_code in (401, 403):
+            return DNCResult(
+                is_dnc=True, reason="provider_auth_denied",
+                provider=self.name,
+                error=f"provider_http_{r.status_code}: {r.text[:200]}",
             )
 
         if r.status_code != 200:
