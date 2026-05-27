@@ -5,6 +5,15 @@ Routes: /kjle/v1/push/demoenginez/*
 
 Pushes qualifying KJLE leads to DemoEnginez via Lovable edge function.
 Endpoint: https://wvqifxycceixsiwsudve.supabase.co/functions/v1/receive-kjle-leads
+
+Phase 4 Layer 1 (2026-05-24): both /batch and /single now gate via DNC
+before pushing. Batch uses dedupe_and_check_phones (dedup payoff at n>1);
+single calls check_lead_for_channel directly (n=1 doesn't benefit from
+dedup, just adds overhead).
+
+Slice 1C (2026-05-27): imports fixed to match Slice 1B's split between
+dnc_check.py and dnc_batch.py. ChannelCheckResult.to_dict() used to unwrap
+the dataclass returned by check_lead_for_channel.
 """
 
 import logging
@@ -16,6 +25,8 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from ..database import get_db
+from ..lib.dnc_check import check_lead_for_channel
+from ..lib.dnc_batch import dedupe_and_check_phones
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -122,8 +133,39 @@ async def push_batch(body: BatchPushRequest):
             "summary": {"pushed": 0, "duplicates": 0, "failed": 0},
         }
 
+    # ── DNC gating (Phase 4 Layer 1, Slice 1C) ─────────────────────────────
+    # DemoEnginez is a voice-channel destination; gate via the voice channel
+    # check. dedupe_and_check_phones takes list[str] of lead_ids; we extract
+    # them from the leads we already fetched. The function runs internal
+    # suppressions + fed_dnc_list + TCPA litigator + Searchbug (full tier)
+    # and fans the verdict per-unique-phone to all leads sharing that phone.
+    lead_id_list = [lead["id"] for lead in leads if lead.get("id")]
+
+    dnc_summary = await dedupe_and_check_phones(
+        lead_id_list,
+        channel="voice",
+        source="demoenginez_push_batch",
+    )
+    # Slice 1B returns blocked_leads as list[dict{lead_id, reason, result_source}].
+    blocked_ids = {b["lead_id"] for b in dnc_summary.get("blocked_leads", [])}
+    allowed_leads = [lead for lead in leads if lead.get("id") not in blocked_ids]
+
+    if not allowed_leads:
+        return {
+            "status": "success",
+            "message": "All eligible leads blocked by DNC",
+            "summary": {
+                "pushed":                0,
+                "duplicates":            0,
+                "failed":                0,
+                "blocked_by_dnc":        len(blocked_ids),
+                "unique_phones_checked": dnc_summary.get("unique_phones_checked", 0),
+                "dnc_cost_usd":          dnc_summary.get("cost_usd", 0.0),
+            },
+        }
+
     # Map leads to DemoEnginez format
-    de_leads = [_map_lead_to_de(lead) for lead in leads]
+    de_leads = [_map_lead_to_de(lead) for lead in allowed_leads]
 
     # Call DemoEnginez edge function
     try:
@@ -150,10 +192,13 @@ async def push_batch(body: BatchPushRequest):
         return {
             "status": "success",
             "summary": {
-                "pushed":     inserted,
-                "duplicates": duplicates,
-                "failed":     failed,
-                "total_sent": len(de_leads),
+                "pushed":                inserted,
+                "duplicates":            duplicates,
+                "failed":                failed,
+                "total_sent":            len(de_leads),
+                "blocked_by_dnc":        len(blocked_ids),
+                "unique_phones_checked": dnc_summary.get("unique_phones_checked", 0),
+                "dnc_cost_usd":          dnc_summary.get("cost_usd", 0.0),
             },
             "filters": filters_used,
         }
@@ -186,6 +231,35 @@ async def push_single_lead(lead_id: str):
         raise HTTPException(status_code=404, detail="Lead not found")
 
     lead = result.data
+
+    # ── DNC gating (Phase 4 Layer 1, Slice 1C) ─────────────────────────────
+    # Single-lead path uses check_lead_for_channel directly — n=1 doesn't
+    # benefit from dedup, so routing through dedupe_and_check_phones would
+    # just add overhead. Response shape mirrors the batch endpoint so
+    # callers get a consistent contract.
+    #
+    # Slice 1B returns a ChannelCheckResult dataclass; unwrap with to_dict()
+    # so the response-shape contract matches the batch path.
+    dnc_result = await check_lead_for_channel(
+        lead_id,
+        channel="voice",
+        source="demoenginez_push_single",
+    )
+    dnc = dnc_result.to_dict()
+
+    if dnc.get("is_blocked"):
+        return {
+            "status":                "blocked",
+            "pushed":                0,
+            "duplicate":             False,
+            "business_name":         lead.get("business_name"),
+            "blocked_by_dnc":        True,
+            "unique_phones_checked": 1,
+            "dnc_cost_usd":          dnc.get("cost_usd", 0.0),
+            "dnc_reason":            dnc.get("reason"),
+            "dnc_result_source":     dnc.get("result_source"),
+        }
+
     de_lead = _map_lead_to_de(lead)
 
     try:
@@ -197,10 +271,13 @@ async def push_single_lead(lead_id: str):
             result = r.json()
 
         return {
-            "status":        "success",
-            "pushed":        result.get("inserted", 0),
-            "duplicate":     result.get("duplicates", 0) > 0,
-            "business_name": lead.get("business_name"),
+            "status":                "success",
+            "pushed":                result.get("inserted", 0),
+            "duplicate":             result.get("duplicates", 0) > 0,
+            "business_name":         lead.get("business_name"),
+            "blocked_by_dnc":        False,
+            "unique_phones_checked": 1,
+            "dnc_cost_usd":          dnc.get("cost_usd", 0.0),
         }
 
     except Exception as e:

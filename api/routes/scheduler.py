@@ -15,8 +15,12 @@ Call setup_scheduler() inside FastAPI lifespan (main.py).
 """
 
 import asyncio
+import csv
+import io
 import logging
+import os
 import time
+import zipfile
 from datetime import datetime, timezone, timedelta, date
 from typing import Optional
 
@@ -136,7 +140,28 @@ JOB_DEFINITIONS = {
         "schedule":    "Every 60 minutes",
         "trigger":     "interval",
     },
+    "fed_dnc_refresh_monthly": {
+        "description": "Refresh fed_dnc_list table from /opt/fed_dnc_latest.zip — warns and skips if file missing",
+        "schedule":    "1st of every month at 04:00 UTC",
+        "trigger":     "cron",
+    },
+    "nanpa_refresh_monthly": {
+        "description": "Refresh nanpa_blocked_prefixes table from /opt/nanpa_latest.csv — warns and skips if file missing",
+        "schedule":    "1st of every month at 04:30 UTC",
+        "trigger":     "cron",
+    },
 }
+
+
+# ── Federal DNC + NANPA refresh paths (Phase 4 Layer 1) ──────────────────────
+# Both source files live on the Render disk and are refreshed out-of-band
+# (FCC subscriber portal for DNC, NANPA monthly download for prefixes).
+# Until Jim's FCC registration is approved, fed_dnc_latest.zip will not
+# exist — the job logs a warning and exits status=skipped (NOT failed).
+FED_DNC_FILE = os.environ.get("FED_DNC_FILE_PATH", "/opt/fed_dnc_latest.zip")
+NANPA_FILE   = os.environ.get("NANPA_FILE_PATH",   "/opt/nanpa_latest.csv")
+FED_DNC_UPSERT_CHUNK = 5_000
+NANPA_UPSERT_CHUNK   = 2_000
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1540,6 +1565,239 @@ async def job_campaign_sync_hourly() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Job 10 — Federal DNC list refresh (monthly, 1st @ 04:00 UTC)
+# Source: /opt/fed_dnc_latest.zip (FCC subscriber portal download).
+# Until Jim's FCC registration (submitted 2026-05-24) is approved, the
+# file will not exist — job logs a warning and exits status=skipped.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def job_fed_dnc_refresh_monthly() -> dict:
+    """
+    Rebuild fed_dnc_list from /opt/fed_dnc_latest.zip.
+
+    The FCC distributes the National DNC Registry as a zipped text file —
+    one phone per line, 10 digits (no formatting). We normalize each to
+    E.164 (+1XXXXXXXXXX) and chunk-upsert into fed_dnc_list.
+
+    Missing file is NOT an error — Jim's FCC registration is still
+    pending approval as of 2026-05-24. Logs a warning and returns
+    status=skipped so the scheduler doesn't fire alerts.
+    """
+    job_name = "fed_dnc_refresh_monthly"
+    logger.info(f"[{job_name}] Starting...")
+    t_start = time.monotonic()
+
+    if not os.path.exists(FED_DNC_FILE):
+        notes = (
+            f"SKIPPED — {FED_DNC_FILE} not present. "
+            "Awaiting FCC National DNC Registry subscription approval "
+            "(submitted 2026-05-24). Drop the latest .zip at this path "
+            "and the next run will populate fed_dnc_list."
+        )
+        logger.warning(f"[{job_name}] {notes}")
+        await _log_job(job_name, status="skipped", notes=notes)
+        return {"job": job_name, "status": "skipped", "reason": notes}
+
+    refresh_run = _today_iso()
+    db = get_db()
+
+    inserted = 0
+    invalid  = 0
+
+    try:
+        with zipfile.ZipFile(FED_DNC_FILE, "r") as zf:
+            # FCC bundles a single .txt — pick the first one regardless of name.
+            text_members = [n for n in zf.namelist() if not n.endswith("/")]
+            if not text_members:
+                notes = f"FAILED — {FED_DNC_FILE} contains no files"
+                logger.error(f"[{job_name}] {notes}")
+                await _log_job(job_name, status="failed", notes=notes)
+                return {"job": job_name, "status": "failed", "reason": notes}
+
+            buffer: list[dict] = []
+            with zf.open(text_members[0]) as fh:
+                for raw_line in io.TextIOWrapper(fh, encoding="utf-8", errors="ignore"):
+                    digits = "".join(c for c in raw_line.strip() if c.isdigit())
+                    if len(digits) == 11 and digits.startswith("1"):
+                        digits = digits[1:]
+                    if len(digits) != 10:
+                        invalid += 1
+                        continue
+                    buffer.append({
+                        "phone": f"+1{digits}",
+                    })
+                    if len(buffer) >= FED_DNC_UPSERT_CHUNK:
+                        db.table("fed_dnc_list").upsert(buffer, on_conflict="phone").execute()
+                        inserted += len(buffer)
+                        buffer.clear()
+
+            if buffer:
+                db.table("fed_dnc_list").upsert(buffer, on_conflict="phone").execute()
+                inserted += len(buffer)
+                buffer.clear()
+
+    except Exception as e:
+        duration = time.monotonic() - t_start
+        notes = f"FAILED — {type(e).__name__}: {str(e)[:300]}"
+        logger.error(f"[{job_name}] {notes}")
+        await _log_job(job_name, duration_seconds=duration, status="failed", notes=notes)
+        return {"job": job_name, "status": "failed", "error": str(e)}
+
+    duration = time.monotonic() - t_start
+    notes = f"inserted={inserted}, invalid={invalid}, refresh_run={refresh_run}"
+    await _log_job(job_name, leads_processed=inserted, duration_seconds=duration,
+                   status="success", notes=notes)
+    return {
+        "job":              job_name,
+        "inserted":         inserted,
+        "invalid":          invalid,
+        "refresh_run":      refresh_run,
+        "duration_seconds": round(duration, 3),
+        "status":           "success",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 11 — NANPA invalid-prefix refresh (monthly, 1st @ 04:30 UTC)
+# Source: /opt/nanpa_latest.csv (NANPA monthly export).
+# Same first-run posture as the FCC job — file may not exist; we warn
+# and skip rather than fail.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def job_nanpa_refresh_monthly() -> dict:
+    """
+    Rebuild nanpa_carrier_prefixes from /opt/nanpa_latest.csv (NANPA
+    Thousands-Block Assignment, All Regions, Augmented).
+
+    Source: https://reports.nanpa.com/public/ThousandsBlockAssignment_All_Augmented.zip
+    Schema target: nanpa_carrier_prefixes (Slice 1A migration). PK is
+    npa_nxx_x (7 chars = NPA + NXX + thousands-block digit).
+
+    NANPA does NOT publish an explicit mobile/landline/voip flag - we derive
+    it from the carrier name via carrier_lookup.classify_line_type().
+
+    Defensive CSV parsing - accepts common NANPA-export header variants:
+        npa,nxx,thousands-block,ocn,company,...
+        NPA,NXX,Block,OCN,Company,...
+    Stray columns are ignored. Malformed rows count as `invalid` and skip.
+
+    Missing file is NOT an error - same posture as job_fed_dnc_refresh_monthly.
+    """
+    from ..lib.carrier_lookup import classify_line_type
+
+    job_name = "nanpa_refresh_monthly"
+    logger.info(f"[{job_name}] Starting...")
+    t_start = time.monotonic()
+
+    if not os.path.exists(NANPA_FILE):
+        notes = (
+            f"SKIPPED - {NANPA_FILE} not present. Drop the latest NANPA "
+            "Thousands-Block Assignment CSV at this path and the next run "
+            "will populate nanpa_carrier_prefixes."
+        )
+        logger.warning(f"[{job_name}] {notes}")
+        await _log_job(job_name, status="skipped", notes=notes)
+        return {"job": job_name, "status": "skipped", "reason": notes}
+
+    db = get_db()
+
+    inserted = 0
+    invalid  = 0
+    UPSERT_CHUNK = 2_000
+
+    def _get(row, *keys):
+        """Case-insensitive lookup over a list of candidate keys."""
+        lower = {(k or "").strip().lower(): v for k, v in row.items()}
+        for k in keys:
+            v = lower.get(k.lower())
+            if v is not None and str(v).strip():
+                return str(v).strip()
+        return None
+
+    try:
+        with open(NANPA_FILE, "r", encoding="utf-8", errors="ignore", newline="") as fh:
+            reader = csv.DictReader(fh)
+            buffer: list[dict] = []
+            for row in reader:
+                npa_raw   = _get(row, "npa", "area_code")
+                nxx_raw   = _get(row, "nxx", "exchange")
+                block_raw = _get(row, "block", "thousands-block", "thousands_block", "x")
+                if not (npa_raw and nxx_raw and block_raw):
+                    invalid += 1
+                    continue
+
+                npa = "".join(c for c in npa_raw if c.isdigit())
+                nxx = "".join(c for c in nxx_raw if c.isdigit())
+                block = "".join(c for c in block_raw if c.isdigit())
+
+                if len(npa) != 3 or len(nxx) != 3 or len(block) != 1:
+                    invalid += 1
+                    continue
+
+                npa_nxx_x = f"{npa}{nxx}{block}"
+
+                carrier = _get(row, "company", "carrier", "company_name", "block_holder")
+                ocn     = _get(row, "ocn", "operating_company_number")
+                state   = _get(row, "state", "region_state")
+                region  = _get(row, "region", "nanpa_region")
+                status  = _get(row, "status", "block_status")
+
+                line_type = classify_line_type(carrier, ocn)
+
+                buffer.append({
+                    "npa_nxx_x":    npa_nxx_x,
+                    "npa":          npa,
+                    "nxx":          nxx,
+                    "block":        block,
+                    "carrier":      carrier,
+                    "line_type":    line_type,
+                    "ocn":          ocn,
+                    "state":        (state or "").upper()[:2] or None,
+                    "region":       region,
+                    "status":       status,
+                })
+
+                if len(buffer) >= UPSERT_CHUNK:
+                    db.table("nanpa_carrier_prefixes").upsert(
+                        buffer, on_conflict="npa_nxx_x"
+                    ).execute()
+                    inserted += len(buffer)
+                    buffer.clear()
+
+            if buffer:
+                db.table("nanpa_carrier_prefixes").upsert(
+                    buffer, on_conflict="npa_nxx_x"
+                ).execute()
+                inserted += len(buffer)
+                buffer.clear()
+
+    except Exception as e:
+        duration = time.monotonic() - t_start
+        notes = f"FAILED - {type(e).__name__}: {str(e)[:300]}"
+        logger.error(f"[{job_name}] {notes}")
+        await _log_job(job_name, duration_seconds=duration, status="failed", notes=notes)
+        return {"job": job_name, "status": "failed", "error": str(e)}
+
+    # Clear the in-process lru_cache so subsequent lookups pick up fresh data
+    try:
+        from ..lib import carrier_lookup
+        carrier_lookup.clear_cache()
+    except Exception:
+        pass
+
+    duration = time.monotonic() - t_start
+    notes = f"inserted={inserted}, invalid={invalid}"
+    await _log_job(job_name, leads_processed=inserted, duration_seconds=duration,
+                   status="success", notes=notes)
+    return {
+        "job":              job_name,
+        "inserted":         inserted,
+        "invalid":          invalid,
+        "duration_seconds": round(duration, 3),
+        "status":           "success",
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
 # JOB DISPATCH MAP — maps name → async callable
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1554,6 +1812,8 @@ JOB_FUNCTIONS = {
     "enrich_stage4_nightly": job_enrich_stage4_nightly,
     "daily_cost_report":    job_daily_cost_report,
     "campaign_sync_hourly": job_campaign_sync_hourly,
+    "fed_dnc_refresh_monthly": job_fed_dnc_refresh_monthly,
+    "nanpa_refresh_monthly":   job_nanpa_refresh_monthly,
 }
 
 
@@ -1678,6 +1938,31 @@ def setup_scheduler() -> AsyncIOScheduler:
         name="Hourly Campaign Stats Sync",
         replace_existing=True,
         misfire_grace_time=600,
+    )
+
+    # Job 10: fed_dnc_refresh_monthly — 1st of every month @ 04:00 UTC
+    # Rebuilds fed_dnc_list from /opt/fed_dnc_latest.zip. Until Jim's FCC
+    # registration (submitted 2026-05-24) is approved, this job logs a
+    # warning and exits skipped — does NOT fail.
+    scheduler.add_job(
+        job_fed_dnc_refresh_monthly,
+        trigger=CronTrigger(day=1, hour=4, minute=0),
+        id="fed_dnc_refresh_monthly",
+        name="Federal DNC List Refresh (monthly)",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # Job 11: nanpa_refresh_monthly — 1st of every month @ 04:30 UTC
+    # Rebuilds nanpa_blocked_prefixes from /opt/nanpa_latest.csv. Same
+    # first-run posture as the FCC job — missing file warns and skips.
+    scheduler.add_job(
+        job_nanpa_refresh_monthly,
+        trigger=CronTrigger(day=1, hour=4, minute=30),
+        id="nanpa_refresh_monthly",
+        name="NANPA Invalid Prefix Refresh (monthly)",
+        replace_existing=True,
+        misfire_grace_time=3600,
     )
 
     logger.info(f"⏰ APScheduler configured: {len(scheduler.get_jobs())} jobs registered")

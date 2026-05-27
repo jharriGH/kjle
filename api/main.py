@@ -55,6 +55,8 @@ from .routes import commander
 from .routes import reachinbox
 from .routes import campaigns
 from .routes import dnc
+from .routes import dnc_channel
+from .routes import local_scraper_ingest
 from .routes import dnc_webhooks
 from .routes import webhooks_truelist
 from .routes.scheduler import setup_scheduler
@@ -159,6 +161,8 @@ app.include_router(scheduler.router,              prefix=PREFIX,                
 app.include_router(commander.router,              prefix=PREFIX,                  tags=["Commander"])
 app.include_router(reachinbox.router,             prefix=PREFIX,                  tags=["ReachInbox"])
 app.include_router(dnc.router,                    prefix=PREFIX,                  tags=["DNC"])
+app.include_router(dnc_channel.router,            prefix=PREFIX,                  tags=["DNC — Channel-Aware"])
+app.include_router(local_scraper_ingest.router,   prefix=PREFIX,                  tags=["Ingest — Local Scraper"])
 app.include_router(dnc_webhooks.router,           prefix=PREFIX,                  tags=["DNC Webhooks"])
 app.include_router(webhooks_truelist.router,      prefix=PREFIX,                  tags=["Truelist Webhooks"])
 app.include_router(admin_settings.router,         prefix=PREFIX,                  tags=["Admin Settings"])
