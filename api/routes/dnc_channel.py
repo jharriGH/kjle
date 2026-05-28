@@ -24,12 +24,13 @@ Phase 4 Layer 1 design notes:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from ..database import get_db
@@ -320,3 +321,56 @@ async def nanpa_refresh(x_api_key: str = Header(...)) -> dict:
         result["in_process_cache_cleared"] = False
 
     return result
+
+
+@router.post("/dnc/nanpa/upload")
+async def nanpa_upload(request: Request, x_api_key: str = Header(...)) -> dict:
+    """
+    One-shot authenticated upload of the NANPA source CSV to the Render
+    Persistent Disk path resolved from NANPA_FILE_PATH (default
+    /var/data/nanpa_latest.csv). Streams the raw request body to disk so
+    the 120MB+ NANPA file does not need to fit in memory.
+
+    Returns size + sha256 of the bytes actually written so the caller can
+    verify integrity against the source. Atomic via tmp-then-rename, so
+    a half-finished write never replaces a known-good file.
+    """
+    verify_api_key(x_api_key)
+
+    target = os.environ.get("NANPA_FILE_PATH", "/var/data/nanpa_latest.csv")
+    target_dir = os.path.dirname(target)
+    if target_dir:
+        os.makedirs(target_dir, exist_ok=True)
+
+    tmp = target + ".upload.tmp"
+    h = hashlib.sha256()
+    bytes_written = 0
+
+    try:
+        with open(tmp, "wb") as fh:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                fh.write(chunk)
+                h.update(chunk)
+                bytes_written += len(chunk)
+        os.replace(tmp, target)
+    except Exception as e:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        logger.error("nanpa_upload: write failed: %s", e)
+        raise HTTPException(
+            status_code=500,
+            detail=f"upload_failed: {type(e).__name__}: {str(e)[:200]}",
+        )
+
+    logger.info("nanpa_upload: wrote %d bytes to %s sha256=%s",
+                bytes_written, target, h.hexdigest())
+    return {
+        "status": "ok",
+        "path":   target,
+        "bytes":  bytes_written,
+        "sha256": h.hexdigest(),
+    }
