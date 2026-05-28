@@ -1736,7 +1736,7 @@ async def job_nanpa_refresh_monthly() -> dict:
 
                 npa_nxx_x = f"{npa}{nxx}{block}"
 
-                carrier = _get(row, "company", "carrier", "company_name", "block_holder")
+                carrier = _get(row, "assigned to", "code holder", "company", "carrier", "company_name", "block_holder")
                 ocn     = _get(row, "ocn", "operating_company_number")
                 state   = _get(row, "state", "region_state")
                 region  = _get(row, "region", "nanpa_region")
