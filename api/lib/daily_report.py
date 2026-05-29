@@ -280,6 +280,7 @@ def _dnc_section(since: datetime) -> str:
     sources_str = ", ".join(f"{s}={n}" for s, n in top_sources) if top_sources else "none"
 
     balance_line = _format_searchbug_balance_line()
+    by_consumer_block = _dnc_by_consumer_block()
 
     if (fresh + hits + halts) == 0:
         return (
@@ -287,6 +288,7 @@ def _dnc_section(since: datetime) -> str:
             "DNC: idle (0 lookups in last 24h)\n"
             f"Cache size: {cache_size:,} phones\n"
             f"{balance_line}\n"
+            f"{by_consumer_block}"
         )
 
     total = fresh + hits
@@ -298,6 +300,53 @@ def _dnc_section(since: datetime) -> str:
         f"Cache size: {cache_size:,} phones\n"
         f"Top sources: {sources_str}\n"
         f"{balance_line}\n"
+        f"{by_consumer_block}"
+    )
+
+
+def _dnc_by_consumer_block() -> str:
+    """
+    Phase 4 Layer 2 Slice 2A — per-consumer DNC breakdown.
+    Shares its SQL with /kjle/v1/dnc/stats/by-consumer via
+    api.routes.dnc.per_consumer_breakdown (no duplicated query).
+    """
+    try:
+        # Lazy import to avoid a circular module dependency at startup
+        # (routes/dnc.py imports from api.lib; this is the reverse edge).
+        from ..routes.dnc import per_consumer_breakdown
+        snapshot = per_consumer_breakdown(period_hours=24)
+    except Exception as e:
+        logger.warning(f"daily_report: per_consumer_breakdown failed: {e}")
+        return ""
+
+    consumers = snapshot.get("consumers") or []
+    totals = snapshot.get("totals") or {}
+
+    if not consumers or (totals.get("calls") or 0) == 0:
+        return "DNC by consumer: no activity in window.\n"
+
+    name_w = max(13, max((len(c["consumer_app"]) for c in consumers), default=13))
+    header = (
+        f"{'consumer_app':<{name_w}}  {'calls':>6}  {'hit_rate':>8}  {'cost':>8}"
+    )
+    rows = [
+        f"{c['consumer_app']:<{name_w}}  {c['calls']:>6,}  "
+        f"{int(round(c['hit_rate_pct'])):>7}%  {_fmt_usd(c['cost_usd']):>8}"
+        for c in consumers
+    ]
+    total_row = (
+        f"{'total':<{name_w}}  {totals['calls']:>6,}  "
+        f"{int(round(totals['hit_rate_pct'])):>7}%  {_fmt_usd(totals['cost_usd']):>8}"
+    )
+    sep = "-----"
+
+    return (
+        "\nDNC BY CONSUMER (last 24h)\n"
+        f"{sep}\n"
+        f"{header}\n"
+        + "\n".join(rows) + "\n"
+        f"{sep}\n"
+        f"{total_row}\n"
     )
 
 
