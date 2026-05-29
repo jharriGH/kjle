@@ -683,3 +683,151 @@ async def dnc_stats(x_api_key: str = Header(...)):
         "avg_fresh_lookup_cost_usd":   avg_cost,
         "searchbug_balance_last":      _get_admin_setting("searchbug_balance_last", ""),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-consumer breakdown — Phase 4 Layer 2 Slice 2A
+#
+# Shared by:
+#   GET /kjle/v1/dnc/stats/by-consumer
+#   api/lib/daily_report.py::_dnc_section (consumer breakdown sub-block)
+#
+# Returns a dict with the same shape as the endpoint response so the report
+# can format directly off it. SQL lives here, not duplicated downstream.
+# ─────────────────────────────────────────────────────────────────────────────
+
+BY_CONSUMER_PERIOD_HOURS_MAX = 720  # 30 days
+
+
+def per_consumer_breakdown(period_hours: int) -> dict:
+    """
+    Aggregate dnc_audit_log over the last `period_hours` grouped by `source`.
+
+    Returns:
+        {
+          "period_hours": int,
+          "as_of": iso8601 str,
+          "consumers": [
+            {
+              consumer_app, calls, fresh_lookups, cache_hits,
+              internal_suppressions, errors, hit_rate_pct, cost_usd
+            },
+            ...
+          ],
+          "totals": { same shape, aggregate across all consumers }
+        }
+
+    hit_rate_pct = cache_hits / (cache_hits + fresh_lookups) * 100. Internal
+    suppressions are excluded from the denominator — they're a pre-cache layer.
+    Budget-cap errors are excluded from cost_usd (they never actually billed).
+    """
+    if period_hours < 1:
+        period_hours = 1
+    if period_hours > BY_CONSUMER_PERIOD_HOURS_MAX:
+        period_hours = BY_CONSUMER_PERIOD_HOURS_MAX
+
+    now = datetime.now(timezone.utc)
+    since = (now - timedelta(hours=period_hours)).isoformat()
+
+    db = get_db()
+    try:
+        rows = (
+            db.table("dnc_audit_log")
+            .select("source, result, cost_usd, error")
+            .gte("occurred_at", since)
+            .execute()
+            .data or []
+        )
+    except Exception as e:
+        logger.warning(f"dnc per_consumer_breakdown: audit fetch failed: {e}")
+        rows = []
+
+    # Aggregate per consumer
+    agg: dict[str, dict] = {}
+    for r in rows:
+        src = (r.get("source") or "").strip() or "unknown"
+        bucket = agg.setdefault(src, {
+            "calls":                 0,
+            "fresh_lookups":         0,
+            "cache_hits":            0,
+            "internal_suppressions": 0,
+            "errors":                0,
+            "cost_usd_raw":          0.0,
+        })
+        bucket["calls"] += 1
+        result = r.get("result")
+        if result == "fresh_lookup":
+            bucket["fresh_lookups"] += 1
+        elif result == "cache_hit":
+            bucket["cache_hits"] += 1
+        elif result == "internal_suppression":
+            bucket["internal_suppressions"] += 1
+        elif result == "error":
+            bucket["errors"] += 1
+
+        # Cost — exclude budget-cap rejections (they never billed)
+        if not (
+            result == "error"
+            and (r.get("error") or "").startswith("budget_cap")
+        ):
+            try:
+                bucket["cost_usd_raw"] += float(r.get("cost_usd") or 0)
+            except (TypeError, ValueError):
+                pass
+
+    def _hit_rate(cache_hits: int, fresh: int) -> float:
+        denom = cache_hits + fresh
+        return round(cache_hits / denom * 100, 2) if denom else 0.0
+
+    consumers = []
+    for src, b in sorted(agg.items(), key=lambda kv: kv[1]["calls"], reverse=True):
+        consumers.append({
+            "consumer_app":          src,
+            "calls":                 b["calls"],
+            "fresh_lookups":         b["fresh_lookups"],
+            "cache_hits":            b["cache_hits"],
+            "internal_suppressions": b["internal_suppressions"],
+            "errors":                b["errors"],
+            "hit_rate_pct":          _hit_rate(b["cache_hits"], b["fresh_lookups"]),
+            "cost_usd":              round(b["cost_usd_raw"], 5),
+        })
+
+    # Totals
+    t_calls   = sum(c["calls"]                 for c in consumers)
+    t_fresh   = sum(c["fresh_lookups"]         for c in consumers)
+    t_hits    = sum(c["cache_hits"]            for c in consumers)
+    t_supp    = sum(c["internal_suppressions"] for c in consumers)
+    t_errs    = sum(c["errors"]                for c in consumers)
+    t_cost    = round(sum(c["cost_usd"]        for c in consumers), 5)
+
+    totals = {
+        "consumer_app":          "total",
+        "calls":                 t_calls,
+        "fresh_lookups":         t_fresh,
+        "cache_hits":            t_hits,
+        "internal_suppressions": t_supp,
+        "errors":                t_errs,
+        "hit_rate_pct":          _hit_rate(t_hits, t_fresh),
+        "cost_usd":              t_cost,
+    }
+
+    return {
+        "period_hours": period_hours,
+        "as_of":        now.isoformat(),
+        "consumers":    consumers,
+        "totals":       totals,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /dnc/stats/by-consumer
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/dnc/stats/by-consumer")
+async def dnc_stats_by_consumer(
+    x_api_key:    str = Header(...),
+    period_hours: int = Query(24, ge=1, le=BY_CONSUMER_PERIOD_HOURS_MAX,
+                              description="Window length, hours. Max 720 (30d)."),
+):
+    verify_api_key(x_api_key)
+    return per_consumer_breakdown(period_hours)
