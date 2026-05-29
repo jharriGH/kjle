@@ -253,6 +253,11 @@ def _dnc_section(since: datetime) -> str:
         1 for r in rows
         if r.get("result") == "error" and (r.get("error") or "").startswith("budget_cap")
     )
+
+    # Phase 4 Layer 2 Slice 2B — soft-TTL counters (24h)
+    stale_hits     = sum(1 for r in rows if r.get("result") == "cache_hit_stale_served")
+    bg_success_24h = sum(1 for r in rows if r.get("result") == "background_refresh_success")
+    bg_failure_24h = sum(1 for r in rows if r.get("result") == "background_refresh_failure")
     cost = round(
         sum(
             _safe_float(r.get("cost_usd"))
@@ -280,9 +285,15 @@ def _dnc_section(since: datetime) -> str:
     sources_str = ", ".join(f"{s}={n}" for s, n in top_sources) if top_sources else "none"
 
     balance_line = _format_searchbug_balance_line()
+    soft_ttl_lines = _dnc_soft_ttl_lines(
+        since=since,
+        stale_hits=stale_hits,
+        bg_success_24h=bg_success_24h,
+        bg_failure_24h=bg_failure_24h,
+    )
     by_consumer_block = _dnc_by_consumer_block()
 
-    if (fresh + hits + halts) == 0:
+    if (fresh + hits + halts + stale_hits + bg_success_24h + bg_failure_24h) == 0:
         return (
             "DNC HEALTH\n"
             "DNC: idle (0 lookups in last 24h)\n"
@@ -299,8 +310,53 @@ def _dnc_section(since: datetime) -> str:
         f"Cost: {_fmt_usd(cost)}\n"
         f"Cache size: {cache_size:,} phones\n"
         f"Top sources: {sources_str}\n"
+        f"{soft_ttl_lines}"
         f"{balance_line}\n"
         f"{by_consumer_block}"
+    )
+
+
+def _dnc_soft_ttl_lines(
+    *,
+    since: datetime,
+    stale_hits: int,
+    bg_success_24h: int,
+    bg_failure_24h: int,
+) -> str:
+    """
+    Phase 4 Layer 2 Slice 2B — soft-TTL counters injected into DNC HEALTH.
+
+    Three lines appended below 'Top sources':
+      Stale hits (24h):           N
+      Background refreshes (24h): X successes / Y failures
+      Refresh failure rate (7d):  Z%
+
+    The 7d failure rate requires a separate query over the 7-day window.
+    Degrades to '0%' if the window has zero attempts.
+    """
+    db = get_db()
+    cutoff_7d = (since - timedelta(hours=6 * 24)).isoformat()  # since is 24h ago -> 7d total
+    try:
+        rows_7d = (
+            db.table("dnc_audit_log")
+            .select("result")
+            .gte("occurred_at", cutoff_7d)
+            .execute()
+            .data or []
+        )
+    except Exception as e:
+        logger.warning(f"daily_report: 7d refresh-failure fetch failed: {e}")
+        rows_7d = []
+
+    succ_7d = sum(1 for r in rows_7d if r.get("result") == "background_refresh_success")
+    fail_7d = sum(1 for r in rows_7d if r.get("result") == "background_refresh_failure")
+    denom_7d = succ_7d + fail_7d
+    fail_rate = round(fail_7d / denom_7d * 100, 1) if denom_7d else 0.0
+
+    return (
+        f"Stale hits (24h): {stale_hits:,}\n"
+        f"Background refreshes (24h): {bg_success_24h:,} successes / {bg_failure_24h:,} failures\n"
+        f"Refresh failure rate (7d): {fail_rate}%\n"
     )
 
 
