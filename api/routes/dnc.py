@@ -25,11 +25,12 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query
 from pydantic import BaseModel
 
 from ..database import get_db
 from ..lib import cost_guard
+from ..lib.cache_refresh import refresh_phone_in_background
 from ..lib.dnc_provider import DNCResult, get_active_provider
 from ..lib.phone_utils import normalize_phone
 
@@ -73,6 +74,24 @@ class ScrubBatchRequest(BaseModel):
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_ts(raw) -> Optional[datetime]:
+    """Parse a Postgres-emitted ISO-8601 timestamptz to a tz-aware datetime."""
+    if not raw:
+        return None
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    try:
+        s = str(raw)
+        # Postgres often emits "...+00:00"; fromisoformat handles that on 3.11+.
+        # Handle "Z" suffix as a safety net.
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
 
 
 def _get_admin_setting(key: str, default: str) -> str:
@@ -155,11 +174,17 @@ async def _perform_check(
     raw_phone: str,
     source: str,
     lead_id: Optional[str],
+    background_tasks: Optional[BackgroundTasks] = None,
 ) -> dict:
     """
     Shared lookup pipeline used by both /dnc/check/{phone} and /dnc/check.
     Returns a serializable dict. Raises HTTPException(400) only on invalid
     phone format (the one case where we don't write an audit row).
+
+    background_tasks is optional so /dnc/scrub-batch (which iterates this fn
+    in-loop) can pass None. When None, a stale-cache hit degrades to a
+    foreground refresh — the batch path is already async-friendly and the
+    extra latency there is acceptable.
     """
     phone = normalize_phone(raw_phone)
     if not phone:
@@ -208,31 +233,63 @@ async def _perform_check(
         logger.warning(f"dnc: suppressions read failed for {phone}: {e}")
         # Fall through — better to fail the check via cache/provider than 500 here.
 
-    # 2. Cache hit (non-expired) — free
+    # 2. Cache lookup with soft TTL (Phase 4 Layer 2 Slice 2B)
+    #
+    #    Three cases:
+    #      a. now < expires_at        — FRESH HIT, return as-is
+    #      b. now < hard_expires_at   — STALE HIT, return stale value AND queue
+    #                                   a background refresh via BackgroundTasks
+    #                                   so the next caller gets fresh data
+    #      c. now >= hard_expires_at  — fall through to fresh provider lookup
     try:
-        now_iso = _now_iso()
         c = (
             db.table("dnc_cache")
             .select("*")
             .eq("phone", phone)
-            .gt("expires_at", now_iso)
             .execute()
         )
         if c.data:
             row = c.data[0]
-            _audit(
-                phone=phone, source=src, result="cache_hit",
-                is_dnc=row.get("is_dnc"), requesting_lead_id=lead_id,
-            )
-            return _serialize_response(
-                result_source="cache_hit",
-                phone_normalized=phone,
-                is_dnc=row.get("is_dnc"),
-                reason=row.get("dnc_reason") or "",
-                tcpa=bool(row.get("tcpa_litigator")),
-                line_type=row.get("line_type") or "unknown",
-                carrier=row.get("carrier") or "",
-            )
+            now = datetime.now(timezone.utc)
+            expires_at_raw      = row.get("expires_at")
+            hard_expires_at_raw = row.get("hard_expires_at")
+            expires_at      = _parse_ts(expires_at_raw)
+            hard_expires_at = _parse_ts(hard_expires_at_raw) or expires_at
+
+            if expires_at and now < expires_at:
+                # a) fresh hit
+                _audit(
+                    phone=phone, source=src, result="cache_hit",
+                    is_dnc=row.get("is_dnc"), requesting_lead_id=lead_id,
+                )
+                return _serialize_response(
+                    result_source="cache_hit",
+                    phone_normalized=phone,
+                    is_dnc=row.get("is_dnc"),
+                    reason=row.get("dnc_reason") or "",
+                    tcpa=bool(row.get("tcpa_litigator")),
+                    line_type=row.get("line_type") or "unknown",
+                    carrier=row.get("carrier") or "",
+                )
+
+            if hard_expires_at and now < hard_expires_at:
+                # b) stale hit — serve stale, queue background refresh
+                _audit(
+                    phone=phone, source=src, result="cache_hit_stale_served",
+                    is_dnc=row.get("is_dnc"), requesting_lead_id=lead_id,
+                )
+                if background_tasks is not None:
+                    background_tasks.add_task(refresh_phone_in_background, phone)
+                return _serialize_response(
+                    result_source="cache_hit_stale_served",
+                    phone_normalized=phone,
+                    is_dnc=row.get("is_dnc"),
+                    reason=row.get("dnc_reason") or "",
+                    tcpa=bool(row.get("tcpa_litigator")),
+                    line_type=row.get("line_type") or "unknown",
+                    carrier=row.get("carrier") or "",
+                )
+            # c) hard-expired — fall through to fresh provider lookup
     except Exception as e:
         logger.warning(f"dnc: cache read failed for {phone}: {e}")
         # Fall through to provider.
@@ -299,20 +356,25 @@ async def _perform_check(
 
     # 5. Successful fresh lookup — cache, bill, audit, persist balance
     ttl_days = int(_get_admin_setting("dnc_cache_ttl_days", "14") or "14")
-    expires_at = (datetime.now(timezone.utc) + timedelta(days=ttl_days)).isoformat()
+    ext_days = int(_get_admin_setting("dnc_soft_ttl_extension_days", "7") or "7")
+    now_dt = datetime.now(timezone.utc)
+    expires_at      = (now_dt + timedelta(days=ttl_days)).isoformat()
+    hard_expires_at = (now_dt + timedelta(days=ttl_days + ext_days)).isoformat()
 
     try:
         db.table("dnc_cache").upsert({
-            "phone":           phone,
-            "is_dnc":          result.is_dnc,
-            "dnc_reason":      result.reason or "",
-            "tcpa_litigator":  result.tcpa_litigator,
-            "line_type":       result.line_type or "unknown",
-            "carrier":         result.carrier or "",
-            "fetched_at":      _now_iso(),
-            "expires_at":      expires_at,
-            "raw_response":    result.raw_response or {},
-            "source_provider": result.provider or "searchbug",
+            "phone":             phone,
+            "is_dnc":            result.is_dnc,
+            "dnc_reason":        result.reason or "",
+            "tcpa_litigator":    result.tcpa_litigator,
+            "line_type":         result.line_type or "unknown",
+            "carrier":           result.carrier or "",
+            "fetched_at":        _now_iso(),
+            "expires_at":        expires_at,
+            "hard_expires_at":   hard_expires_at,
+            "raw_response":      result.raw_response or {},
+            "source_provider":   result.provider or "searchbug",
+            "refresh_in_flight": False,
         }, on_conflict="phone").execute()
     except Exception as e:
         logger.error(f"dnc: cache upsert failed for {phone}: {e}")
@@ -442,11 +504,12 @@ async def dnc_check_email_path(
 
 @router.get("/dnc/check")
 async def dnc_check_query(
+    background_tasks: BackgroundTasks,
     phone:   str           = Query(..., description="US phone in any format"),
     source:  str           = Query("unknown"),
     lead_id: Optional[str] = Query(None),
 ):
-    return await _perform_check(phone, source, lead_id)
+    return await _perform_check(phone, source, lead_id, background_tasks)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -456,10 +519,11 @@ async def dnc_check_query(
 @router.get("/dnc/check/{phone}")
 async def dnc_check_path(
     phone:   str,
+    background_tasks: BackgroundTasks,
     source:  str           = Query("unknown"),
     lead_id: Optional[str] = Query(None),
 ):
-    return await _perform_check(phone, source, lead_id)
+    return await _perform_check(phone, source, lead_id, background_tasks)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -612,6 +676,12 @@ async def dnc_stats(x_api_key: str = Header(...)):
         1 for r in audit_24h
         if r.get("result") == "error" and (r.get("error") or "").startswith("budget_cap")
     )
+
+    # Phase 4 Layer 2 Slice 2B — soft-TTL observability
+    stale_hits_24h          = sum(1 for r in audit_24h if r.get("result") == "cache_hit_stale_served")
+    bg_refresh_success_24h  = sum(1 for r in audit_24h if r.get("result") == "background_refresh_success")
+    bg_refresh_failure_24h  = sum(1 for r in audit_24h if r.get("result") == "background_refresh_failure")
+    background_refreshes_24h = bg_refresh_success_24h + bg_refresh_failure_24h
     cost_24h = round(
         sum(
             float(r.get("cost_usd") or 0)
@@ -639,6 +709,14 @@ async def dnc_stats(x_api_key: str = Header(...)):
     real_7d   = sum(1 for r in audit_7d if r.get("result") in ("fresh_lookup", "cache_hit"))
     hits_7d   = sum(1 for r in audit_7d if r.get("result") == "cache_hit")
     hit_rate  = round(hits_7d / real_7d * 100, 2) if real_7d else 0.0
+
+    # Phase 4 Layer 2 Slice 2B — 7d background-refresh failure rate
+    bg_success_7d = sum(1 for r in audit_7d if r.get("result") == "background_refresh_success")
+    bg_failure_7d = sum(1 for r in audit_7d if r.get("result") == "background_refresh_failure")
+    bg_total_7d   = bg_success_7d + bg_failure_7d
+    background_refresh_failure_rate_7d_pct = (
+        round(bg_failure_7d / bg_total_7d * 100, 2) if bg_total_7d else 0.0
+    )
 
     cost_7d = round(
         sum(
@@ -682,6 +760,10 @@ async def dnc_stats(x_api_key: str = Header(...)):
         "top_sources_24h":             top_sources,
         "avg_fresh_lookup_cost_usd":   avg_cost,
         "searchbug_balance_last":      _get_admin_setting("searchbug_balance_last", ""),
+        # Phase 4 Layer 2 Slice 2B — soft-TTL observability
+        "stale_hits_24h":                          stale_hits_24h,
+        "background_refreshes_24h":                background_refreshes_24h,
+        "background_refresh_failure_rate_7d_pct":  background_refresh_failure_rate_7d_pct,
     }
 
 
@@ -760,6 +842,17 @@ def per_consumer_breakdown(period_hours: int) -> dict:
             bucket["fresh_lookups"] += 1
         elif result == "cache_hit":
             bucket["cache_hits"] += 1
+        elif result == "cache_hit_stale_served":
+            # Slice 2B — stale-served still counts as a hit for the consumer
+            # (no provider call from their perspective).
+            bucket["cache_hits"] += 1
+        elif result == "background_refresh_success":
+            # Slice 2B — billable fresh lookup attributed to kjle_internal
+            # via the source column set by cache_refresh.py.
+            bucket["fresh_lookups"] += 1
+        elif result in ("background_refresh_failure", "background_refresh_skipped_budget"):
+            # Slice 2B — non-billable failure; attributed to kjle_internal.
+            bucket["errors"] += 1
         elif result == "internal_suppression":
             bucket["internal_suppressions"] += 1
         elif result == "error":
