@@ -2034,10 +2034,16 @@ async def _send_tcpa_weekly_digest(
         result = await send_email(to=recipient, subject=subject, body_text=body, from_addr=sender)
         return ("success" if result.get("ok") else "failed"), result.get("error")
 
-    # Build the long-form digest
-    next_refresh = (
-        datetime.now(timezone.utc) + timedelta(days=7)
-    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+    # Build the long-form digest. Next refresh is 7 days from the just-completed
+    # refresh, not from now() — keeps the email accurate even if digest send is
+    # delayed by a slow Resend round-trip.
+    try:
+        ref_dt = datetime.fromisoformat(refreshed_at_iso.replace("Z", "+00:00"))
+        if ref_dt.tzinfo is None:
+            ref_dt = ref_dt.replace(tzinfo=timezone.utc)
+        next_refresh = (ref_dt + timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        next_refresh = (datetime.now(timezone.utc) + timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S UTC")
     refreshed_at_human = refreshed_at_iso.replace("T", " ").split("+")[0].split(".")[0] + " UTC"
 
     lines = [
@@ -2056,7 +2062,8 @@ async def _send_tcpa_weekly_digest(
             row = added_rows_by_phone.get(ph) or {}
             name  = (row.get("name") or "").strip()
             state = (row.get("state") or "").strip()
-            label = f"  +{ph}"
+            # ph is already E.164 (+1XXXXXXXXXX); don't prepend another '+'
+            label = f"  {ph}"
             if name and state:
                 label += f"  {name} ({state})"
             elif name:
