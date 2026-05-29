@@ -33,6 +33,7 @@ from ..lib import cost_guard
 from ..lib.cache_refresh import refresh_phone_in_background
 from ..lib.dnc_provider import DNCResult, get_active_provider
 from ..lib.phone_utils import normalize_phone
+from ..lib.tcpa_check import is_tcpa_litigator
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -232,6 +233,30 @@ async def _perform_check(
     except Exception as e:
         logger.warning(f"dnc: suppressions read failed for {phone}: {e}")
         # Fall through — better to fail the check via cache/provider than 500 here.
+
+    # 1.5 TCPA litigator pre-check (Phase 4 Layer 3 Slice 3A)
+    #
+    #     Pre-cache, pre-Searchbug. A phone on the litigator list is DNC under
+    #     any circumstance regardless of consent, so we must not let a
+    #     previously-cached "clean" row hide the match. The check is a PK
+    #     lookup against tcpa_litigators — free, indexed, fast.
+    #
+    #     is_tcpa_litigator() degrades to is_litigator=False on read failure
+    #     so this layer never 500s the request — it's hardening, not gating.
+    tcpa_res = await is_tcpa_litigator(phone, db)
+    if tcpa_res.get("is_litigator"):
+        matched_row = tcpa_res.get("matched_row") or {}
+        _audit(
+            phone=phone, source=src, result="tcpa_litigator_match",
+            is_dnc=True, cost_usd=0.0, requesting_lead_id=lead_id,
+            metadata={"litigator_row": matched_row},
+        )
+        return _serialize_response(
+            result_source="tcpa_litigator_match",
+            phone_normalized=phone, is_dnc=True,
+            reason="tcpa_litigator_match",
+            tcpa=True,
+        )
 
     # 2. Cache lookup with soft TTL (Phase 4 Layer 2 Slice 2B)
     #
@@ -657,6 +682,13 @@ async def dnc_stats(x_api_key: str = Header(...)):
     except Exception:
         sup_size = 0
 
+    # Phase 4 Layer 3 Slice 3A — TCPA litigator-list size
+    try:
+        tcpa_size_res = db.table("tcpa_litigators").select("phone", count="exact").limit(1).execute()
+        tcpa_litigator_list_size = tcpa_size_res.count or 0
+    except Exception:
+        tcpa_litigator_list_size = 0
+
     # Audit rollups (24h)
     try:
         audit_24h = (
@@ -682,6 +714,11 @@ async def dnc_stats(x_api_key: str = Header(...)):
     bg_refresh_success_24h  = sum(1 for r in audit_24h if r.get("result") == "background_refresh_success")
     bg_refresh_failure_24h  = sum(1 for r in audit_24h if r.get("result") == "background_refresh_failure")
     background_refreshes_24h = bg_refresh_success_24h + bg_refresh_failure_24h
+
+    # Phase 4 Layer 3 Slice 3A — TCPA litigator matches in last 24h
+    tcpa_litigator_matches_24h = sum(
+        1 for r in audit_24h if r.get("result") == "tcpa_litigator_match"
+    )
     cost_24h = round(
         sum(
             float(r.get("cost_usd") or 0)
@@ -764,6 +801,12 @@ async def dnc_stats(x_api_key: str = Header(...)):
         "stale_hits_24h":                          stale_hits_24h,
         "background_refreshes_24h":                background_refreshes_24h,
         "background_refresh_failure_rate_7d_pct":  background_refresh_failure_rate_7d_pct,
+        # Phase 4 Layer 3 Slice 3A — TCPA litigator pre-check observability
+        "tcpa_litigator_list_size":         tcpa_litigator_list_size,
+        "tcpa_litigator_matches_24h":       tcpa_litigator_matches_24h,
+        "tcpa_litigator_last_refreshed_at": (
+            _get_admin_setting("tcpa_list_last_refresh_at", "") or None
+        ),
     }
 
 
@@ -854,6 +897,11 @@ def per_consumer_breakdown(period_hours: int) -> dict:
             # Slice 2B — non-billable failure; attributed to kjle_internal.
             bucket["errors"] += 1
         elif result == "internal_suppression":
+            bucket["internal_suppressions"] += 1
+        elif result == "tcpa_litigator_match":
+            # Slice 3A — categorical pre-cache block, free to the consumer.
+            # Same shape as internal_suppression (no provider call, cost=0)
+            # so we bucket it alongside to keep sub-bucket totals consistent.
             bucket["internal_suppressions"] += 1
         elif result == "error":
             bucket["errors"] += 1

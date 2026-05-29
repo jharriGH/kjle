@@ -150,6 +150,11 @@ JOB_DEFINITIONS = {
         "schedule":    "1st of every month at 04:30 UTC",
         "trigger":     "cron",
     },
+    "tcpa_refresh_weekly": {
+        "description": "Refresh tcpa_litigators table from active TCPA list provider — dormant-safe if env vars empty; emails weekly delta digest",
+        "schedule":    "Weekly on Sunday at 04:00 UTC",
+        "trigger":     "cron",
+    },
 }
 
 
@@ -1798,6 +1803,351 @@ async def job_nanpa_refresh_monthly() -> dict:
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Job 12 — TCPA litigator list refresh (weekly, Sunday @ 04:00 UTC)
+# Phase 4 Layer 3 Slice 3A. Pulls from get_active_tcpa_provider().fetch_latest_list().
+# Dormant-safe: if the provider has no env vars set, returns an empty list and
+# we no-op without touching tcpa_litigators. After UPSERT, computes a delta vs
+# the pre-refresh snapshot and emails a weekly digest to the daily-report
+# recipient via Resend.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def job_tcpa_refresh_weekly() -> dict:
+    """
+    Refresh the tcpa_litigators table from the active vendor and email the
+    weekly delta digest. Cadence: Sunday 04:00 UTC.
+
+    Empty list handling (Section 3.5 of the design doc):
+      - empty -> empty: log "no-op (list not yet provisioned)" + skipped status
+      - non-empty -> empty: WARNING, send investigate-empty email, do NOT
+        delete existing rows, skip digest, return failed
+    """
+    from ..lib.tcpa_provider import get_active_tcpa_provider
+    from ..lib.email_sender import send_email, is_configured as _email_configured
+
+    job_name = "tcpa_refresh_weekly"
+    logger.info(f"[{job_name}] Starting...")
+    t_start = time.monotonic()
+    db = get_db()
+
+    # 1) Snapshot pre-refresh phones
+    try:
+        old_rows = (
+            db.table("tcpa_litigators").select("phone").execute().data or []
+        )
+    except Exception as e:
+        # Table missing = migration not run. Treat as failed but don't crash.
+        duration = time.monotonic() - t_start
+        notes = f"FAILED — tcpa_litigators read failed: {type(e).__name__}: {e}"
+        logger.error(f"[{job_name}] {notes}")
+        await _log_job(job_name, duration_seconds=duration, status="failed", notes=notes)
+        return {"job": job_name, "status": "failed", "error": str(e)}
+
+    old_phones = {r["phone"] for r in old_rows if r.get("phone")}
+
+    # 2) Fetch latest list from active provider
+    provider = get_active_tcpa_provider()
+    try:
+        new_list = await provider.fetch_latest_list()
+    except Exception as e:
+        duration = time.monotonic() - t_start
+        notes = f"FAILED — provider.fetch_latest_list raised: {type(e).__name__}: {e}"
+        logger.error(f"[{job_name}] {notes}")
+        await _log_job(job_name, duration_seconds=duration, status="failed", notes=notes)
+        return {"job": job_name, "status": "failed", "error": str(e)}
+
+    new_phones = {row["phone"] for row in new_list if row.get("phone")}
+
+    # 2a) Dormant / empty list handling
+    if not new_list:
+        if not old_phones:
+            duration = time.monotonic() - t_start
+            notes = (
+                "SKIPPED — provider returned empty list and tcpa_litigators "
+                "is also empty (list not yet provisioned; set "
+                "TCPA_LIST_CSV_URL to activate)"
+            )
+            logger.info(f"[{job_name}] {notes}")
+            await _log_job(job_name, duration_seconds=duration, status="skipped", notes=notes)
+            return {"job": job_name, "status": "skipped", "reason": notes}
+
+        # Empty payload but existing data: do NOT delete. Investigate.
+        duration = time.monotonic() - t_start
+        notes = (
+            f"FAILED — provider returned empty list but tcpa_litigators has "
+            f"{len(old_phones)} existing rows. Existing data preserved. "
+            "Subject 'TCPA refresh returned empty — investigate' email sent."
+        )
+        logger.error(f"[{job_name}] {notes}")
+        await _send_tcpa_empty_investigation_email(existing_count=len(old_phones))
+        await _log_job(job_name, duration_seconds=duration, status="failed", notes=notes)
+        return {"job": job_name, "status": "failed", "reason": notes}
+
+    # 3) UPSERT all returned rows (preserves added_at via on_conflict)
+    upserted = 0
+    upsert_errors = 0
+    now_iso = _now_iso()
+    UPSERT_CHUNK = 1_000
+
+    buffer: list[dict] = []
+    for row in new_list:
+        phone = row.get("phone")
+        if not phone:
+            continue
+        payload = {
+            "phone":             phone,
+            "source":            provider.name,
+            "name":              row.get("name"),
+            "state":             row.get("state"),
+            "case_count":        row.get("case_count"),
+            "last_refreshed_at": now_iso,
+            "metadata":          row.get("metadata") or {},
+        }
+        buffer.append(payload)
+        if len(buffer) >= UPSERT_CHUNK:
+            try:
+                db.table("tcpa_litigators").upsert(buffer, on_conflict="phone").execute()
+                upserted += len(buffer)
+            except Exception as e:
+                upsert_errors += len(buffer)
+                logger.error(f"[{job_name}] upsert chunk failed: {e}")
+            buffer.clear()
+
+    if buffer:
+        try:
+            db.table("tcpa_litigators").upsert(buffer, on_conflict="phone").execute()
+            upserted += len(buffer)
+        except Exception as e:
+            upsert_errors += len(buffer)
+            logger.error(f"[{job_name}] final upsert chunk failed: {e}")
+        buffer.clear()
+
+    # 4) Compute delta
+    added   = sorted(new_phones - old_phones)
+    removed = sorted(old_phones - new_phones)
+
+    # Build a lookup of added rows for the digest (phone -> row dict)
+    new_by_phone = {row["phone"]: row for row in new_list if row.get("phone")}
+
+    # 5) Persist last_refresh timestamp
+    try:
+        db.table("admin_settings").upsert(
+            {"key": "tcpa_list_last_refresh_at", "value": now_iso, "updated_at": now_iso},
+            on_conflict="key",
+        ).execute()
+    except Exception as e:
+        logger.warning(f"[{job_name}] admin_settings last_refresh write failed: {e}")
+
+    # 6) Send weekly digest
+    digest_status = "skipped"
+    digest_error: Optional[str] = None
+    try:
+        if _email_configured():
+            digest_status, digest_error = await _send_tcpa_weekly_digest(
+                added_phones=added,
+                removed_phones=removed,
+                added_rows_by_phone=new_by_phone,
+                total_list_size=len(new_phones),
+                provider_name=provider.name,
+                refreshed_at_iso=now_iso,
+            )
+        else:
+            logger.warning(f"[{job_name}] RESEND_API_KEY not set — digest skipped")
+    except Exception as e:
+        digest_error = str(e)
+        digest_status = "failed"
+        logger.error(f"[{job_name}] digest send failed: {e}")
+
+    duration = time.monotonic() - t_start
+    notes = (
+        f"upserted={upserted}, upsert_errors={upsert_errors}, "
+        f"added={len(added)}, removed={len(removed)}, "
+        f"total={len(new_phones)}, digest_status={digest_status}"
+    )
+    if digest_error:
+        notes += f", digest_error={digest_error[:120]}"
+
+    status = "success" if upsert_errors == 0 else "partial"
+    await _log_job(
+        job_name,
+        leads_processed=upserted,
+        duration_seconds=duration,
+        status=status,
+        notes=notes,
+    )
+    return {
+        "job":             job_name,
+        "status":          status,
+        "upserted":        upserted,
+        "upsert_errors":   upsert_errors,
+        "added":           len(added),
+        "removed":         len(removed),
+        "total_list_size": len(new_phones),
+        "digest_status":   digest_status,
+        "digest_error":    digest_error,
+        "duration_seconds": round(duration, 3),
+    }
+
+
+# ── Weekly delta digest email — Slice 3A Step 7 ──────────────────────────────
+
+async def _send_tcpa_weekly_digest(
+    *,
+    added_phones: list[str],
+    removed_phones: list[str],
+    added_rows_by_phone: dict,
+    total_list_size: int,
+    provider_name: str,
+    refreshed_at_iso: str,
+) -> tuple[str, Optional[str]]:
+    """
+    Build + send the weekly TCPA delta digest. Returns (status, error).
+    'success' | 'failed' | 'skipped'. Reused recipient + sender as the
+    daily report so we don't fan out new admin_settings keys.
+    """
+    from ..lib.email_sender import send_email
+
+    db = get_db()
+
+    # Recipient (same key as daily_cost_report)
+    try:
+        res = db.table("admin_settings").select("value").eq("key", "daily_cost_report_email").execute()
+        recipient = (res.data[0].get("value") if res.data else "") or "sales@mobilewebmds.com"
+    except Exception:
+        recipient = "sales@mobilewebmds.com"
+    recipient = (recipient or "").strip() or "sales@mobilewebmds.com"
+
+    try:
+        res = db.table("admin_settings").select("value").eq("key", "daily_cost_report_sender").execute()
+        sender = (res.data[0].get("value") if res.data else "") or "KJLE Reports <kjle@kjreportz.com>"
+    except Exception:
+        sender = "KJLE Reports <kjle@kjreportz.com>"
+    sender = (sender or "").strip() or "KJLE Reports <kjle@kjreportz.com>"
+
+    today = date.today().isoformat()
+    n_added   = len(added_phones)
+    n_removed = len(removed_phones)
+    subject = f"KJLE TCPA list refresh — {today} — +{n_added} added, -{n_removed} removed"
+
+    # Compact body for the zero-change case
+    if n_added == 0 and n_removed == 0:
+        body = f"TCPA list refresh: no changes. Total list size: {total_list_size}."
+        result = await send_email(to=recipient, subject=subject, body_text=body, from_addr=sender)
+        return ("success" if result.get("ok") else "failed"), result.get("error")
+
+    # Build the long-form digest. Next refresh is 7 days from the just-completed
+    # refresh, not from now() — keeps the email accurate even if digest send is
+    # delayed by a slow Resend round-trip.
+    try:
+        ref_dt = datetime.fromisoformat(refreshed_at_iso.replace("Z", "+00:00"))
+        if ref_dt.tzinfo is None:
+            ref_dt = ref_dt.replace(tzinfo=timezone.utc)
+        next_refresh = (ref_dt + timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        next_refresh = (datetime.now(timezone.utc) + timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S UTC")
+    refreshed_at_human = refreshed_at_iso.replace("T", " ").split("+")[0].split(".")[0] + " UTC"
+
+    lines = [
+        "TCPA list refresh complete.",
+        "",
+        f"Total list size: {total_list_size}",
+        f"Added this week: {n_added}",
+        f"Removed this week: {n_removed}",
+        "",
+    ]
+
+    if added_phones:
+        lines.append("ADDED:")
+        # Cap at 100 displayed so the email stays readable on big refreshes
+        for ph in added_phones[:100]:
+            row = added_rows_by_phone.get(ph) or {}
+            name  = (row.get("name") or "").strip()
+            state = (row.get("state") or "").strip()
+            # ph is already E.164 (+1XXXXXXXXXX); don't prepend another '+'
+            label = f"  {ph}"
+            if name and state:
+                label += f"  {name} ({state})"
+            elif name:
+                label += f"  {name}"
+            elif state:
+                label += f"  ({state})"
+            lines.append(label)
+        if len(added_phones) > 100:
+            lines.append(f"  ... + {len(added_phones) - 100} more")
+        lines.append("")
+
+    if removed_phones:
+        lines.append("REMOVED:")
+        for ph in removed_phones[:100]:
+            lines.append(f"  {ph}  (no longer on source list)")
+        if len(removed_phones) > 100:
+            lines.append(f"  ... + {len(removed_phones) - 100} more")
+        lines.append("")
+
+    # "Notable" pattern — v1 just notes which state had the most additions
+    state_counts: dict = {}
+    for ph in added_phones:
+        st = ((added_rows_by_phone.get(ph) or {}).get("state") or "").strip().upper()
+        if st:
+            state_counts[st] = state_counts.get(st, 0) + 1
+    if state_counts and n_added > 0:
+        top_state, top_n = max(state_counts.items(), key=lambda kv: kv[1])
+        if top_n >= 2:
+            lines.append(
+                f"Notable: {top_n}/{n_added} new additions from {top_state} — "
+                f"{top_state} continues to lead litigation volume."
+            )
+            lines.append("")
+
+    lines.append(f"Source: {provider_name}")
+    lines.append(f"Last refresh: {refreshed_at_human}")
+    lines.append(f"Next refresh: {next_refresh}")
+
+    body = "\n".join(lines).rstrip() + "\n"
+    result = await send_email(to=recipient, subject=subject, body_text=body, from_addr=sender)
+    return ("success" if result.get("ok") else "failed"), result.get("error")
+
+
+async def _send_tcpa_empty_investigation_email(*, existing_count: int) -> None:
+    """
+    Sent when the provider returned [] but tcpa_litigators is NOT empty.
+    Indicates a vendor-side outage or credential expiry. Existing data is
+    preserved; we just alert.
+    """
+    from ..lib.email_sender import send_email, is_configured
+
+    if not is_configured():
+        logger.warning("tcpa_refresh_weekly: RESEND_API_KEY not set; investigate-empty email skipped")
+        return
+
+    db = get_db()
+    try:
+        res = db.table("admin_settings").select("value").eq("key", "daily_cost_report_email").execute()
+        recipient = (res.data[0].get("value") if res.data else "") or "sales@mobilewebmds.com"
+    except Exception:
+        recipient = "sales@mobilewebmds.com"
+    recipient = (recipient or "").strip() or "sales@mobilewebmds.com"
+
+    today = date.today().isoformat()
+    subject = f"KJLE TCPA refresh returned empty — investigate ({today})"
+    body = (
+        "TCPA list refresh returned an EMPTY payload from the active provider, "
+        f"but tcpa_litigators currently has {existing_count} existing rows.\n"
+        "\n"
+        "Existing data preserved (no delete). This typically indicates:\n"
+        "  - Vendor outage / credential expiry\n"
+        "  - CSV URL changed without notice\n"
+        "  - Auth header / API key change\n"
+        "\n"
+        "Check TCPA_LIST_CSV_URL + TCPA_LIST_API_KEY env vars on Render. "
+        "Re-trigger with POST /scheduler/run/tcpa_refresh_weekly after fix.\n"
+    )
+    try:
+        await send_email(to=recipient, subject=subject, body_text=body)
+    except Exception as e:
+        logger.error(f"tcpa_refresh_weekly: investigate-empty email send failed: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # JOB DISPATCH MAP — maps name → async callable
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1814,6 +2164,7 @@ JOB_FUNCTIONS = {
     "campaign_sync_hourly": job_campaign_sync_hourly,
     "fed_dnc_refresh_monthly": job_fed_dnc_refresh_monthly,
     "nanpa_refresh_monthly":   job_nanpa_refresh_monthly,
+    "tcpa_refresh_weekly":     job_tcpa_refresh_weekly,
 }
 
 
@@ -1961,6 +2312,19 @@ def setup_scheduler() -> AsyncIOScheduler:
         trigger=CronTrigger(day=1, hour=4, minute=30),
         id="nanpa_refresh_monthly",
         name="NANPA Invalid Prefix Refresh (monthly)",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # Job 12: tcpa_refresh_weekly — Sunday @ 04:00 UTC (Phase 4 Layer 3 Slice 3A)
+    # Mirrors the active TCPA litigator-list vendor into tcpa_litigators and
+    # emails a weekly delta digest. Dormant-safe when TCPA_LIST_CSV_URL is
+    # unset — no crash, no false positives.
+    scheduler.add_job(
+        job_tcpa_refresh_weekly,
+        trigger=CronTrigger(day_of_week="sun", hour=4, minute=0),
+        id="tcpa_refresh_weekly",
+        name="TCPA Litigator List Refresh (weekly)",
         replace_existing=True,
         misfire_grace_time=3600,
     )

@@ -224,6 +224,89 @@ def _format_searchbug_balance_line() -> str:
     return f"Searchbug balance: ${bal:.2f} 🚨 ZERO/NEGATIVE — fail-closed mode active"
 
 
+def _tcpa_litigator_block(since: datetime) -> str:
+    """
+    Phase 4 Layer 3 Slice 3A — TCPA LITIGATOR PROTECTION sub-section.
+
+    Appended below the DNC HEALTH block. Three lines when provisioned:
+      List size:                N numbers
+      Matches blocked (24h):    M
+      Last refreshed:           YYYY-MM-DD HH:MM UTC (D days ago)
+
+    When the table is empty (no subscription yet), block collapses to a
+    single 'Status: not provisioned (no subscription)' line.
+
+    Graceful degradation: if the migration hasn't run, the block is omitted
+    entirely so the rest of the daily report still ships.
+    """
+    db = get_db()
+
+    try:
+        size_res = (
+            db.table("tcpa_litigators")
+            .select("phone", count="exact")
+            .limit(1)
+            .execute()
+        )
+        list_size = size_res.count or 0
+    except Exception as e:
+        logger.info(f"daily_report: tcpa_litigators unavailable ({e}); skipping TCPA block")
+        return ""
+
+    header = (
+        "\nTCPA LITIGATOR PROTECTION\n"
+        "-----\n"
+    )
+    footer = "-----\n"
+
+    if list_size == 0:
+        return header + "Status: not provisioned (no subscription)\n" + footer
+
+    # Matches in last 24h
+    try:
+        rows_24h = (
+            db.table("dnc_audit_log")
+            .select("result")
+            .gte("occurred_at", since.isoformat())
+            .eq("result", "tcpa_litigator_match")
+            .execute()
+            .data or []
+        )
+        matches_24h = len(rows_24h)
+    except Exception as e:
+        logger.warning(f"daily_report: tcpa matches 24h fetch failed: {e}")
+        matches_24h = 0
+
+    last_refreshed_raw = _get_setting("tcpa_list_last_refresh_at", "")
+    last_refreshed_line = "never (refresh job has not run yet)"
+    if last_refreshed_raw:
+        try:
+            s = last_refreshed_raw
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            days_ago = (datetime.now(timezone.utc) - dt).days
+            if days_ago == 0:
+                ago = "today"
+            elif days_ago == 1:
+                ago = "1 day ago"
+            else:
+                ago = f"{days_ago} days ago"
+            last_refreshed_line = f"{dt.strftime('%Y-%m-%d %H:%M UTC')} ({ago})"
+        except Exception:
+            last_refreshed_line = last_refreshed_raw
+
+    return (
+        header
+        + f"List size:                {list_size:,} numbers\n"
+        + f"Matches blocked (24h):    {matches_24h:,}\n"
+        + f"Last refreshed:           {last_refreshed_line}\n"
+        + footer
+    )
+
+
 def _dnc_section(since: datetime) -> str:
     """
     DNC HEALTH section. Reads from dnc_audit_log + dnc_cache + dnc_suppressions
@@ -292,6 +375,7 @@ def _dnc_section(since: datetime) -> str:
         bg_failure_24h=bg_failure_24h,
     )
     by_consumer_block = _dnc_by_consumer_block()
+    tcpa_block = _tcpa_litigator_block(since)
 
     if (fresh + hits + halts + stale_hits + bg_success_24h + bg_failure_24h) == 0:
         return (
@@ -300,6 +384,7 @@ def _dnc_section(since: datetime) -> str:
             f"Cache size: {cache_size:,} phones\n"
             f"{balance_line}\n"
             f"{by_consumer_block}"
+            f"{tcpa_block}"
         )
 
     total = fresh + hits
@@ -313,6 +398,7 @@ def _dnc_section(since: datetime) -> str:
         f"{soft_ttl_lines}"
         f"{balance_line}\n"
         f"{by_consumer_block}"
+        f"{tcpa_block}"
     )
 
 
