@@ -7,6 +7,30 @@
 
 ---
 
+## Vendor strategy pivot — 2026-05-29
+
+Original Section 3 recommended tcpalitigatorlist.com at ~$99/yr based on stale intel.
+Live web-check on 2026-05-29 found their entry tier is now $2,029/yr.
+
+**Replacement strategy: harvest from Searchbug responses (Slice 3A.1).**
+
+Searchbug's api_lnd2 tier (which kjle-api already uses for DNC checks) returns a
+TCPA litigator flag in the same payload as the DNC check. No additional cost.
+
+Mechanism:
+1. Every fresh `/dnc/check` Searchbug lookup that returns `tcpa_litigator=true`
+   also upserts the phone into `tcpa_litigators` (organic harvest).
+2. The Slice 3A pre-cache guard then short-circuits future calls for that phone
+   at $0 cost.
+3. The dormant `job_tcpa_refresh_weekly` job remains in code, unchanged. If a
+   future paid third-party source becomes affordable, it can populate
+   `tcpa_litigators` alongside the harvest without architectural changes.
+
+Effective cost: $0 net new. TCPA protection becomes a byproduct of the DNC
+spend already in budget.
+
+---
+
 ## 1. Context
 
 Phase 4 Layer 2 (Slices 2A–2B) shipped the per-consumer DNC observability layer
@@ -147,6 +171,8 @@ Existing consumers ignore unknown fields, so this is backwards-compatible.
 
 ### 3.5 Weekly refresh job
 
+**SUPERSEDED — see pivot above.** The refresh job remains dormant in code; data ingress now arrives organically via Searchbug harvest (Slice 3A.1). Table contract + lookup behavior unchanged.
+
 `api/routes/scheduler.py` gains `job_tcpa_refresh_weekly`:
 
 - **Cadence:** Sunday 04:00 UTC (1 hr after the daily Stage 4 cron at 03:00).
@@ -198,6 +224,8 @@ after slice ships. No code changes required at switch time beyond a new provider
 class + one registry entry.
 
 ### 3.8 `/dnc/stats` extension
+
+**SUPERSEDED — see pivot above.** Fields still ship; the data they expose is now sourced from harvest (`source LIKE 'searchbug_harvest%'`) rather than a refresh-job mirror. Slice 3A.1 also adds `tcpa_litigator_harvested_count`.
 
 Three new fields:
 
