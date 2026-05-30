@@ -253,6 +253,19 @@ def _tcpa_litigator_block(since: datetime) -> str:
         logger.info(f"daily_report: tcpa_litigators unavailable ({e}); skipping TCPA block")
         return ""
 
+    # Slice 3A.1: count rows harvested from Searchbug responses.
+    try:
+        harvest_res = (
+            db.table("tcpa_litigators")
+            .select("phone", count="exact")
+            .like("source", "searchbug_harvest%")
+            .limit(1)
+            .execute()
+        )
+        harvested_count = harvest_res.count or 0
+    except Exception:
+        harvested_count = 0
+
     header = (
         "\nTCPA LITIGATOR PROTECTION\n"
         "-----\n"
@@ -260,7 +273,13 @@ def _tcpa_litigator_block(since: datetime) -> str:
     footer = "-----\n"
 
     if list_size == 0:
-        return header + "Status: not provisioned (no subscription)\n" + footer
+        return (
+            header
+            + "Status: not provisioned (no subscription)\n"
+            + "Status: not provisioned. Harvest from Searchbug active — table will populate\n"
+            + "        organically as DNC checks fire on flagged phones.\n"
+            + footer
+        )
 
     # Matches in last 24h
     try:
@@ -278,7 +297,12 @@ def _tcpa_litigator_block(since: datetime) -> str:
         matches_24h = 0
 
     last_refreshed_raw = _get_setting("tcpa_list_last_refresh_at", "")
-    last_refreshed_line = "never (refresh job has not run yet)"
+    # Slice 3A.1: when the refresh job has never populated the setting but the
+    # table has rows, attribution is the organic Searchbug harvest.
+    if not last_refreshed_raw and harvested_count > 0:
+        last_refreshed_line = "organic harvest (Slice 3A.1)"
+    else:
+        last_refreshed_line = "never (refresh job has not run yet)"
     if last_refreshed_raw:
         try:
             s = last_refreshed_raw
@@ -300,9 +324,10 @@ def _tcpa_litigator_block(since: datetime) -> str:
 
     return (
         header
-        + f"List size:                {list_size:,} numbers\n"
-        + f"Matches blocked (24h):    {matches_24h:,}\n"
-        + f"Last refreshed:           {last_refreshed_line}\n"
+        + f"List size:                    {list_size:,} numbers\n"
+        + f"  └─ harvested from Searchbug: {harvested_count:,}\n"
+        + f"Matches blocked (24h):        {matches_24h:,}\n"
+        + f"Last refreshed:               {last_refreshed_line}\n"
         + footer
     )
 
