@@ -37,6 +37,8 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from ..database import get_db
+from ..lib.lead_filters import classify_lead_quality
+from ..lib.phone_filters import classify_phone_quality
 from ..lib.phone_utils import normalize_phone
 
 logger = logging.getLogger(__name__)
@@ -179,6 +181,21 @@ def _process_results(db, results: list, run_id: str, worker_id: str,
             state = raw_lead.get("state")
             state = state.upper() if isinstance(state, str) and state else None
 
+            # Phase 4 Layer 3 Slice 3B — lead + phone quality classifiers.
+            # Both are pure-function, no IO. Non-contactable leads are STILL
+            # SAVED (with contactable=false) so research / analytics retain
+            # the data — we don't hard-delete.
+            quality = classify_lead_quality(raw_lead)
+            phone_quality = (
+                classify_phone_quality(phone) if phone else None
+            )
+            contactable = quality["contactable"] and (
+                phone_quality["contactable"] if phone_quality else True
+            )
+            filter_reasons = list(quality["reasons"]) + (
+                list(phone_quality["reasons"]) if phone_quality else []
+            )
+
             payload = {
                 "business_name": (raw_lead.get("business_name") or
                                   raw_lead.get("name") or "").strip() or None,
@@ -196,9 +213,15 @@ def _process_results(db, results: list, run_id: str, worker_id: str,
                 "dnc_status":    "unchecked",
                 "is_active":     True,
                 "enrichment_stage": 0,
+                "contactable":   contactable,
+                "filter_reasons": filter_reasons,
             }
             payload = {k: v for k, v in payload.items()
                        if v is not None and v != ""}
+            # contactable / filter_reasons are intentionally preserved even
+            # when False / [] — re-add after the falsy-strip pass.
+            payload["contactable"]    = contactable
+            payload["filter_reasons"] = filter_reasons
 
             try:
                 db.table("leads").insert(payload).execute()

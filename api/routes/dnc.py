@@ -32,6 +32,7 @@ from ..database import get_db
 from ..lib import cost_guard
 from ..lib.cache_refresh import refresh_phone_in_background
 from ..lib.dnc_provider import DNCResult, get_active_provider
+from ..lib.phone_filters import classify_phone_quality
 from ..lib.phone_utils import normalize_phone
 from ..lib.tcpa_check import is_tcpa_litigator
 
@@ -214,6 +215,30 @@ async def _perform_check(
     except Exception as e:
         logger.warning(f"dnc: whitelist read failed for {phone}: {e}")
         # Fall through — better to consult suppressions/cache/provider than 500.
+
+    # 0.5 Carrier-pattern short-circuit (Phase 4 Layer 3 Slice 3B)
+    #
+    #     Deterministic + free. Run BEFORE suppression / TCPA / cache /
+    #     provider so structural garbage (NPA-555 / NXX-555 numbers,
+    #     toll-free NPAs, sequential test numbers like X-XXX-1234567,
+    #     all-zeros, all-nines, and all-same-digit subscriber portions)
+    #     never burns a DB row or a Searchbug $0.0214.
+    phone_quality = classify_phone_quality(phone)
+    if not phone_quality["contactable"]:
+        _audit(
+            phone=phone, source=src, result="carrier_pattern_blocked",
+            is_dnc=True, cost_usd=0.0, requesting_lead_id=lead_id,
+            metadata={
+                "pattern_hits": phone_quality["pattern_hits"],
+                "reasons":      phone_quality["reasons"],
+            },
+        )
+        return _serialize_response(
+            result_source="carrier_pattern_blocked",
+            phone_normalized=phone, is_dnc=True,
+            reason=",".join(phone_quality["reasons"]),
+            tcpa=False,
+        )
 
     # 1. Internal suppression list — free, fastest path
     try:
@@ -756,6 +781,11 @@ async def dnc_stats(x_api_key: str = Header(...)):
     tcpa_litigator_matches_24h = sum(
         1 for r in audit_24h if r.get("result") == "tcpa_litigator_match"
     )
+
+    # Phase 4 Layer 3 Slice 3B — carrier-pattern blocks (last 24h)
+    carrier_pattern_blocks_24h = sum(
+        1 for r in audit_24h if r.get("result") == "carrier_pattern_blocked"
+    )
     cost_24h = round(
         sum(
             float(r.get("cost_usd") or 0)
@@ -783,6 +813,11 @@ async def dnc_stats(x_api_key: str = Header(...)):
     real_7d   = sum(1 for r in audit_7d if r.get("result") in ("fresh_lookup", "cache_hit"))
     hits_7d   = sum(1 for r in audit_7d if r.get("result") == "cache_hit")
     hit_rate  = round(hits_7d / real_7d * 100, 2) if real_7d else 0.0
+
+    # Phase 4 Layer 3 Slice 3B — carrier-pattern blocks (last 7d)
+    carrier_pattern_blocks_7d = sum(
+        1 for r in audit_7d if r.get("result") == "carrier_pattern_blocked"
+    )
 
     # Phase 4 Layer 2 Slice 2B — 7d background-refresh failure rate
     bg_success_7d = sum(1 for r in audit_7d if r.get("result") == "background_refresh_success")
@@ -846,6 +881,9 @@ async def dnc_stats(x_api_key: str = Header(...)):
         ),
         # Phase 4 Layer 3 Slice 3A.1 — Searchbug-harvest visibility
         "tcpa_litigator_harvested_count": tcpa_litigator_harvested_count,
+        # Phase 4 Layer 3 Slice 3B — carrier-pattern observability
+        "carrier_pattern_blocks_24h": carrier_pattern_blocks_24h,
+        "carrier_pattern_blocks_7d":  carrier_pattern_blocks_7d,
     }
 
 
@@ -941,6 +979,11 @@ def per_consumer_breakdown(period_hours: int) -> dict:
             # Slice 3A — categorical pre-cache block, free to the consumer.
             # Same shape as internal_suppression (no provider call, cost=0)
             # so we bucket it alongside to keep sub-bucket totals consistent.
+            bucket["internal_suppressions"] += 1
+        elif result == "carrier_pattern_blocked":
+            # Slice 3B — structural-garbage pre-cache block, free to the
+            # consumer. Same shape as internal_suppression (no provider
+            # call, cost=0) — bucket alongside.
             bucket["internal_suppressions"] += 1
         elif result == "error":
             bucket["errors"] += 1
