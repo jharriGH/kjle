@@ -712,6 +712,20 @@ async def dnc_stats(x_api_key: str = Header(...)):
     except Exception:
         tcpa_litigator_list_size = 0
 
+    # Slice 3A.1: how many of the litigators in the table were harvested from
+    # Searchbug responses (vs from a future paid vendor).
+    try:
+        tcpa_harvest_res = (
+            db.table("tcpa_litigators")
+            .select("phone", count="exact")
+            .like("source", "searchbug_harvest%")
+            .limit(1)
+            .execute()
+        )
+        tcpa_litigator_harvested_count = tcpa_harvest_res.count or 0
+    except Exception:
+        tcpa_litigator_harvested_count = 0
+
     # Audit rollups (24h)
     try:
         audit_24h = (
@@ -830,6 +844,8 @@ async def dnc_stats(x_api_key: str = Header(...)):
         "tcpa_litigator_last_refreshed_at": (
             _get_admin_setting("tcpa_list_last_refresh_at", "") or None
         ),
+        # Phase 4 Layer 3 Slice 3A.1 — Searchbug-harvest visibility
+        "tcpa_litigator_harvested_count": tcpa_litigator_harvested_count,
     }
 
 
