@@ -332,6 +332,62 @@ def _tcpa_litigator_block(since: datetime) -> str:
     )
 
 
+def _carrier_pattern_block(since: datetime) -> str:
+    """
+    Phase 4 Layer 3 Slice 3B — CARRIER-PATTERN PROTECTION sub-section.
+
+    Counts dnc_audit_log rows with result='carrier_pattern_blocked' over the
+    24h and 7d windows. Estimates Searchbug cost saved at the published
+    per-lookup rate ($0.0214). Pattern blocks are deterministic + free; this
+    block makes the cumulative spend savings visible.
+
+    Appended below the TCPA LITIGATOR PROTECTION block. Degrades gracefully:
+    if dnc_audit_log can't be read, returns an empty string so the rest of
+    the daily report still ships.
+    """
+    db = get_db()
+    try:
+        rows_24h = (
+            db.table("dnc_audit_log")
+            .select("result")
+            .gte("occurred_at", since.isoformat())
+            .eq("result", "carrier_pattern_blocked")
+            .execute()
+            .data or []
+        )
+    except Exception as e:
+        logger.info(f"daily_report: carrier-pattern 24h fetch failed: {e}")
+        return ""
+
+    # since is the start of the 24h window — subtract 6 more days to get 7d total.
+    cutoff_7d = (since - timedelta(hours=6 * 24)).isoformat()
+    try:
+        rows_7d = (
+            db.table("dnc_audit_log")
+            .select("result")
+            .gte("occurred_at", cutoff_7d)
+            .eq("result", "carrier_pattern_blocked")
+            .execute()
+            .data or []
+        )
+    except Exception as e:
+        logger.warning(f"daily_report: carrier-pattern 7d fetch failed: {e}")
+        rows_7d = []
+
+    blocks_24h  = len(rows_24h)
+    blocks_7d   = len(rows_7d)
+    savings_24h = 0.0214 * blocks_24h
+
+    return (
+        "\nCARRIER-PATTERN PROTECTION\n"
+        "-----\n"
+        f"Blocks (24h):  {blocks_24h:,}        (← free, deterministic)\n"
+        f"Blocks (7d):   {blocks_7d:,}\n"
+        f"Searchbug $ saved (est, 24h):  $0.0214 × {blocks_24h:,} = {_fmt_usd(savings_24h)}\n"
+        "-----\n"
+    )
+
+
 def _dnc_section(since: datetime) -> str:
     """
     DNC HEALTH section. Reads from dnc_audit_log + dnc_cache + dnc_suppressions
@@ -401,6 +457,7 @@ def _dnc_section(since: datetime) -> str:
     )
     by_consumer_block = _dnc_by_consumer_block()
     tcpa_block = _tcpa_litigator_block(since)
+    carrier_block = _carrier_pattern_block(since)
 
     if (fresh + hits + halts + stale_hits + bg_success_24h + bg_failure_24h) == 0:
         return (
@@ -410,6 +467,7 @@ def _dnc_section(since: datetime) -> str:
             f"{balance_line}\n"
             f"{by_consumer_block}"
             f"{tcpa_block}"
+            f"{carrier_block}"
         )
 
     total = fresh + hits
@@ -424,6 +482,7 @@ def _dnc_section(since: datetime) -> str:
         f"{balance_line}\n"
         f"{by_consumer_block}"
         f"{tcpa_block}"
+        f"{carrier_block}"
     )
 
 
