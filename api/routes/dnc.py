@@ -404,6 +404,29 @@ async def _perform_check(
     except Exception as e:
         logger.error(f"dnc: cache upsert failed for {phone}: {e}")
 
+    # 5b. TCPA harvest (Slice 3A.1) — if Searchbug flagged this phone as a TCPA
+    #     litigator, upsert into tcpa_litigators so future /dnc/check calls
+    #     short-circuit at the pre-cache guard (Slice 3A) at $0 cost.
+    if result.tcpa_litigator:
+        try:
+            db.table("tcpa_litigators").upsert({
+                "phone":               phone,
+                "source":              "searchbug_harvest",
+                "name":                None,
+                "state":               None,
+                "case_count":          None,
+                "last_refreshed_at":   _now_iso(),
+                "metadata":            {
+                    "harvested_from": "searchbug_api_lnd2",
+                    "carrier":        result.carrier or "",
+                    "line_type":      result.line_type or "unknown",
+                    "dnc_reason":     result.reason or "",
+                },
+            }, on_conflict="phone").execute()
+            logger.info(f"dnc: harvested TCPA litigator from Searchbug: {phone}")
+        except Exception as e:
+            logger.error(f"dnc: tcpa_litigators harvest upsert failed for {phone}: {e}")
+
     try:
         await cost_guard.log_cost(
             stage="dnc",
