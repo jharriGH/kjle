@@ -683,6 +683,7 @@ async def job_email_clean_nightly() -> dict:
         enabled = (enabled_res.data or [{}])[0].get("value", "false").lower() in ("true", "1", "yes")
     except Exception:
         enabled = False
+    logger.info(f"[{job_name}] email_clean_enabled={enabled}")
     if not enabled:
         notes = "SKIPPED — email_clean_enabled is false"
         logger.warning(f"[{job_name}] {notes}")
@@ -697,6 +698,7 @@ async def job_email_clean_nightly() -> dict:
         logger.warning(f"[{job_name}] {notes}")
         await _log_job(job_name, status="skipped", notes=notes)
         return {"job": job_name, "status": "skipped", "reason": notes}
+    logger.info(f"[{job_name}] api_key_present={bool(api_key)} length={len(api_key) if api_key else 0}")
 
     # Load v2 batch sizing from admin_settings (with safe defaults)
     def _get_int(key: str, default: int) -> int:
@@ -712,11 +714,19 @@ async def job_email_clean_nightly() -> dict:
     logger.info(f"[{job_name}] V2 starting — max_batches={max_batches}, batch_size={batch_size}")
 
     submitted_batches: list[dict] = []
+    selector_total_returned = 0
+    submit_exception_count = 0
     for i in range(max_batches):
+        logger.info(f"[{job_name}] iteration={i} requesting batch_size={batch_size}")
         leads = ec_select_uncleaned_leads(db, batch_size)
+        logger.info(
+            f"[{job_name}] iteration={i} selected={len(leads)} leads, "
+            f"first_3_ids={[l.get('id') for l in leads[:3]]}"
+        )
         if not leads:
             logger.info(f"[{job_name}] No more uncleaned leads after {i} batches — stopping early")
             break
+        selector_total_returned += len(leads)
         try:
             r = await ec_submit_batch(
                 db, api_key, leads,
@@ -730,20 +740,36 @@ async def job_email_clean_nightly() -> dict:
                 f"batch_id={r.get('batch_id')}"
             )
         except Exception as e:
-            logger.error(f"[{job_name}] Batch {i+1} submit FAILED: {e}")
+            submit_exception_count += 1
+            logger.error(
+                f"[{job_name}] iteration={i} ec_submit_batch raised: "
+                f"{type(e).__name__}: {e}",
+                exc_info=True,
+            )
             submitted_batches.append({"index": i, "submitted": 0, "error": str(e)})
             break  # don't hammer Truelist if first one failed
 
     duration = time.monotonic() - t_start
     total_emails = sum((b.get("submitted") or 0) for b in submitted_batches)
-    notes = (
-        f"batches_submitted={len([b for b in submitted_batches if b.get('submitted', 0) > 0])}, "
-        f"total_emails={total_emails}, "
-        f"batch_ids={[b.get('batch_id') for b in submitted_batches if b.get('batch_id')]}"
-    )
-    status = "success" if any(b.get("submitted", 0) > 0 for b in submitted_batches) else (
-        "skipped" if not submitted_batches else "failed"
-    )
+    any_submitted = any(b.get("submitted", 0) > 0 for b in submitted_batches)
+    if any_submitted:
+        notes = (
+            f"batches_submitted={len([b for b in submitted_batches if b.get('submitted', 0) > 0])}, "
+            f"total_emails={total_emails}, "
+            f"batch_ids={[b.get('batch_id') for b in submitted_batches if b.get('batch_id')]}"
+        )
+        status = "success"
+    elif selector_total_returned == 0:
+        # Select returned [] on iteration 0 — nothing to clean, not a failure.
+        notes = "no_uncleaned_leads_available (selector returned 0 on iteration 0)"
+        status = "success"
+    else:
+        # Selector found leads but every submit attempt raised.
+        notes = (
+            f"selector returned {selector_total_returned} leads but all "
+            f"{submit_exception_count} submit attempts raised — see logs for exception details"
+        )
+        status = "failed"
     await _log_job(job_name, leads_processed=total_emails, duration_seconds=duration,
                    status=status, notes=notes)
 
