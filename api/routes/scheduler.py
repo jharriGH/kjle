@@ -782,7 +782,7 @@ async def job_email_clean_poll_batches() -> dict:
         rows = (
             db.table("truelist_batches")
             .select("id, status, submitted_at, email_count")
-            .in_("status", ["pending", "processing"])
+            .in_("status", ["pending", "processing", "completed"])
             .order("submitted_at", desc=False)
             .execute()
             .data or []
@@ -794,7 +794,7 @@ async def job_email_clean_poll_batches() -> dict:
 
     if not rows:
         await _log_job(job_name, leads_processed=0, status="success",
-                       notes="no in-flight batches")
+                       notes="no in-flight or completed-not-ingested batches")
         return {"job": job_name, "status": "success", "in_flight": 0}
 
     ingested = 0
