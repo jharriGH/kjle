@@ -67,33 +67,6 @@ def verify_api_key(x_api_key: str = Header(...)) -> None:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-# ── Brain log (best-effort, fire-and-forget; never blocks response) ──────────
-EMPIRE_BRAIN_URL = os.environ.get(
-    "BRAIN_URL", "https://jim-brain-production.up.railway.app"
-).rstrip("/")
-EMPIRE_BRAIN_KEY = os.environ.get(
-    "EMPIRE_BRAIN_KEY", "jim-brain-kje-2026-kingjames"
-)
-
-
-def _brain_log(content: str, tags: list[str]) -> None:
-    """
-    Best-effort POST /log to Brain. Swallows every exception — this is a
-    nice-to-have observation hook; the test-fire MUST NOT fail because Brain
-    is down or slow.
-    """
-    try:
-        import httpx  # local import — keeps top-level import set tight
-        with httpx.Client(timeout=5.0) as client:
-            client.post(
-                f"{EMPIRE_BRAIN_URL}/log",
-                headers={"x-brain-key": EMPIRE_BRAIN_KEY},
-                json={"content": content, "tags": tags},
-            )
-    except Exception as e:
-        logger.warning("backlog_scrub: brain_log best-effort failed: %s", e)
-
-
 # ── Request / response models ────────────────────────────────────────────────
 
 class TestFireRequest(BaseModel):
@@ -333,36 +306,6 @@ async def backlog_contactability_test_fire(
         "warnings":                       warnings,
         "classified_at":                  classified_at,
     }
-
-    # ── Brain log summary (best-effort; never blocks response) ───────────────
-    sample_descriptions = []
-    for s in samples[:5]:
-        sample_descriptions.append(
-            f"  - id={s['id']} name={s['business_name']!r} "
-            f"reasons={s['reasons']}"
-        )
-    sample_block = "\n".join(sample_descriptions) if sample_descriptions \
-        else "  (no newly flagged leads in this sample)"
-
-    brain_content = (
-        f"KJLE Phase 4 Layer 5B Stage 1 — test-fire backlog scrub\n"
-        f"  label:                           {label}\n"
-        f"  dry_run:                         {req.dry_run}\n"
-        f"  sample_size_requested:           {req.sample_size}\n"
-        f"  rows_selected:                   {len(rows)}\n"
-        f"  total_processed:                 {total_processed}\n"
-        f"  newly_marked_uncontactable:      {newly_marked_uncontactable}\n"
-        f"  already_contactable_remains_so:  {already_contactable_remains_so}\n"
-        f"  writes_attempted:                {writes_attempted}\n"
-        f"  writes_failed:                   {writes_failed}\n"
-        f"  filter_reason_distribution:      {reason_dist}\n"
-        f"  sample flagged leads (first 5):\n{sample_block}\n"
-    )
-    _brain_log(
-        brain_content,
-        tags=["kjle", "phase4", "layer5b", "stage1",
-              "layer5b_stage1_test_2026_06_01"],
-    )
 
     logger.info(
         "backlog_scrub.test_fire: dry_run=%s label=%s selected=%d "
