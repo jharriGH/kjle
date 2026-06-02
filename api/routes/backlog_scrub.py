@@ -186,8 +186,8 @@ async def backlog_contactability_test_fire(
         sel = (
             db.table("leads")
               .select(
-                  "id,business_name,phone,address,city,state,categories,"
-                  "description,contactable,filter_reasons,filter_classified_at"
+                 "id,business_name,phone,address,city,state,"
+                  "contactable,filter_reasons,filter_classified_at"
               )
               .eq("is_active", True)
               .is_("filter_classified_at", "null")
