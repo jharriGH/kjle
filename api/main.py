@@ -59,6 +59,7 @@ from .routes import dnc_channel
 from .routes import local_scraper_ingest
 from .routes import dnc_webhooks
 from .routes import webhooks_truelist
+from .routes import backlog_scrub
 from .routes.scheduler import setup_scheduler
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -165,6 +166,7 @@ app.include_router(dnc_channel.router,            prefix=PREFIX,                
 app.include_router(local_scraper_ingest.router,   prefix=PREFIX,                  tags=["Ingest — Local Scraper"])
 app.include_router(dnc_webhooks.router,           prefix=PREFIX,                  tags=["DNC Webhooks"])
 app.include_router(webhooks_truelist.router,      prefix=PREFIX,                  tags=["Truelist Webhooks"])
+app.include_router(backlog_scrub.router,          prefix=PREFIX,                  tags=["Backlog Scrub"])
 app.include_router(admin_settings.router,         prefix=PREFIX,                  tags=["Admin Settings"])
 app.include_router(campaigns.router,              prefix=PREFIX,                  tags=["Campaign Performance"])
 
