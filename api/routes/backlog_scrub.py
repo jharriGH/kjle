@@ -227,6 +227,7 @@ async def backlog_contactability_test_fire(
     samples: list[dict] = []
     writes_attempted = 0
     writes_failed = 0
+    bulk_updates: list[dict] = []
 
     for row in rows:
         try:
@@ -267,19 +268,13 @@ async def backlog_contactability_test_fire(
 
             if not req.dry_run:
                 writes_attempted += 1
-                try:
-                    db.table("leads").update({
-                        "contactable":          contactable,
-                        "filter_reasons":       reasons,
-                        "filter_classified_at": classified_at,
-                        "filter_classified_by": label,
-                    }).eq("id", row.get("id")).execute()
-                except Exception as ew:
-                    writes_failed += 1
-                    logger.warning(
-                        "backlog_scrub: per-row update failed id=%s: %s",
-                        row.get("id"), ew,
-                    )
+                bulk_updates.append({
+                    "id":            row.get("id"),
+                    "contactable":   contactable,
+                    "reasons":       reasons,
+                    "classified_at": classified_at,
+                    "label":         label,
+                })
 
         except Exception as e:
             # One bad row never kills the batch.
@@ -290,6 +285,26 @@ async def backlog_contactability_test_fire(
             logger.warning(
                 "backlog_scrub: per-row classification failed: %s", e
             )
+
+    # ── Single bulk UPDATE via Postgres function ─────────────────────────────
+    # Replaces N per-row PostgREST round-trips with one rpc call.
+    if not req.dry_run and bulk_updates:
+        try:
+            result = db.rpc("bulk_update_lead_contactability", {
+                "p_updates": bulk_updates,
+            }).execute()
+            rows_updated = result.data if isinstance(result.data, int) else 0
+            writes_failed = max(0, writes_attempted - rows_updated)
+        except Exception as e_bulk:
+            logger.error(
+                "backlog_scrub: bulk_update_lead_contactability failed: %s",
+                e_bulk,
+            )
+            warnings.append(
+                f"bulk_update_failed: {type(e_bulk).__name__}: "
+                f"{str(e_bulk)[:120]}"
+            )
+            writes_failed = writes_attempted
 
     response = {
         "dry_run":                        req.dry_run,
