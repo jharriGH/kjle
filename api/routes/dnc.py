@@ -1054,3 +1054,264 @@ async def dnc_stats_by_consumer(
 ):
     verify_api_key(x_api_key)
     return per_consumer_breakdown(period_hours)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Read-only browse endpoints for Lovable "DNC Cost" tab (2026-06-03)
+#
+# All 4 endpoints below are paginated SELECTs against tables that already
+# exist. They share these conventions:
+#   - x_api_key Header required (verify_api_key, same as /dnc/stats)
+#   - page_size capped at 200 (>200 → HTTP 400)
+#   - Returns total count + rows
+#   - No writes, no rpc, no external HTTP
+# ─────────────────────────────────────────────────────────────────────────────
+
+LIST_PAGE_SIZE_MAX = 200
+
+
+def _enforce_list_limit(limit: int) -> None:
+    if limit > LIST_PAGE_SIZE_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"limit_too_large: {limit} > {LIST_PAGE_SIZE_MAX}",
+        )
+
+
+def _mask_phone_last4(raw: Optional[str]) -> Optional[str]:
+    """Privacy-conscious display: show only last 4 digits as '***-***-NNNN'."""
+    if raw is None:
+        return None
+    s = str(raw)
+    last4 = s[-4:] if len(s) >= 4 else s
+    return f"***-***-{last4}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /dnc/suppressions/list
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/dnc/suppressions/list")
+async def dnc_suppressions_list(
+    x_api_key: str           = Header(...),
+    limit:     int           = Query(50, ge=1),
+    offset:    int           = Query(0,  ge=0),
+    source:    Optional[str] = Query(None),
+    reason:    Optional[str] = Query(None),
+):
+    verify_api_key(x_api_key)
+    _enforce_list_limit(limit)
+
+    db = get_db()
+
+    rows_q = (
+        db.table("dnc_suppressions")
+        .select("phone, reason, source, suppressed_at, notes")
+    )
+    cnt_q = db.table("dnc_suppressions").select("phone", count="exact")
+
+    if source is not None:
+        rows_q = rows_q.eq("source", source)
+        cnt_q  = cnt_q.eq("source",  source)
+    if reason is not None:
+        rows_q = rows_q.eq("reason", reason)
+        cnt_q  = cnt_q.eq("reason",  reason)
+
+    try:
+        rows_res = (
+            rows_q.order("suppressed_at", desc=True)
+                  .range(offset, offset + limit - 1)
+                  .execute()
+        )
+        rows = rows_res.data or []
+    except Exception as e:
+        logger.error(f"dnc_suppressions_list: rows fetch failed: {e}")
+        raise HTTPException(status_code=500, detail=f"suppressions_read_failed: {e}")
+
+    try:
+        total = cnt_q.limit(1).execute().count or 0
+    except Exception:
+        total = 0
+
+    return {
+        "total":  total,
+        "limit":  limit,
+        "offset": offset,
+        "rows":   rows,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /dnc/tcpa/list
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/dnc/tcpa/list")
+async def dnc_tcpa_list(
+    x_api_key: str = Header(...),
+    limit:     int = Query(50, ge=1),
+    offset:    int = Query(0,  ge=0),
+):
+    verify_api_key(x_api_key)
+    _enforce_list_limit(limit)
+
+    db = get_db()
+
+    try:
+        rows_res = (
+            db.table("tcpa_litigators")
+            .select("phone, source, last_refreshed_at, metadata")
+            .order("last_refreshed_at", desc=True, nullsfirst=False)
+            .range(offset, offset + limit - 1)
+            .execute()
+        )
+        rows = rows_res.data or []
+    except Exception as e:
+        logger.error(f"dnc_tcpa_list: rows fetch failed: {e}")
+        raise HTTPException(status_code=500, detail=f"tcpa_read_failed: {e}")
+
+    try:
+        total = (
+            db.table("tcpa_litigators")
+            .select("phone", count="exact")
+            .limit(1)
+            .execute()
+            .count or 0
+        )
+    except Exception:
+        total = 0
+
+    return {
+        "total":  total,
+        "limit":  limit,
+        "offset": offset,
+        "rows":   rows,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /dnc/cache/list
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/dnc/cache/list")
+async def dnc_cache_list(
+    x_api_key: str            = Header(...),
+    limit:     int            = Query(50, ge=1),
+    offset:    int            = Query(0,  ge=0),
+    is_dnc:    Optional[bool] = Query(None),
+    line_type: Optional[str]  = Query(None,
+                                      description="mobile/landline/voip/unknown"),
+):
+    verify_api_key(x_api_key)
+    _enforce_list_limit(limit)
+
+    db = get_db()
+
+    rows_q = (
+        db.table("dnc_cache")
+        .select(
+            "phone, is_dnc, dnc_reason, tcpa_litigator, "
+            "line_type, carrier, fetched_at, expires_at"
+        )
+    )
+    cnt_q = db.table("dnc_cache").select("phone", count="exact")
+
+    if is_dnc is not None:
+        rows_q = rows_q.eq("is_dnc", is_dnc)
+        cnt_q  = cnt_q.eq("is_dnc",  is_dnc)
+    if line_type is not None:
+        rows_q = rows_q.eq("line_type", line_type)
+        cnt_q  = cnt_q.eq("line_type",  line_type)
+
+    try:
+        rows_res = (
+            rows_q.order("fetched_at", desc=True)
+                  .range(offset, offset + limit - 1)
+                  .execute()
+        )
+        rows = rows_res.data or []
+    except Exception as e:
+        logger.error(f"dnc_cache_list: rows fetch failed: {e}")
+        raise HTTPException(status_code=500, detail=f"cache_read_failed: {e}")
+
+    try:
+        total = cnt_q.limit(1).execute().count or 0
+    except Exception:
+        total = 0
+
+    return {
+        "total":  total,
+        "limit":  limit,
+        "offset": offset,
+        "rows":   rows,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /dnc/audit/recent
+# ─────────────────────────────────────────────────────────────────────────────
+
+AUDIT_RECENT_HOURS_MAX = 720   # 30 days
+AUDIT_RECENT_LIMIT_MAX = 500
+
+
+@router.get("/dnc/audit/recent")
+async def dnc_audit_recent(
+    x_api_key: str = Header(...),
+    hours:     int = Query(24,  ge=1, le=AUDIT_RECENT_HOURS_MAX,
+                           description="Window length, hours. Max 720 (30d)."),
+    limit:     int = Query(100, ge=1, le=AUDIT_RECENT_LIMIT_MAX,
+                           description="Max rows returned. Max 500."),
+):
+    verify_api_key(x_api_key)
+
+    db = get_db()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+
+    try:
+        rows_res = (
+            db.table("dnc_audit_log")
+            .select(
+                "occurred_at, phone, source, result, is_dnc, "
+                "cost_usd, metadata"
+            )
+            .gte("occurred_at", cutoff)
+            .order("occurred_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        raw_rows = rows_res.data or []
+    except Exception as e:
+        logger.error(f"dnc_audit_recent: rows fetch failed: {e}")
+        raise HTTPException(status_code=500, detail=f"audit_read_failed: {e}")
+
+    try:
+        total_in_window = (
+            db.table("dnc_audit_log")
+            .select("occurred_at", count="exact")
+            .gte("occurred_at", cutoff)
+            .limit(1)
+            .execute()
+            .count or 0
+        )
+    except Exception:
+        total_in_window = 0
+
+    masked_rows = [
+        {
+            "occurred_at": r.get("occurred_at"),
+            "phone":       _mask_phone_last4(r.get("phone")),
+            "source":      r.get("source"),
+            "result":      r.get("result"),
+            "is_dnc":      r.get("is_dnc"),
+            "cost_usd":    r.get("cost_usd"),
+            "metadata":    r.get("metadata"),
+        }
+        for r in raw_rows
+    ]
+
+    return {
+        "window_hours":    hours,
+        "total_in_window": total_in_window,
+        "returned":        len(masked_rows),
+        "rows":            masked_rows,
+    }
