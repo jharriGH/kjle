@@ -57,6 +57,7 @@ from .routes import campaigns
 from .routes import dnc
 from .routes import dnc_channel
 from .routes import local_scraper_ingest
+from .routes import scrape_jobs
 from .routes import dnc_webhooks
 from .routes import webhooks_truelist
 from .routes import backlog_scrub
@@ -164,6 +165,7 @@ app.include_router(reachinbox.router,             prefix=PREFIX,                
 app.include_router(dnc.router,                    prefix=PREFIX,                  tags=["DNC"])
 app.include_router(dnc_channel.router,            prefix=PREFIX,                  tags=["DNC — Channel-Aware"])
 app.include_router(local_scraper_ingest.router,   prefix=PREFIX,                  tags=["Ingest — Local Scraper"])
+app.include_router(scrape_jobs.router,            prefix=PREFIX,                  tags=["Scrape Jobs — Worker Queue"])
 app.include_router(dnc_webhooks.router,           prefix=PREFIX,                  tags=["DNC Webhooks"])
 app.include_router(webhooks_truelist.router,      prefix=PREFIX,                  tags=["Truelist Webhooks"])
 app.include_router(backlog_scrub.router,          prefix=PREFIX,                  tags=["Backlog Scrub"])
