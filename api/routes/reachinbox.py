@@ -140,6 +140,13 @@ async def ri_put(path: str, body: dict) -> dict:
             raise HTTPException(status_code=r.status_code, detail=f"ReachInbox error: {r.text[:200]}")
         return r.json()
 
+async def ri_delete(path: str) -> dict:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.delete(f"{RI_BASE}{path}", headers=_ri_headers())
+        if r.status_code not in [200, 201, 202, 204]:
+            raise HTTPException(status_code=r.status_code, detail=f"ReachInbox error: {r.text[:200]}")
+        return r.json() if r.text else {}
+
 def fetch_kjle_leads(filters: CampaignLeadFilter) -> list:
     """Pull leads from KJLE database based on filters."""
     db = get_db()
@@ -161,7 +168,10 @@ def fetch_kjle_leads(filters: CampaignLeadFilter) -> list:
     if filters.segment_label:
         query = query.eq("segment_label", filters.segment_label)
 
-    query = query.order("pain_score", desc=True).limit(limit)
+    # Deterministic ordering so LIMIT cuts at the same boundary every call,
+    # and the partial-index planner (leads_campaign_eligible_idx) gets a
+    # stable sort key — prevents statement_timeout on the 596K-row table.
+    query = query.order("pain_score", desc=True).order("id").limit(limit)
     result = query.execute()
     return result.data or []
 
@@ -263,18 +273,61 @@ async def list_accounts(
 @router.post("/reachinbox/campaigns/create")
 async def create_full_campaign(body: CreateCampaignRequest):
     """
-    Create a complete ReachInbox campaign in one call:
-    1. Create campaign
-    2. Add email sequences
-    3. Set schedule
-    4. Set email accounts
-    5. Update campaign options
-    6. Add KJLE leads
-    7. Optionally launch
+    Create a complete ReachInbox campaign in one call.
+
+    Pre-flight (fail fast, no RI write):
+      P1. Fetch KJLE leads → 400 if zero match the filter (prevents orphan campaign).
+      P2. Resolve account_ids (int) → emails via /account/all → 400 if any unresolvable
+          (RI /campaigns/set-accounts expects an email-address array, NOT account IDs).
+
+    RI write sequence (rollback-protected):
+      1. Create campaign
+      2. Add email sequences
+      3. Set schedule
+      4. Update campaign options
+      5. Set email accounts (emails, translated from int IDs)
+      6. Add KJLE leads
+      7. Optionally launch
+      8. Register in campaign_performance (non-fatal, outside rollback)
     """
 
     steps_completed = []
     campaign_id     = None
+
+    # ── Pre-flight P1: Fetch leads BEFORE any RI call ─────────────────────────
+    # Prior shape created the campaign first, then queried leads — when the
+    # 596K-row leads table hit Postgres statement_timeout 57014, the RI
+    # campaign was already created and the request returned an error,
+    # leaving an orphan draft. Fetching first lets us 400 before any write.
+    kjle_leads = fetch_kjle_leads(body.lead_filter)
+    if not kjle_leads:
+        raise HTTPException(status_code=400, detail="no_eligible_leads_match_filter")
+
+    # ── Pre-flight P2: Translate account_ids → emails (Bug 1) ─────────────────
+    # RI /campaigns/set-accounts "emails" field expects email-address strings,
+    # not the integer account IDs the KJLE sender contract uses. Resolve them
+    # via the same /account/all helper that GET /reachinbox/accounts uses.
+    account_emails: List[str] = []
+    if body.account_ids:
+        accounts_resp = await ri_get("/account/all", {"limit": 500, "offset": 0})
+        connected = accounts_resp.get("data", {}).get("emailsConnected", []) or []
+        id_email_map = {a["id"]: a["email"] for a in connected if a.get("id") and a.get("email")}
+
+        missing_ids = [aid for aid in body.account_ids if aid not in id_email_map]
+        if missing_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unresolvable_account_ids: {missing_ids}",
+            )
+
+        account_emails = [id_email_map[aid] for aid in body.account_ids]
+        logger.info(
+            f"[reachinbox.create] resolved {len(account_emails)}/{len(body.account_ids)} "
+            f"account_ids to emails"
+        )
+
+    leads_added = 0
+    leads_skipped = 0
 
     try:
         # ── Step 1: Create campaign ───────────────────────────────────────────
@@ -353,79 +406,71 @@ async def create_full_campaign(body: CreateCampaignRequest):
         await ri_post("/campaigns/update-details", options_payload)
         steps_completed.append("✅ Campaign options updated")
 
-        # ── Step 5: Set email accounts ────────────────────────────────────────
-        if body.account_ids:
+        # ── Step 5: Set email accounts (emails, not int IDs) ──────────────────
+        if account_emails:
             accounts_payload = {
                 "campaignId": campaign_id,
-                "emails":     body.account_ids,
+                "emails":     account_emails,
             }
             await ri_put("/campaigns/set-accounts", accounts_payload)
-            steps_completed.append(f"✅ {len(body.account_ids)} email account(s) assigned")
+            steps_completed.append(
+                f"✅ {len(account_emails)} email account(s) assigned "
+                f"({len(body.account_ids)} id(s) translated)"
+            )
 
-        # ── Step 6: Fetch KJLE leads and add to campaign ──────────────────────
-        kjle_leads = fetch_kjle_leads(body.lead_filter)
-        leads_added = 0
-        leads_skipped = 0
+        # ── Step 6: Add pre-fetched KJLE leads to campaign ────────────────────
+        ri_leads = [map_lead_to_ri(lead) for lead in kjle_leads if lead.get("email")]
 
-        if kjle_leads:
-            ri_leads = [map_lead_to_ri(lead) for lead in kjle_leads if lead.get("email")]
-
-            # Add leads in batches of 100
-            batch_size = 100
-            for i in range(0, len(ri_leads), batch_size):
-                batch = ri_leads[i:i+batch_size]
-                add_payload = {
-                    "campaignId": campaign_id,
-                    "leads":      batch,
-                }
-                try:
-                    await ri_post("/leads/addLeadsToCampaign", add_payload)
-                    leads_added += len(batch)
-                except Exception as e:
-                    logger.warning(f"Batch {i} lead add failed: {e}")
-                    leads_skipped += len(batch)
+        batch_size = 100
+        for i in range(0, len(ri_leads), batch_size):
+            batch = ri_leads[i:i+batch_size]
+            add_payload = {
+                "campaignId": campaign_id,
+                "leads":      batch,
+            }
+            try:
+                await ri_post("/leads/addLeadsToCampaign", add_payload)
+                leads_added += len(batch)
+            except Exception as e:
+                logger.warning(f"Batch {i} lead add failed: {e}")
+                leads_skipped += len(batch)
 
         steps_completed.append(f"✅ {leads_added} leads added ({leads_skipped} skipped)")
 
         # ── Step 7: Launch campaign (optional) ───────────────────────────────
-        if body.auto_launch and body.account_ids:
+        if body.auto_launch and account_emails:
             await ri_post("/campaigns/start", {"campaignId": campaign_id})
             steps_completed.append("🚀 Campaign launched!")
 
-        # ── Step 8: Auto-register in campaign_performance (non-fatal) ────────
-        try:
-            from .campaigns import _auto_register_from_ri_create
-            launched = bool(body.auto_launch and body.account_ids)
-            await _auto_register_from_ri_create(
-                ri_campaign_id = str(campaign_id),
-                campaign_name  = body.name,
-                niche          = body.lead_filter.niche_slug,
-                domain_used    = body.domain_used,
-                offer_type     = body.offer_type,
-                leads_count    = leads_added,
-                launched       = launched,
-            )
-            steps_completed.append("📊 Registered in campaign_performance")
-        except Exception as e:
-            logger.warning(f"[auto-register] non-fatal (campaign_id={campaign_id}): {e}")
-            steps_completed.append(f"⚠️ auto-register skipped: {str(e)[:100]}")
-
-        return {
-            "status":          "success",
-            "campaign_id":     campaign_id,
-            "campaign_name":   body.name,
-            "steps_completed": steps_completed,
-            "summary": {
-                "leads_added":      leads_added,
-                "sequences":        len(body.sequences),
-                "accounts_assigned": len(body.account_ids),
-                "auto_launched":    body.auto_launch,
-            },
-        }
-
-    except HTTPException:
+    except HTTPException as e:
+        # Steps 1-7 fault: roll back the RI campaign we just created so the
+        # caller doesn't accumulate orphan drafts on retry.
+        if campaign_id is not None:
+            try:
+                await ri_delete(f"/campaigns/{campaign_id}")
+                logger.warning(
+                    f"[reachinbox.create] rollback: deleted orphan campaign "
+                    f"{campaign_id} after failure at step {len(steps_completed)}"
+                )
+            except Exception as del_err:
+                logger.error(
+                    f"[reachinbox.create] rollback DELETE failed for campaign "
+                    f"{campaign_id}: {del_err}"
+                )
         raise
     except Exception as e:
+        if campaign_id is not None:
+            try:
+                await ri_delete(f"/campaigns/{campaign_id}")
+                logger.warning(
+                    f"[reachinbox.create] rollback: deleted orphan campaign "
+                    f"{campaign_id} after failure at step {len(steps_completed)+1}"
+                )
+            except Exception as del_err:
+                logger.error(
+                    f"[reachinbox.create] rollback DELETE failed for campaign "
+                    f"{campaign_id}: {del_err}"
+                )
         logger.error(f"Campaign creation failed at step {len(steps_completed)+1}: {e}")
         raise HTTPException(
             status_code=500,
@@ -433,8 +478,40 @@ async def create_full_campaign(body: CreateCampaignRequest):
                 "error":           str(e),
                 "steps_completed": steps_completed,
                 "campaign_id":     campaign_id,
+                "rollback":        "attempted" if campaign_id is not None else "not_needed",
             }
         )
+
+    # ── Step 8: Auto-register in campaign_performance (non-fatal) ────────────
+    try:
+        from .campaigns import _auto_register_from_ri_create
+        launched = bool(body.auto_launch and account_emails)
+        await _auto_register_from_ri_create(
+            ri_campaign_id = str(campaign_id),
+            campaign_name  = body.name,
+            niche          = body.lead_filter.niche_slug,
+            domain_used    = body.domain_used,
+            offer_type     = body.offer_type,
+            leads_count    = leads_added,
+            launched       = launched,
+        )
+        steps_completed.append("📊 Registered in campaign_performance")
+    except Exception as e:
+        logger.warning(f"[auto-register] non-fatal (campaign_id={campaign_id}): {e}")
+        steps_completed.append(f"⚠️ auto-register skipped: {str(e)[:100]}")
+
+    return {
+        "status":          "success",
+        "campaign_id":     campaign_id,
+        "campaign_name":   body.name,
+        "steps_completed": steps_completed,
+        "summary": {
+            "leads_added":      leads_added,
+            "sequences":        len(body.sequences),
+            "accounts_assigned": len(account_emails),
+            "auto_launched":    body.auto_launch,
+        },
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
