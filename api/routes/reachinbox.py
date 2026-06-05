@@ -456,21 +456,36 @@ async def create_full_campaign(body: CreateCampaignRequest):
             await ri_post("/campaigns/start", {"campaignId": campaign_id})
             steps_completed.append("🚀 Campaign launched!")
 
-    except HTTPException as e:
+   except HTTPException as e:
+        # DIAG 2.1: confirm we reached the rollback path
+        logger.error(
+            f"[reachinbox.create] HTTPException caught at rollback path — "
+            f"campaign_id={campaign_id} steps_done={len(steps_completed)} "
+            f"status={e.status_code} detail={str(e.detail)[:200]}"
+        )
         # Steps 1-7 fault: roll back the RI campaign we just created so the
         # caller doesn't accumulate orphan drafts on retry.
         if campaign_id is not None:
+            logger.warning(
+                f"[reachinbox.create] rollback: attempting DELETE /campaigns/{campaign_id}"
+            )
             try:
-                await ri_delete(f"/campaigns/{campaign_id}")
+                delete_result = await ri_delete(f"/campaigns/{campaign_id}")
                 logger.warning(
                     f"[reachinbox.create] rollback: deleted orphan campaign "
-                    f"{campaign_id} after failure at step {len(steps_completed)}"
+                    f"{campaign_id} after failure at step {len(steps_completed)} "
+                    f"result={delete_result!r}"
                 )
             except Exception as del_err:
                 logger.error(
                     f"[reachinbox.create] rollback DELETE failed for campaign "
-                    f"{campaign_id}: {del_err}"
+                    f"{campaign_id}: {del_err!r}"
                 )
+        else:
+            logger.error(
+                f"[reachinbox.create] rollback SKIPPED — campaign_id is None "
+                f"(failure happened before campaign was created)"
+            )
         raise
     except Exception as e:
         if campaign_id is not None:
