@@ -406,13 +406,27 @@ async def create_full_campaign(body: CreateCampaignRequest):
         await ri_post("/campaigns/update-details", options_payload)
         steps_completed.append("✅ Campaign options updated")
 
-        # ── Step 5: Set email accounts (emails, not int IDs) ──────────────────
+       # ── Step 5: Set email accounts (emails, not int IDs) ──────────────────
         if account_emails:
             accounts_payload = {
                 "campaignId": campaign_id,
                 "emails":     account_emails,
             }
-            await ri_put("/campaigns/set-accounts", accounts_payload)
+            logger.info(
+                f"[reachinbox.set_accounts] sending payload: "
+                f"campaignId={campaign_id} emails={account_emails!r}"
+            )
+            try:
+                set_accounts_result = await ri_put("/campaigns/set-accounts", accounts_payload)
+                logger.info(
+                    f"[reachinbox.set_accounts] success response: {set_accounts_result!r}"
+                )
+            except Exception as e_setacct:
+                logger.error(
+                    f"[reachinbox.set_accounts] FAILED — campaignId={campaign_id} "
+                    f"emails={account_emails!r} error={e_setacct!r}"
+                )
+                raise
             steps_completed.append(
                 f"✅ {len(account_emails)} email account(s) assigned "
                 f"({len(body.account_ids)} id(s) translated)"
