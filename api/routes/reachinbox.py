@@ -410,8 +410,9 @@ async def create_full_campaign(body: CreateCampaignRequest):
         if account_emails:
             accounts_payload = {
                 "campaignId": campaign_id,
-                "emails":     account_emails,
+                "accountsToUse": account_emails,
             }
+
             logger.info(
                 f"[reachinbox.set_accounts] sending payload: "
                 f"campaignId={campaign_id} emails={account_emails!r}"
