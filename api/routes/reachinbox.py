@@ -176,15 +176,21 @@ def fetch_kjle_leads(filters: CampaignLeadFilter) -> list:
     return result.data or []
 
 def map_lead_to_ri(lead: dict) -> dict:
-    """Map KJLE lead to ReachInbox lead format."""
+    """Map KJLE lead to ReachInbox lead format.
+
+    RI docs (docs.reachinbox.ai/lead) require firstName/lastName as
+    top-level fields. Custom attributes go under "attributes".
+    """
     name_parts = (lead.get("business_name") or "").split()
     first_name = name_parts[0] if name_parts else "Business"
+    last_name  = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
     company    = lead.get("business_name") or ""
 
     return {
-        "email": lead.get("email") or "",
+        "email":     lead.get("email") or "",
+        "firstName": first_name,
+        "lastName":  last_name,
         "attributes": {
-            "firstName":   first_name,
             "companyName": company,
             "phone":       lead.get("phone") or "",
             "city":        lead.get("city") or "",
@@ -443,10 +449,17 @@ async def create_full_campaign(body: CreateCampaignRequest):
                 "leads":      batch,
             }
             try:
-                await ri_post("/leads/addLeadsToCampaign", add_payload)
+                add_result = await ri_post("/leads/add", add_payload)
+                logger.info(
+                    f"[reachinbox.add_leads] batch {i}: sent {len(batch)} leads, "
+                    f"result={str(add_result)[:200]}"
+                )
                 leads_added += len(batch)
             except Exception as e:
-                logger.warning(f"Batch {i} lead add failed: {e}")
+                logger.warning(
+                    f"[reachinbox.add_leads] batch {i} FAILED: "
+                    f"sample_payload={str(add_payload)[:300]!r} error={e!r}"
+                )
                 leads_skipped += len(batch)
 
         steps_completed.append(f"✅ {leads_added} leads added ({leads_skipped} skipped)")
@@ -561,11 +574,22 @@ async def add_leads_to_campaign(body: AddLeadsRequest):
     batch_size = 100
     for i in range(0, len(ri_leads), batch_size):
         batch = ri_leads[i:i+batch_size]
-        await ri_post("/leads/addLeadsToCampaign", {
+        add_payload = {
             "campaignId": body.campaign_id,
             "leads":      batch,
-        })
-        leads_added += len(batch)
+        }
+        try:
+            add_result = await ri_post("/leads/add", add_payload)
+            logger.info(
+                f"[reachinbox.add_leads] batch {i}: sent {len(batch)} leads, "
+                f"result={str(add_result)[:200]}"
+            )
+            leads_added += len(batch)
+        except Exception as e:
+            logger.warning(
+                f"[reachinbox.add_leads] batch {i} FAILED: "
+                f"sample_payload={str(add_payload)[:300]!r} error={e!r}"
+            )
 
     return {
         "status":      "success",
