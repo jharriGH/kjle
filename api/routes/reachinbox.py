@@ -22,8 +22,20 @@ from pydantic import BaseModel
 from ..database import get_db
 from ..config import settings
 
+# Added for DELETE /reachinbox/campaigns/{id} (orphan cleanup endpoint)
+import os
+from fastapi import Depends, Header
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# Auth for destructive endpoints (delete_campaign). Other RI routes remain unauth'd.
+API_SECRET_KEY = os.environ.get("API_SECRET_KEY", "kjle-prod-2026-secret")
+
+
+def verify_api_key(x_api_key: str = Header(...)):
+    if x_api_key != API_SECRET_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
 RI_BASE = "https://api.reachinbox.ai/api/v1"
 
@@ -236,6 +248,36 @@ async def list_campaigns(
             for c in campaigns
         ],
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DELETE /reachinbox/campaigns/{campaign_id}
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.delete("/reachinbox/campaigns/{campaign_id}", dependencies=[Depends(verify_api_key)])
+async def delete_campaign(campaign_id: int):
+    """
+    Delete a RI campaign by ID. Thin wrapper around ri_delete.
+
+    Used for orphan cleanup of test/draft campaigns. Returns RI's response.
+    Caller is responsible for verifying the campaign is safe to delete
+    (Draft + hasStarted=False) before calling.
+    """
+    logger.info(f"[reachinbox.delete_campaign] DELETE /campaigns/{campaign_id}")
+    try:
+        result = await ri_delete(f"/campaigns/{campaign_id}")
+        logger.info(f"[reachinbox.delete_campaign] success: campaign_id={campaign_id} result={result!r}")
+        return {
+            "status":      "success",
+            "campaign_id": campaign_id,
+            "ri_response": result,
+        }
+    except HTTPException as e:
+        logger.error(f"[reachinbox.delete_campaign] FAILED: campaign_id={campaign_id} status={e.status_code} detail={str(e.detail)[:200]}")
+        raise
+    except Exception as e:
+        logger.error(f"[reachinbox.delete_campaign] UNEXPECTED ERROR: campaign_id={campaign_id} error={e!r}")
+        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)[:200]}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
