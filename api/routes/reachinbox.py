@@ -456,7 +456,7 @@ async def create_full_campaign(body: CreateCampaignRequest):
             await ri_post("/campaigns/start", {"campaignId": campaign_id})
             steps_completed.append("🚀 Campaign launched!")
 
-   except HTTPException as e:
+    except HTTPException as e:
         # DIAG 2.1: confirm we reached the rollback path
         logger.error(
             f"[reachinbox.create] HTTPException caught at rollback path — "
