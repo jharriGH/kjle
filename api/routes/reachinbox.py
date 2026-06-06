@@ -409,8 +409,8 @@ async def create_full_campaign(body: CreateCampaignRequest):
        # ── Step 5: Set email accounts (emails, not int IDs) ──────────────────
         if account_emails:
             accounts_payload = {
-                "campaignId": campaign_id,
-                "emails":     account_emails,
+                "campaignId":    campaign_id,
+                "accountsToUse": account_emails,
             }
             logger.info(
                 f"[reachinbox.set_accounts] sending payload: "
