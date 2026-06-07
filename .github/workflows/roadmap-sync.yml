@@ -1,0 +1,86 @@
+name: Roadmap sync
+
+# Keeps KJ_EMPIRE_ROADMAP.html generated from KJ_EMPIRE_ROADMAP.md, and makes a
+# dropped/blank YAML `project:` key impossible to merge silently (it breaks the
+# empire dashboard at jharriGH.github.io/empire-dashboard).
+#
+# On a PR that touches the .md: validate the front-matter, regenerate the .html,
+# and commit it back to the PR branch so the merge always carries an in-sync .html.
+# The editor only ever touches the .md.
+#
+# On push to main: validate + verify the .html is in sync (safety net; cannot
+# auto-commit to a protected branch).
+
+on:
+  pull_request:
+    paths:
+      - "KJ_EMPIRE_ROADMAP.md"
+      - "scripts/build_roadmap_html.py"
+  push:
+    branches: [main]
+    paths:
+      - "KJ_EMPIRE_ROADMAP.md"
+      - "scripts/build_roadmap_html.py"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: roadmap-sync-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # On a PR, check out the PR's head branch so we can commit the
+          # regenerated HTML back to it. On push, this is just the pushed ref.
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pyyaml markdown
+
+      # --- PUSH TO MAIN: validate + verify sync only (cannot commit to protected main) ---
+      - name: Validate + verify sync (push to main)
+        if: github.event_name == 'push'
+        run: |
+          python scripts/build_roadmap_html.py --check
+
+      # --- PULL REQUEST: validate, regenerate, commit back to the PR branch ---
+      - name: Validate front-matter (pull request)
+        if: github.event_name == 'pull_request'
+        run: |
+          # Regenerate to a throwaway path purely to exercise validation.
+          # Exit 2 = bad/missing YAML front-matter -> the build fails here.
+          python scripts/build_roadmap_html.py --html /tmp/_validate.html
+
+      - name: Regenerate HTML (pull request)
+        if: github.event_name == 'pull_request'
+        run: |
+          python scripts/build_roadmap_html.py
+
+      - name: Commit regenerated HTML back to the PR branch
+        # Same-repo PRs only (fork PRs can't push with the default token).
+        if: >
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          if git diff --quiet -- KJ_EMPIRE_ROADMAP.html; then
+            echo "KJ_EMPIRE_ROADMAP.html already in sync — nothing to commit."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add KJ_EMPIRE_ROADMAP.html
+          # [skip ci] prevents this bot commit from re-triggering this workflow (loop guard).
+          git commit -m "chore(roadmap): regenerate HTML from .md [skip ci]"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}

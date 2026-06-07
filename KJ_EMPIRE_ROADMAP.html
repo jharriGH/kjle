@@ -3,567 +3,574 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>KJ Empire — Sprint Roadmap</title>
+<title>KJ Empire — KJLE Roadmap</title>
+<!-- GENERATED FILE — do not edit by hand. Source: KJ_EMPIRE_ROADMAP.md -->
+<!-- Regenerate with: python scripts/build_roadmap_html.py -->
 <style>
   :root {
-    --bg: #0a0e1a;
-    --panel: #111827;
-    --panel-2: #1a2236;
-    --border: #233048;
-    --text: #e5e7eb;
-    --text-dim: #9ca3af;
-    --text-faint: #6b7280;
-    --green: #10b981;
-    --yellow: #f59e0b;
-    --blue: #3b82f6;
-    --grey: #6b7280;
-    --pause: #a78bfa;
-    --red: #ef4444;
-    --warn: #f97316;
-    --cyan: #06b6d4;
-    --accent: #fbbf24;
+    --bg:#0a0e1a; --panel:#111827; --panel-2:#1a2236; --border:#233048;
+    --text:#e5e7eb; --text-dim:#9ca3af; --text-faint:#6b7280;
+    --green:#10b981; --yellow:#f59e0b; --blue:#3b82f6; --grey:#6b7280;
+    --pause:#a78bfa; --red:#ef4444; --warn:#f97316; --cyan:#06b6d4; --accent:#fbbf24;
   }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.5; }
-  .wrap { max-width: 1400px; margin: 0 auto; padding: 32px 24px 64px; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; line-height:1.55; }
+  .wrap { max-width:1100px; margin:0 auto; padding:32px 24px 64px; }
+  a { color:var(--cyan); text-decoration:none; }
+  a:hover { text-decoration:underline; }
 
-  header { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 12px; margin-bottom: 8px; }
-  header h1 { font-size: 28px; font-weight: 600; color: var(--accent); letter-spacing: -0.5px; }
-  header h1 .crown { margin-right: 8px; }
-  header .meta { color: var(--text-dim); font-size: 13px; }
-  header .meta code { background: var(--panel-2); padding: 2px 6px; border-radius: 4px; font-family: 'SF Mono', Menlo, monospace; font-size: 12px; color: var(--cyan); }
+  header h1 { font-size:28px; font-weight:600; color:var(--accent); letter-spacing:-0.5px; margin-bottom:4px; }
+  header .gen { color:var(--text-faint); font-size:12px; font-family:'SF Mono',Menlo,monospace; }
 
-  .subtitle { color: var(--text-dim); font-size: 14px; margin-bottom: 24px; }
-  .subtitle .target { color: var(--accent); font-weight: 600; }
+  .status-card { background:var(--panel); border:1px solid var(--border); border-radius:8px;
+    padding:18px 20px; margin:18px 0 28px; }
+  .status-card .card-head { display:flex; align-items:center; gap:12px; margin-bottom:8px; }
+  .status-card .proj { font-size:20px; font-weight:600; color:var(--text); }
+  .status-card .status-badge { font-size:11px; text-transform:uppercase; letter-spacing:0.5px;
+    border:1px solid; border-radius:10px; padding:2px 10px; font-weight:600; }
+  .card-desc { color:var(--text-dim); font-size:13px; margin-bottom:6px; }
+  .card-notes { color:var(--text-faint); font-size:12px; margin-bottom:12px; font-style:italic; }
+  .meta-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:4px 24px; }
+  .meta-row { display:flex; justify-content:space-between; gap:12px; font-size:12px;
+    padding:3px 0; border-bottom:1px dashed var(--border); }
+  .meta-k { color:var(--text-faint); }
+  .meta-v { color:var(--text-dim); text-align:right; }
 
-  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 32px; }
-  .kpi { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
-  .kpi-label { color: var(--text-dim); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
-  .kpi-value { font-size: 26px; font-weight: 600; color: var(--text); }
-  .kpi-value.green { color: var(--green); }
-  .kpi-value.yellow { color: var(--yellow); }
-  .kpi-value.accent { color: var(--accent); }
+  .body h1 { font-size:22px; color:var(--accent); margin:28px 0 10px; }
+  .body h2 { font-size:16px; font-weight:600; color:var(--text); margin:26px 0 12px;
+    padding-bottom:8px; border-bottom:1px solid var(--border); }
+  .body h3 { font-size:14px; font-weight:600; color:var(--text-dim); margin:18px 0 8px; }
+  .body p { color:var(--text-dim); font-size:13px; margin:8px 0; }
+  .body ul, .body ol { color:var(--text-dim); font-size:13px; margin:8px 0 8px 22px; }
+  .body li { margin:3px 0; }
+  .body strong { color:var(--text); }
+  .body hr { border:0; border-top:1px solid var(--border); margin:24px 0; }
+  .body blockquote { border-left:3px solid var(--accent); padding:4px 14px; margin:12px 0;
+    color:var(--text-dim); background:var(--panel); border-radius:0 6px 6px 0; }
+  .body code { background:var(--panel-2); color:var(--cyan); padding:2px 6px; border-radius:4px;
+    font-family:'SF Mono',Menlo,monospace; font-size:12px; }
+  .body pre { background:var(--panel); border:1px solid var(--border); border-radius:6px;
+    padding:12px 14px; overflow-x:auto; margin:12px 0; }
+  .body pre code { background:none; padding:0; color:var(--text); }
 
-  .legend { display: flex; gap: 16px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 32px; font-size: 13px; }
-  .legend-item { display: flex; align-items: center; gap: 6px; color: var(--text-dim); }
-  .legend-dot { width: 10px; height: 10px; border-radius: 50%; }
+  .body table { width:100%; border-collapse:collapse; margin:14px 0; font-size:12.5px; }
+  .body th, .body td { text-align:left; padding:7px 10px; border:1px solid var(--border);
+    vertical-align:top; }
+  .body th { background:var(--panel-2); color:var(--accent); font-weight:600; }
+  .body td { color:var(--text-dim); background:var(--panel); }
+  .body tr:hover td { background:var(--panel-2); }
 
-  .timeline { display: grid; grid-template-columns: repeat(8, 1fr); gap: 8px; margin-bottom: 32px; }
-  .day { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 10px; position: relative; }
-  .day.done { border-color: var(--green); background: linear-gradient(135deg, rgba(16,185,129,0.08), var(--panel)); }
-  .day.now { border-color: var(--yellow); background: linear-gradient(135deg, rgba(245,158,11,0.12), var(--panel)); box-shadow: 0 0 0 1px var(--yellow); }
-  .day.next { border-color: var(--blue); background: linear-gradient(135deg, rgba(59,130,246,0.06), var(--panel)); }
-  .day.target { border-color: var(--accent); background: linear-gradient(135deg, rgba(251,191,36,0.15), var(--panel)); }
-  .day-label { color: var(--text-dim); font-size: 11px; font-weight: 500; margin-bottom: 4px; }
-  .day-theme { color: var(--text); font-size: 12px; font-weight: 500; line-height: 1.3; }
-  .day-cost { color: var(--accent); font-size: 11px; font-weight: 500; margin-top: 4px; }
-  .day.target .day-label { color: var(--accent); }
-  .day.target .day-theme { color: var(--accent); }
-
-  section { margin-bottom: 32px; }
-  section h2 { font-size: 16px; font-weight: 600; color: var(--text); margin-bottom: 14px; padding-bottom: 8px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: baseline; }
-  section h2 .count { color: var(--text-faint); font-size: 12px; font-weight: 400; }
-  section h2 .phase-cost { color: var(--accent); font-size: 12px; font-weight: 500; }
-
-  .task-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 8px; }
-  .task { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; display: flex; align-items: flex-start; gap: 10px; font-size: 13px; }
-  .task-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; margin-top: 6px; }
-  .task-text { flex: 1; }
-  .task-text .name { color: var(--text); }
-  .task-text .note { color: var(--text-faint); font-size: 11px; margin-top: 2px; }
-  .task-cost { background: var(--panel-2); color: var(--accent); font-size: 11px; padding: 2px 7px; border-radius: 10px; flex-shrink: 0; align-self: center; font-family: 'SF Mono', Menlo, monospace; }
-  .task-cost.free { color: var(--green); background: rgba(16,185,129,0.1); }
-  .task-cost.paid { color: var(--accent); }
-  .task-cost.calibrated::before { content: '✓ '; color: var(--green); }
-  .task-cost.guessed::before { content: '? '; color: var(--warn); }
-
-  .dot-green { background: var(--green); }
-  .dot-yellow { background: var(--yellow); }
-  .dot-blue { background: var(--blue); }
-  .dot-grey { background: var(--grey); }
-  .dot-pause { background: var(--pause); }
-  .dot-red { background: var(--red); }
-  .dot-warn { background: var(--warn); }
-
-  .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
-  @media (max-width: 768px) { .columns { grid-template-columns: 1fr; } .timeline { grid-template-columns: repeat(4, 1fr); } }
-
-  table.compact { width: 100%; border-collapse: collapse; font-size: 13px; }
-  table.compact td, table.compact th { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left; }
-  table.compact th { color: var(--text-dim); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-  table.compact td { color: var(--text); }
-  table.compact td.dim { color: var(--text-dim); }
-  table.compact td.cost { color: var(--accent); font-family: 'SF Mono', Menlo, monospace; }
-  table.compact tr:last-child td { border-bottom: 0; }
-
-  .cost-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
-  .cost-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
-  .cost-card.budget { border-color: var(--accent); background: linear-gradient(135deg, rgba(251,191,36,0.08), var(--panel)); }
-  .cost-card.danger { border-color: var(--red); background: linear-gradient(135deg, rgba(239,68,68,0.05), var(--panel)); }
-  .cost-label { color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-  .cost-amount { color: var(--text); font-size: 22px; font-weight: 500; margin-top: 4px; }
-  .cost-detail { color: var(--text-faint); font-size: 11px; margin-top: 2px; }
-
-  /* Tier framework table */
-  .tier-table { width: 100%; font-size: 12px; }
-  .tier-table th, .tier-table td { padding: 6px 10px; border-bottom: 1px solid var(--border); }
-  .tier-table th { color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; font-size: 10px; }
-  .tier-T0 { color: var(--green); }
-  .tier-T1 { color: var(--green); }
-  .tier-T2 { color: var(--cyan); }
-  .tier-T3 { color: var(--accent); }
-  .tier-T4 { color: var(--red); }
-
-  /* Cost legend banner */
-  .cost-legend { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; margin-bottom: 16px; font-size: 12px; color: var(--text-dim); display: flex; gap: 24px; flex-wrap: wrap; }
-  .cost-legend strong { color: var(--text); }
-  .cost-legend code { background: var(--panel-2); padding: 1px 5px; border-radius: 3px; font-size: 11px; }
-
-  footer { color: var(--text-faint); font-size: 11px; text-align: center; margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--border); }
-
-  .pin { background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 6px; padding: 10px 14px; font-size: 13px; color: var(--text-dim); margin-bottom: 6px; }
-  .pin .label { color: var(--accent); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; margin-right: 8px; }
+  footer { margin-top:40px; padding-top:16px; border-top:1px solid var(--border);
+    color:var(--text-faint); font-size:11px; }
 </style>
 </head>
 <body>
 <div class="wrap">
-
   <header>
-    <h1><span class="crown">👑</span>KJ Empire — Sprint Roadmap</h1>
-    <div class="meta">
-      Last refresh: <strong>2026-06-04 (Day 2 PM close)</strong>
-      &nbsp;·&nbsp;
-      KJLE main HEAD: <code>d42b54a</code>
-    </div>
+    <h1>👑 KJ Empire — Roadmap</h1>
+    <div class="gen">generated from KJ_EMPIRE_ROADMAP.md — do not edit this file by hand</div>
   </header>
-  <div class="subtitle">
-    Sprint target: <span class="target">Autonomous lead pumping LIVE by Monday 2026-06-09</span>
+  <div class="status-card">
+  <div class="card-head">
+    <span class="proj">KJLE</span>
+    <span class="status-badge" style="color:var(--green);border-color:var(--green)">active</span>
   </div>
-
-  <!-- VICTORY banner -->
-  <div style="background: linear-gradient(90deg, rgba(16,185,129,0.20), rgba(16,185,129,0.05)); border: 1px solid var(--green); border-radius: 8px; padding: 14px 18px; margin-bottom: 24px; font-size: 13px; color: var(--text);">
-    <strong style="color: var(--green); font-size: 14px;">🏆 Day 3 milestone — RI campaign path fully unblocked end-to-end (2026-06-06)</strong><br>
-    Three bugs root-caused via RI's official docs at docs.reachinbox.ai, fixed, and verified by ES SC:
-    <strong>Bug 2.1</strong> rollback diagnostic logging shipped <code style="background:var(--panel-2);padding:1px 5px;border-radius:3px;color:var(--cyan);">f791cce</code> ·
-    <strong>Bug 1.1</strong> set-accounts key fix <code style="background:var(--panel-2);padding:1px 5px;border-radius:3px;color:var(--cyan);">140f4b4</code> (ES SC verified: 5 telehealth + 1 control accounts assigned cleanly) ·
-    <strong>Bug 3</strong> add-leads endpoint + per-lead shape fix <code style="background:var(--panel-2);padding:1px 5px;border-radius:3px;color:var(--cyan);">ad87b1a</code> (ES SC verified: 5 added / 0 skipped).
-    <br><span style="color: var(--text-dim);">Day 3 dispatch cost: ~$3.00. Sprint total: ~$13.92.</span>
+  <p class="card-desc">Lead engine — scraping, classification, DNC compliance, RI campaign creation. Data hub for the empire.</p><p class="card-notes">LS pipeline proven end-to-end (job ed784559, 120 leads). One SC casing patch from leads landing. kjle-api flapping root-caused (scheduler loop blocking). DNC swap to RealValidito in flight.</p>
+  <div class="meta-grid">
+    <div class="meta-row"><span class="meta-k">Sprint</span><span class="meta-v">Day 3 done — LS pipeline proven; casing patch + DNC swap pending</span></div><div class="meta-row"><span class="meta-k">Target date</span><span class="meta-v">2026-06-09</span></div><div class="meta-row"><span class="meta-k">Last updated</span><span class="meta-v">2026-06-07</span></div><div class="meta-row"><span class="meta-k">Integrates with</span><span class="meta-v">EmpireSenderz, TH, DemoEnginez, DemoBoosterz, Local Scraper workers</span></div><div class="meta-row"><span class="meta-k">Budget</span><span class="meta-v">$10.92 spent · $4.08 remaining</span></div>
   </div>
-
-  <!-- KPIs -->
-  <div class="kpis">
-    <div class="kpi">
-      <div class="kpi-label">Leads classified</div>
-      <div class="kpi-value green">596,764</div>
-    </div>
-    <div class="kpi">
-      <div class="kpi-label">Flagged uncontactable</div>
-      <div class="kpi-value yellow">1,760</div>
-    </div>
-    <div class="kpi">
-      <div class="kpi-label">Coverage</div>
-      <div class="kpi-value green">100%</div>
-    </div>
-    <div class="kpi">
-      <div class="kpi-label">Sprint spent</div>
-      <div class="kpi-value">$13.92</div>
-    </div>
-    <div class="kpi">
-      <div class="kpi-label">Sprint budget remaining</div>
-      <div class="kpi-value accent">$6-11</div>
-    </div>
+</div>
+  <div class="body">
+<h1 id="kj-empire-centralized-roadmap">👑 KJ EMPIRE — CENTRALIZED ROADMAP</h1>
+<p><strong>Owner:</strong> Jim Harris, DevelopingRiches Inc
+<strong>Last refresh:</strong> 2026-06-07 (Day 3 — Local Scraper pipeline proven end-to-end)
+<strong>Sprint goal:</strong> Autonomous lead pumping live by <strong>Monday 2026-06-09</strong>
+<strong>Source of truth:</strong> This file + <code>KJ_EMPIRE_ROADMAP.html</code>
+<strong>KJLE main HEAD:</strong> <code>d42b54a</code> (last verified by this seat) — SC reports main now at <code>46ec14e</code>; SC to confirm before any pull.</p>
+<hr />
+<h2 id="visual-dashboard-kj_empire_roadmaphtml">🖼️ VISUAL DASHBOARD — KJ_EMPIRE_ROADMAP.html</h2>
+<p>Companion file: <code>KJ_EMPIRE_ROADMAP.html</code>. Same data, visual format. Save both in <code>Documents/GitHub/kjle/</code> and open the HTML for a glanceable status check.</p>
+<p><strong>Update discipline — non-negotiable:</strong></p>
+<ol>
+<li><strong>At session start</strong> — read BOTH this markdown AND the HTML before doing anything else</li>
+<li><strong>After EVERY successful task</strong> — update BOTH files inline before moving on</li>
+<li><strong>At session end</strong> — final refresh of BOTH, deliver via outputs folder</li>
+<li><strong>If only one updates</strong> — task is NOT complete</li>
+</ol>
+<hr />
+<h2 id="status-legend">🚦 STATUS LEGEND</h2>
+<table>
+<thead>
+<tr>
+<th>Symbol</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>🟢</td>
+<td>Done &amp; verified</td>
+</tr>
+<tr>
+<td>🟡</td>
+<td>In progress now</td>
+</tr>
+<tr>
+<td>🔵</td>
+<td>Queued — next up</td>
+</tr>
+<tr>
+<td>⚪</td>
+<td>Scoped — later in sprint</td>
+</tr>
+<tr>
+<td>⏸️</td>
+<td>Parked — deferred post-sprint</td>
+</tr>
+<tr>
+<td>❌</td>
+<td>Blocked / needs decision</td>
+</tr>
+<tr>
+<td>⚠️</td>
+<td>Risk / watch item</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="headline-day-3-2026-06-07">🎯 HEADLINE — DAY 3 (2026-06-07)</h2>
+<p><strong>The autonomous scrape→ingest pipeline is PROVEN end-to-end.</strong> Job <code>ed784559</code> ran clean: Local Scraper exited rc 0, daemon loaded <strong>120 leads</strong> from JSON, KJLE ingest returned <code>status: processed</code> with <strong>zero errors</strong>. Every fix shipped tonight held.</p>
+<p><strong>One blocker remains before leads actually land:</strong> all 120 leads were filtered (<code>inserted_count: 0, filtered_count: 120</code>) due to a <strong>field-name casing mismatch</strong> in KJLE's ingest. Root-caused; one-block SC patch ready (see Blockers). Until patched, every scrape will filter 100%.</p>
+<hr />
+<h2 id="sprint-calendar-mon-62-mon-69">📅 SPRINT CALENDAR (Mon 6/2 → Mon 6/9)</h2>
+<table>
+<thead>
+<tr>
+<th>Day</th>
+<th>Theme</th>
+<th>Status</th>
+<th>Cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Day 1 (Mon 6/2)</td>
+<td>Phase 4 close + ES bug hotfix</td>
+<td>🟢 DONE</td>
+<td>$5.51</td>
+</tr>
+<tr>
+<td>Day 2 AM</td>
+<td>Connection pool fix</td>
+<td>🟢 DONE</td>
+<td>$0</td>
+</tr>
+<tr>
+<td>Day 2 PM</td>
+<td>Phase 4.2 backend (scrape queue + worker daemon)</td>
+<td>🟢 DONE</td>
+<td>$5.41</td>
+</tr>
+<tr>
+<td>Day 3 (landed 6/7)</td>
+<td>LS install + daemon live + pipeline proven</td>
+<td>🟢 <strong>DONE</strong> (1 SC patch pending)</td>
+<td>~$0</td>
+</tr>
+<tr>
+<td>Day 4</td>
+<td>n8n workflow build — 1 niche end-to-end</td>
+<td>⚪ scoped</td>
+<td>~$2-4</td>
+</tr>
+<tr>
+<td>Day 5</td>
+<td>Multi-niche + scraper trigger logic</td>
+<td>⚪ scoped</td>
+<td>~$2-3</td>
+</tr>
+<tr>
+<td>Day 6-7</td>
+<td>Stress test + monitoring</td>
+<td>⚪ scoped</td>
+<td>~$2-5</td>
+</tr>
+<tr>
+<td>Day 8 (Mon 6/9)</td>
+<td><strong>AUTONOMOUS LEAD PUMPING LIVE</strong></td>
+<td>🎯 target</td>
+<td>~$0-1</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Sprint spent so far:</strong> $10.92 (Day 3 added $0 — all Tier 0/1 diagnostics)
+<strong>Sprint budget remaining:</strong> $9-14 (target total: $15-25)</p>
+<hr />
+<h2 id="completed-day-3-local-scraper-pipeline-2026-06-07">✅ COMPLETED — DAY 3 (Local Scraper pipeline, 2026-06-07)</h2>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Status</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>LS files onto Z820</td>
+<td>🟢</td>
+<td><code>C:\Users\King James\OneDrive\Desktop\workers\local_scraper_daemon\</code> (OneDrive-redirected Desktop); Python 3.13.5</td>
+</tr>
+<tr>
+<td>Daemon live on Z820</td>
+<td>🟢</td>
+<td>Reverse-polling <code>/scrape/jobs/poll</code> every 15s; <code>X-Worker-API-Key</code> authenticates (returns <code>{"jobs":[]}</code>)</td>
+</tr>
+<tr>
+<td>Env vars set (Z820)</td>
+<td>🟢</td>
+<td><code>KJLE_API_BASE</code>, <code>WORKER_ID=z820</code>, <code>LOCAL_SCRAPER_SAVE_DIR=C:\KJLE\scrapes</code>, <code>LOCAL_SCRAPER_WEBHOOK_SECRET</code>, <code>KJLE_WORKER_API_KEY</code>, <code>LOCAL_SCRAPER_EXE_PATH</code></td>
+</tr>
+<tr>
+<td><strong>Backend gap 1 — ingest log table</strong></td>
+<td>🟢</td>
+<td><code>local_scraper_ingest_log</code> table created in Supabase (ingest had been fail-closed on missing table → <code>ingest_log_write_failed</code>)</td>
+</tr>
+<tr>
+<td><strong>Backend gap 2 — webhook secret</strong></td>
+<td>🟢</td>
+<td><code>LOCAL_SCRAPER_WEBHOOK_SECRET</code> set in Render <code>kjle-api</code> env (HMAC verify was fail-closed)</td>
+</tr>
+<tr>
+<td><strong>Backend gap 3 — LS output format</strong></td>
+<td>🟢</td>
+<td>Switched LS export CSV→JSON; daemon <code>_load_saved_lead_files</code> reads only <code>**/*.json</code>. LS JSON = top-level list of dicts ✓</td>
+</tr>
+<tr>
+<td>LS CLI contract verified</td>
+<td>🟢</td>
+<td><code>--target "&lt;exact scraper name&gt;"</code> + <code>--keyword</code> + <code>--location</code>; daemon builds 13-arg cmd. Requires saved settings file (Tools→Save Settings)</td>
+</tr>
+<tr>
+<td><strong>End-to-end run proven</strong></td>
+<td>🟢</td>
+<td>Job <code>ed784559</code>: rc 0 → 120 leads loaded → ingest <code>processed</code>, 0 errors</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Day 3 dispatch cost: $0</strong> (all Tier 0/1: vps_exec reads, Supabase SQL editor, Render env, GUI config)</p>
+<hr />
+<h2 id="active-blocker-120120-leads-filtered-root-caused">❌ ACTIVE BLOCKER — 120/120 leads filtered (root-caused)</h2>
+<p><strong>Symptom:</strong> Job <code>ed784559</code> ingest → <code>results_count: 120, inserted_count: 0, filtered_count: 120</code>.</p>
+<p><strong>Root cause:</strong> Field-name <strong>casing mismatch</strong>. <code>api/routes/local_scraper_ingest.py</code> → <code>_process_results</code> (L142-152) reads contact fields <strong>lowercase</strong> (<code>raw_lead.get("phone"/"email"/"website")</code>). Local Scraper JSON emits <strong>capitalized</strong> keys (<code>Phone</code>/<code>Email</code>/<code>Website</code>/<code>Name</code>/<code>FullAddress</code>). All three <code>.get()</code> return <code>None</code> per row → "no contact path" (L151) → every row filtered.</p>
+<p><strong>Fix (SC domain — receiver code, off-limits to worker-daemon seat):</strong> in <code>_process_results</code>, top of the <code>for raw_lead in results:</code> loop, after the <code>isinstance</code> check, add:</p>
+<pre><code class="language-python">            raw_lead = {
+                (k.lower() if isinstance(k, str) else k): v
+                for k, v in raw_lead.items()
+            }
+</code></pre>
+<p>Commit + redeploy <code>kjle-api</code>, re-fire one scrape, expect <code>inserted_count &gt; 0</code>. Alt locus: normalize in daemon before POST (ingest side is the cleaner contract boundary).</p>
+<p><strong>Owner:</strong> KJLE backend SC. <strong>Status:</strong> patch handed off, awaiting deploy.</p>
+<hr />
+<h2 id="kjle-api-flapping-root-caused-coordinated-fix">⚠️ kjle-api FLAPPING — root-caused (coordinated fix)</h2>
+<p><strong>Symptom:</strong> <code>kjle-api</code> goes "down/up dozens of times a day" — 502s on poll, <code>/health</code> itself timed out at 40s. Restored twice this session via Render restart (healthy ~130-195ms after).</p>
+<p><strong>Root cause:</strong> In-process <code>AsyncIOScheduler</code> (<code>api/routes/scheduler.py</code> <code>setup_scheduler</code>, ~13 jobs, started in <code>api/main.py</code> lifespan) runs <strong>synchronous blocking</strong> Supabase/external calls directly on the single event loop — <strong>zero</strong> <code>asyncio.to_thread</code> / <code>run_in_executor</code> / <code>ThreadPoolExecutor</code> offloading. A blocking job stalls the whole loop, so even static-dict <code>/health</code> hangs. Pool fix <code>813f75b</code> only added a 30s DB timeout — did not address loop blocking.</p>
+<p><strong>Fix plan (SC domain — <code>scheduler.py</code> PROTECTED):</strong>
+- <strong>Primary:</strong> move scheduler to a separate Render <strong>Background Worker</strong> service.
+- <strong>Secondary:</strong> wrap blocking DB calls in <code>asyncio.to_thread</code>; consider multiple uvicorn workers.
+- <strong>Coordination required:</strong> ~10 API consumers, 4 of them real-time fail-closed (Telehealth/AVA, DemoBoosterz, KJ Sales Agentz, n8n <code>/dnc/check</code>). Flapping intermittently halts live outreach empire-wide. Needs SC sign-off + Render config change + one cost-approved T3 dispatch.</p>
+<p><strong>Owner:</strong> KJLE backend SC. <strong>Status:</strong> root cause documented, fix queued.</p>
+<hr />
+<h2 id="queued-phase-5-day-4-7">🔵 QUEUED — Phase 5 (Day 4-7)</h2>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Owner</th>
+<th>Cost</th>
+<th>Conf.</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>SC: land the casing patch</strong> (unblocks leads)</td>
+<td>KJLE SC</td>
+<td>$0 (T1)</td>
+<td>High</td>
+</tr>
+<tr>
+<td>Wire Find Leads "Start Scrape" button → <code>/scrape/start</code> (Lovable prompt)</td>
+<td>Jim (paste)</td>
+<td>$0</td>
+<td>High</td>
+</tr>
+<tr>
+<td>Build <code>GET /kjle/v1/leads/eligible-for-campaign</code> helper</td>
+<td>Claude (CC)</td>
+<td>✓ $1-2</td>
+<td>High</td>
+</tr>
+<tr>
+<td>n8n workflow: 1 niche end-to-end (route → create → attach)</td>
+<td>Jim + Claude</td>
+<td>? $0-1</td>
+<td>Med</td>
+</tr>
+<tr>
+<td>Test campaign creates in RI manually first</td>
+<td>Jim</td>
+<td>$0</td>
+<td>High</td>
+</tr>
+<tr>
+<td>Lead inventory monitor (triggers scraper if pool &lt; N)</td>
+<td>Claude (CC)</td>
+<td>✓ $2-3</td>
+<td>Med-High</td>
+</tr>
+<tr>
+<td>Monitoring/alerting for autonomous failures</td>
+<td>Claude (CC)</td>
+<td>? $2-5</td>
+<td>Low</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Phase 5 total estimated cost: ~$6-15</strong></p>
+<hr />
+<h2 id="architecture-status">🏗️ ARCHITECTURE STATUS</h2>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>URL/Location</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>KJLE API</td>
+<td>https://kjle-api.onrender.com</td>
+<td>🟢 Live ⚠️ flapping (root-caused — scheduler blocking loop)</td>
+</tr>
+<tr>
+<td>KJLE Lead Finder UI</td>
+<td>https://kjleadzempire.com</td>
+<td>🟢 Live, 4 tabs</td>
+</tr>
+<tr>
+<td>KJLE Supabase</td>
+<td>dhzpwobfihrprlcxqjbq</td>
+<td>🟢 Small compute tier</td>
+</tr>
+<tr>
+<td>EmpireSenderz API</td>
+<td>https://kjle-sender.onrender.com</td>
+<td>🟢 Live, CR.3 routing endpoints</td>
+</tr>
+<tr>
+<td>Jim Brain</td>
+<td>https://jim-brain-production.up.railway.app</td>
+<td>🟢 Live (intermittent 500s on memory writes → fall back to brain_log)</td>
+</tr>
+<tr>
+<td>Brain MCP</td>
+<td>https://kje-mcp.onrender.com</td>
+<td>🟢 Live</td>
+</tr>
+<tr>
+<td>RackNerd VPS</td>
+<td>192.161.173.97</td>
+<td>🟢 CC dispatcher on 8091</td>
+</tr>
+<tr>
+<td>CSV uploader cron</td>
+<td><code>/opt/kjle_csv_uploader.py</code> (10pm nightly)</td>
+<td>🟢 Live</td>
+</tr>
+<tr>
+<td>Worker daemon code</td>
+<td>GitHub <code>workers/local_scraper_daemon/</code> (commit <code>d42b54a</code>)</td>
+<td>🟢 Shipped</td>
+</tr>
+<tr>
+<td><strong>Local Scraper (Z820)</strong></td>
+<td>Z820 desktop</td>
+<td>🟢 <strong>Installed + daemon live &amp; polling</strong></td>
+</tr>
+<tr>
+<td>Local Scraper (VPS)</td>
+<td>RackNerd VPS</td>
+<td>🟡 Awaiting license #2 + Wine (later)</td>
+</tr>
+<tr>
+<td>n8n autonomous orchestrator</td>
+<td>Railway</td>
+<td>⚪ Not built yet</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="known-risks-watch-items">⚠️ KNOWN RISKS / WATCH ITEMS</h2>
+<table>
+<thead>
+<tr>
+<th>Risk</th>
+<th>Likelihood</th>
+<th>Cost impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SC casing patch slips → no leads land</td>
+<td>—</td>
+<td>$0 (blocks progress, not budget)</td>
+</tr>
+<tr>
+<td>kjle-api flapping recurs during n8n testing</td>
+<td>Medium-High</td>
+<td>$0 to restart; fix is coordinated T3</td>
+</tr>
+<tr>
+<td>LS license #2 / Wine for VPS worker</td>
+<td>Medium</td>
+<td>$0 — install time</td>
+</tr>
+<tr>
+<td>n8n learning curve eats Day 4-5</td>
+<td>Medium</td>
+<td>+$2-3</td>
+</tr>
+<tr>
+<td>Scope creep — "just add X"</td>
+<td>High</td>
+<td>+$3-5 per off-roadmap dispatch — <strong>biggest budget risk</strong></td>
+</tr>
+<tr>
+<td>Brain memory 500s</td>
+<td>Low</td>
+<td>$0 — fall back to brain_log</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="external-dependencies-sc-coordination">🤝 EXTERNAL DEPENDENCIES — SC COORDINATION</h2>
+<h3 id="kjle-backend-sc-new-this-seats-handoffs">KJLE backend SC (NEW — this seat's handoffs)</h3>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Casing patch in <code>_process_results</code> (lands leads)</td>
+<td>🟡 Handed off</td>
+</tr>
+<tr>
+<td>Scheduler split → Background Worker (flapping fix)</td>
+<td>🟡 Root cause documented</td>
+</tr>
+<tr>
+<td><code>/opt/kjle</code> working tree cleanup (uncommitted dnc.py +261, scheduler.py, .gitignore on <code>phase4-email-clean-poller-and-logging-fix</code>)</td>
+<td>⚠️ SC-owned — author commits/stashes; this seat will NOT git-write <code>/opt/kjle</code></td>
+</tr>
+<tr>
+<td>DNC vendor swap (RealValidation/RealValidito) — edits same <code>dnc.py</code></td>
+<td>⏸️ Downstream of tree cleanup</td>
+</tr>
+</tbody>
+</table>
+<h3 id="empiresenderz-sc">EmpireSenderz SC</h3>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Bug 1 (int→email) fixed at <code>1bbdeb0</code></td>
+<td>🟢</td>
+</tr>
+<tr>
+<td>Bug 1.1 (set-accounts 500 on valid payload)</td>
+<td>🟡 capture RI UI request via DevTools</td>
+</tr>
+<tr>
+<td>Bug 2.1 (rollback path / orphan campaigns)</td>
+<td>🟡 add logging around <code>ri_delete</code></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="cost-protocol-5-tier-framework">💰 COST PROTOCOL — 5-TIER FRAMEWORK</h2>
+<table>
+<thead>
+<tr>
+<th>Tier</th>
+<th>What</th>
+<th>Cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T0</td>
+<td>vps_exec / terminal / browser dev tools</td>
+<td>$0</td>
+</tr>
+<tr>
+<td>T1</td>
+<td>GitHub web UI edit (2-20 lines)</td>
+<td>$0</td>
+</tr>
+<tr>
+<td>T2</td>
+<td>Claude writes patch, Jim applies</td>
+<td>$0</td>
+</tr>
+<tr>
+<td>T3</td>
+<td>Single combined CC dispatch (build+verify+merge)</td>
+<td>$1.50-$3</td>
+</tr>
+<tr>
+<td>T4</td>
+<td>Multiple sequential dispatches (rare, explicit approval)</td>
+<td>$5+</td>
+</tr>
+</tbody>
+</table>
+<p><strong>5 absolute rules:</strong> (1) never dispatch CC just to run curl; (2) never dispatch CC just to verify truth; (3) never dispatch CC for drain/batch/loop — use vps_exec; (4) never split chaperone + merge; (5) when uncertain, <strong>ASK Jim before spending.</strong> State verified cost BEFORE any dispatch; wait for explicit Y/N.</p>
+<hr />
+<h2 id="standing-reminders">📌 STANDING REMINDERS</h2>
+<ul>
+<li>📌 Roadmap dual-update discipline — refresh both .md and .html after every successful task</li>
+<li>📌 Cost protocol — state verified cost BEFORE any T3+ dispatch, get explicit Y/N</li>
+<li>📌 Build card v9 refresh needed</li>
+<li>📌 Add/test "Send to DemoBoosterz" from Lead Finder after Tour demo</li>
+<li>📌 Schedule local backups for <code>Documents/GitHub</code></li>
+<li>📌 EmpireSenderz: prune 83 stale Instantly rows in mailbox_fleet</li>
+<li>📌 EmpireSenderz: <code>reachinbox_ltd_1</code> empty workspace decision</li>
+<li>📌 Promote Z820 daemon from foreground to Task Scheduler once stable</li>
+<li>📌 vps_exec cannot send master <code>x-api-key</code> (secret denylist) — Jim runs master-auth POSTs himself</li>
+</ul>
+<hr />
+<h2 id="next-immediate-action">🎯 NEXT IMMEDIATE ACTION</h2>
+<ol>
+<li><strong>KJLE SC:</strong> apply the <code>_process_results</code> casing patch + redeploy <code>kjle-api</code>.</li>
+<li>Re-fire one test scrape → confirm <code>inserted_count &gt; 0</code>.</li>
+<li>Wire Find Leads "Start Scrape" button (Lovable prompt — Claude writes, Jim pastes).</li>
+<li>Begin n8n 1-niche workflow.</li>
+</ol>
+<hr />
+<p><em>Centralized Empire Roadmap v1.3 — DevelopingRiches Inc — Jim Harris</em>
+<em>Updated after every successful task — markdown + HTML kept in sync</em></p>
   </div>
-
-  <!-- Cost annotation legend -->
-  <div class="cost-legend">
-    <span><strong>Cost annotations:</strong></span>
-    <span><code class="task-cost free">$0</code> = Tier 0/1 (free — vps_exec or GitHub web UI edit)</span>
-    <span><code class="task-cost paid calibrated">✓ $X</code> = calibrated from real past dispatches</span>
-    <span><code class="task-cost paid guessed">? $X</code> = estimated, no calibration data yet</span>
-  </div>
-
-  <!-- Legend -->
-  <div class="legend">
-    <div class="legend-item"><span class="legend-dot dot-green"></span>Done</div>
-    <div class="legend-item"><span class="legend-dot dot-yellow"></span>In progress</div>
-    <div class="legend-item"><span class="legend-dot dot-blue"></span>Queued next</div>
-    <div class="legend-item"><span class="legend-dot dot-grey"></span>Scoped later</div>
-    <div class="legend-item"><span class="legend-dot dot-pause"></span>Parked</div>
-    <div class="legend-item"><span class="legend-dot dot-red"></span>Blocked</div>
-    <div class="legend-item"><span class="legend-dot dot-warn"></span>Watch</div>
-  </div>
-
-  <!-- Sprint Timeline (now with daily costs) -->
-  <section>
-    <h2>Sprint timeline <span class="phase-cost">$13.92 spent · ~$6-11 remaining</span></h2>
-    <div class="timeline">
-      <div class="day done">
-        <div class="day-label">Mon 6/2</div>
-        <div class="day-theme">Phase 4 close</div>
-        <div class="day-cost">$5.51 ✓</div>
-      </div>
-      <div class="day done">
-        <div class="day-label">Tue 6/3 AM</div>
-        <div class="day-theme">Connection pool fix</div>
-        <div class="day-cost">$0 ✓</div>
-      </div>
-      <div class="day done">
-        <div class="day-label">Tue 6/3 PM</div>
-        <div class="day-theme">Phase 4.2 backend</div>
-        <div class="day-cost">$5.41 ✓</div>
-      </div>
-      <div class="day done">
-        <div class="day-label">Wed 6/4 → Thu 6/5</div>
-        <div class="day-theme">3 RI bugs fixed E2E</div>
-        <div class="day-cost">$3.00 ✓</div>
-      </div>
-      <div class="day">
-        <div class="day-label">Thu 6/5</div>
-        <div class="day-theme">n8n 1 niche</div>
-        <div class="day-cost">~$2-4</div>
-      </div>
-      <div class="day">
-        <div class="day-label">Fri 6/6</div>
-        <div class="day-theme">Multi-niche</div>
-        <div class="day-cost">~$2-3</div>
-      </div>
-      <div class="day">
-        <div class="day-label">Sat-Sun</div>
-        <div class="day-theme">Stress test</div>
-        <div class="day-cost">~$2-5</div>
-      </div>
-      <div class="day target">
-        <div class="day-label">★ Mon 6/9</div>
-        <div class="day-theme">LIVE</div>
-        <div class="day-cost">~$0</div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Phase 4 Closed -->
-  <section>
-    <h2>Phase 4 — closed <span class="count">14 items · $5.51 spent</span></h2>
-    <div class="task-grid">
-      <div class="task"><div class="task-dot dot-green"></div><div class="task-text">L1 Core ingest + DNC restructure</div><span class="task-cost paid">$0</span></div>
-      <div class="task"><div class="task-dot dot-green"></div><div class="task-text">L2 Cache optimization (soft TTL)</div><span class="task-cost paid">prior</span></div>
-      <div class="task"><div class="task-dot dot-green"></div><div class="task-text">L3 Protective filters (TCPA + leadcrap + carrier)</div><span class="task-cost paid">prior</span></div>
-      <div class="task"><div class="task-dot dot-green"></div><div class="task-text">L4 Find Leads UI tab</div><span class="task-cost paid">prior</span></div>
-      <div class="task"><div class="task-dot dot-green"></div><div class="task-text">L4 Campaign Push UI tab</div><span class="task-cost paid">prior</span></div>
-      <div class="task"><div class="task-dot dot-green"></div><div class="task-text">L4 Cost Command Center UI tab</div><span class="task-cost paid">prior</span></div>
-      <div class="task"><div class="task-dot dot-green"></div><div class="task-text">L4 DNC Center UI tab + 4 endpoints</div><span class="task-cost paid calibrated">$1.51</span></div>
-      <div class="task"><div class="task-dot dot-green"></div><div class="task-text">L5 Bulk scrub (596,764 leads, 100% coverage)</div><span class="task-cost paid">prior</span></div>
-      <div class="task"><div class="task-dot dot-green"></div><div class="task-text">L5B Bulk-update patch (50s → 2s per chunk)</div><span class="task-cost paid calibrated">$1.50</span></div>
-      <div class="task"><div class="task-dot dot-green"></div><div class="task-text">ES Bug 1 + 2 fix (translation + rollback + index)<div class="note">re-test pending</div></div><span class="task-cost paid calibrated">$2.50</span></div>
-      <div class="task"><div class="task-dot dot-green"></div><div class="task-text">Render Standard tier ($25/mo)</div><span class="task-cost free">$0</span></div>
-      <div class="task"><div class="task-dot dot-green"></div><div class="task-text">Supabase Small compute (~$5/mo net)</div><span class="task-cost free">$0</span></div>
-      <div class="task"><div class="task-dot dot-green"></div><div class="task-text">DB connection pool fix (kills health-hung)</div><span class="task-cost free">$0</span></div>
-      <div class="task"><div class="task-dot dot-green"></div><div class="task-text">Migrations applied via Supabase SQL editor</div><span class="task-cost free">$0</span></div>
-    </div>
-  </section>
-
-  <!-- Phase 4.2 (current) -->
-  <section>
-    <h2>Phase 4.2 — Local Scraper integration <span class="count">backend complete · $5.41 spent · ~$0-1 remaining</span></h2>
-    <div class="task-grid">
-      <div class="task"><div class="task-dot dot-green"></div><div class="task-text">/scrape/start endpoint + queue endpoints + migration</div><span class="task-cost paid calibrated">$2.91</span></div>
-      <div class="task"><div class="task-dot dot-green"></div><div class="task-text">scrape_jobs table migration applied</div><span class="task-cost free">$0</span></div>
-      <div class="task"><div class="task-dot dot-green"></div><div class="task-text">WORKER_API_KEY in Render env</div><span class="task-cost free">$0</span></div>
-      <div class="task"><div class="task-dot dot-green"></div><div class="task-text">Worker daemon code shipped (workers/local_scraper_daemon/)</div><span class="task-cost paid calibrated">$2.50</span></div>
-      <div class="task"><div class="task-dot dot-green"></div><div class="task-text">Bug 1 diagnostic logging deployed</div><span class="task-cost free">$0</span></div>
-      <div class="task"><div class="task-dot dot-yellow"></div><div class="task-text">LS license email<div class="note">Jim awaiting support response</div></div><span class="task-cost free">$0</span></div>
-      <div class="task"><div class="task-dot dot-blue"></div><div class="task-text">Install LS on Z820 (license #1)</div><span class="task-cost free">$0</span></div>
-      <div class="task"><div class="task-dot dot-blue"></div><div class="task-text">Install LS on VPS (license #2)<div class="note">may need Wine</div></div><span class="task-cost free">$0</span></div>
-      <div class="task"><div class="task-dot dot-blue"></div><div class="task-text">Deploy daemon on Z820 (Task Scheduler)</div><span class="task-cost free">$0</span></div>
-      <div class="task"><div class="task-dot dot-blue"></div><div class="task-text">Deploy daemon on VPS (systemd)</div><span class="task-cost free">$0</span></div>
-      <div class="task"><div class="task-dot dot-blue"></div><div class="task-text">First end-to-end scrape test</div><span class="task-cost free">$0</span></div>
-      <div class="task"><div class="task-dot dot-blue"></div><div class="task-text">Wire Find Leads UI button to /scrape/start<div class="note">Lovable prompt</div></div><span class="task-cost free">$0</span></div>
-    </div>
-  </section>
-
-  <!-- Phase 5 -->
-  <section>
-    <h2>Phase 5 — Autonomous Orchestrator <span class="count">queued for Day 4-7 · est ~$6-12</span></h2>
-    <div class="task-grid">
-      <div class="task"><div class="task-dot dot-blue"></div><div class="task-text">/leads/eligible-for-campaign helper endpoint<div class="note">paginated lead pull for n8n</div></div><span class="task-cost paid calibrated">$1-2</span></div>
-      <div class="task"><div class="task-dot dot-grey"></div><div class="task-text">n8n workflow: 1 niche end-to-end<div class="note">route → create → attach loop</div></div><span class="task-cost paid guessed">$0-1</span></div>
-      <div class="task"><div class="task-dot dot-grey"></div><div class="task-text">Manual test campaign through full loop</div><span class="task-cost free">$0</span></div>
-      <div class="task"><div class="task-dot dot-grey"></div><div class="task-text">Schedule cron after manual success</div><span class="task-cost free">$0</span></div>
-      <div class="task"><div class="task-dot dot-grey"></div><div class="task-text">Wire 2-3 more niches into n8n</div><span class="task-cost paid guessed">$0-1</span></div>
-      <div class="task"><div class="task-dot dot-grey"></div><div class="task-text">Lead inventory monitor (auto-triggers scraper)<div class="note">new endpoint + cron</div></div><span class="task-cost paid calibrated">$2-3</span></div>
-      <div class="task"><div class="task-dot dot-grey"></div><div class="task-text">Add monitoring/alerting for autonomous failures<div class="note">scope unclear, buffer</div></div><span class="task-cost paid guessed">$2-5</span></div>
-      <div class="task"><div class="task-dot dot-grey"></div><div class="task-text">Sat-Sun stress test fixes (anything that breaks)<div class="note">unpredictable buffer</div></div><span class="task-cost paid guessed">$0-3</span></div>
-    </div>
-  </section>
-
-  <!-- External coordination + Risks two columns -->
-  <div class="columns">
-    <section>
-      <h2>External coordination</h2>
-      <table class="compact">
-        <thead><tr><th>Item</th><th>Owner</th><th>Status</th></tr></thead>
-        <tbody>
-          <tr><td>ES sprint brief sent</td><td class="dim">→ ES SC</td><td><span class="legend-dot dot-green"></span> Sent</td></tr>
-          <tr><td>ES Bug 1 + 2 fix shipped</td><td class="dim">→ ES SC</td><td><span class="legend-dot dot-green"></span> Live</td></tr>
-          <tr><td>ES Bug 1 re-verify with diagnostic logs</td><td class="dim">← ES SC</td><td><span class="legend-dot dot-yellow"></span> Awaiting test</td></tr>
-          <tr><td>ES 4-question reply</td><td class="dim">← ES SC</td><td><span class="legend-dot dot-yellow"></span> Due EOD Wed</td></tr>
-          <tr><td>DemoBoosterz coordination brief</td><td class="dim">→ DemoBoosterz</td><td><span class="legend-dot dot-grey"></span> Not started</td></tr>
-          <tr><td>DemoEnginez coordination brief</td><td class="dim">→ DemoEnginez</td><td><span class="legend-dot dot-grey"></span> Not started</td></tr>
-        </tbody>
-      </table>
-    </section>
-
-    <section>
-      <h2>Risks &amp; watch items</h2>
-      <table class="compact">
-        <thead><tr><th>Risk</th><th>Impact ($)</th></tr></thead>
-        <tbody>
-          <tr><td>LS license arrival delay</td><td class="cost">$0 — blocks progress not budget</td></tr>
-          <tr><td>LS on Linux VPS may need Wine</td><td class="cost">$0 — install time, not dispatch</td></tr>
-          <tr><td>n8n learning curve eats Day 4-5</td><td class="cost">+$2-3 if extra dispatches needed</td></tr>
-          <tr><td>RI 500 on set-accounts root cause unknown</td><td class="cost">+$1-3 if Bug 2.1 hotfix needed</td></tr>
-          <tr><td>Scope creep ("just add X")</td><td class="cost">~$3-5 per off-roadmap dispatch</td></tr>
-          <tr><td>Brain memory 500s</td><td class="cost">$0 — fall back to brain_log</td></tr>
-        </tbody>
-      </table>
-    </section>
-  </div>
-
-  <!-- Cost framework + tier breakdown -->
-  <section>
-    <h2>Cost protocol — 5-tier framework</h2>
-    <table class="tier-table">
-      <thead><tr><th>Tier</th><th>What</th><th>When to use</th><th>Cost</th></tr></thead>
-      <tbody>
-        <tr><td class="tier-T0"><strong>T0</strong></td><td>vps_exec / terminal / browser dev tools</td><td>Diagnostics, verification, reads</td><td class="cost">$0</td></tr>
-        <tr><td class="tier-T1"><strong>T1</strong></td><td>GitHub web UI edit</td><td>2-20 line code changes (Jim's preferred manual)</td><td class="cost">$0</td></tr>
-        <tr><td class="tier-T2"><strong>T2</strong></td><td>Claude writes patch, Jim applies</td><td>Small file changes Jim prefers to apply</td><td class="cost">$0</td></tr>
-        <tr><td class="tier-T3"><strong>T3</strong></td><td>Single combined CC dispatch (build+verify+merge)</td><td>Real architectural slices</td><td class="cost">$1.50-$3 typical</td></tr>
-        <tr><td class="tier-T4"><strong>T4</strong></td><td>Multiple sequential dispatches</td><td>Rare, requires explicit Jim approval</td><td class="cost">$5+</td></tr>
-      </tbody>
-    </table>
-  </section>
-
-  <!-- Sprint cost tracking -->
-  <section>
-    <h2>Sprint cost tracking</h2>
-    <div class="cost-grid">
-      <div class="cost-card">
-        <div class="cost-label">Day 1 — Phase 4 close</div>
-        <div class="cost-amount">$5.51</div>
-        <div class="cost-detail">L5B + DNC + ES hotfix</div>
-      </div>
-      <div class="cost-card">
-        <div class="cost-label">Day 2 AM — pool fix</div>
-        <div class="cost-amount">$0</div>
-        <div class="cost-detail">Tier 1 GitHub edit</div>
-      </div>
-      <div class="cost-card">
-        <div class="cost-label">Day 2 PM — Phase 4.2</div>
-        <div class="cost-amount">$5.41</div>
-        <div class="cost-detail">Scrape queue + worker daemon</div>
-      </div>
-      <div class="cost-card budget">
-        <div class="cost-label">Spent total</div>
-        <div class="cost-amount" style="color: var(--accent);">$10.92</div>
-        <div class="cost-detail">3 dispatches + 1 free fix</div>
-      </div>
-      <div class="cost-card budget">
-        <div class="cost-label">Remaining budget</div>
-        <div class="cost-amount" style="color: var(--accent);">~$9-14</div>
-        <div class="cost-detail">For Days 3-7 (target $15-25 total)</div>
-      </div>
-      <div class="cost-card">
-        <div class="cost-label">Recurring infra</div>
-        <div class="cost-amount" style="color: var(--text-dim); font-size: 18px;">+$23/mo</div>
-        <div class="cost-detail">Render Standard + Supabase Small</div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Forward-looking budget detail -->
-  <section>
-    <h2>Forward budget — Days 3-7 (estimates)</h2>
-    <table class="compact">
-      <thead><tr><th>Day</th><th>Items</th><th>Estimate</th><th>Confidence</th></tr></thead>
-      <tbody>
-        <tr><td><strong>Day 3 (Wed)</strong></td><td>LS install (your hands, free) + daemon deploy + Lovable UI wire</td><td class="cost">$0-1</td><td class="dim">High — mostly $0 work</td></tr>
-        <tr><td><strong>Day 4 (Thu)</strong></td><td>/leads/eligible-for-campaign endpoint + n8n workflow start</td><td class="cost">$2-4</td><td class="dim">Medium — n8n unknown</td></tr>
-        <tr><td><strong>Day 5 (Fri)</strong></td><td>Multi-niche + lead inventory monitor</td><td class="cost">$2-3</td><td class="dim">Medium-high — calibrated for monitor endpoint</td></tr>
-        <tr><td><strong>Day 6-7 (Sat-Sun)</strong></td><td>Stress test + monitoring + buffer for fixes</td><td class="cost">$2-5</td><td class="dim">Low — buffer territory</td></tr>
-        <tr><td><strong>Day 8 (Mon)</strong></td><td>Go-live polish (Tier 0/1 mostly)</td><td class="cost">$0-1</td><td class="dim">High — should be just polish</td></tr>
-        <tr><td><strong>Worst case</strong></td><td>All maxes hit, plus 1 unscoped surprise</td><td class="cost">+$3-5</td><td class="dim">Buffer</td></tr>
-      </tbody>
-    </table>
-    <p style="color: var(--text-faint); font-size: 12px; margin-top: 12px; font-style: italic;">
-      Calibrated estimates (✓) are anchored to real past dispatches in this session (mean $2.30, median $2.50).
-      Guessed estimates (?) have no calibration data — primarily n8n work since we haven't built one in this empire yet.
-      Anything off-roadmap will be flagged for explicit Y/N approval before spending.
-    </p>
-  </section>
-
-  <!-- Cross-project touchpoints -->
-  <section>
-    <h2>🔗 Cross-project touchpoints <span class="count">integration contracts · last verified 2026-06-06</span></h2>
-    <p style="color: var(--text-dim); font-size: 13px; margin-bottom: 16px;">
-      This section is the <strong style="color:var(--text);">integration contract</strong> between KJLE and every other empire project.
-      SCs from other projects can read this section instead of digging into KJLE source.
-      If you change ANY contract below, update this section in the same commit as the code change, then ping the affected SC.
-    </p>
-
-    <h3 style="font-size: 14px; color: var(--accent); margin: 20px 0 12px; font-weight: 600;">⬇️ Incoming — what KJLE RECEIVES</h3>
-    <div class="task-grid">
-      <div class="task">
-        <div class="task-dot dot-green"></div>
-        <div class="task-text">
-          <div class="name"><strong>Telehealth (AVA) → DNC compliance check</strong></div>
-          <div class="note">
-            <code style="color:var(--cyan);">GET /kjle/v1/dnc/check/{phone}</code> · Auth: <code>x-api-key</code><br>
-            Fail-CLOSED on KJLE outage — TH won't dial if KJLE unreachable<br>
-            <span style="color: var(--green);">Last verified: 2026-05-30</span>
-          </div>
-        </div>
-      </div>
-      <div class="task">
-        <div class="task-dot dot-green"></div>
-        <div class="task-text">
-          <div class="name"><strong>Any empire app → Opt-out / suppression push</strong></div>
-          <div class="note">
-            <code style="color:var(--cyan);">POST /kjle/v1/dnc/add</code> · Body: <code>{phone, reason, source, notes?}</code><br>
-            Used by Telehealth (replied-stop) + ReachInbox webhooks (unsubscribed/complained)
-          </div>
-        </div>
-      </div>
-      <div class="task">
-        <div class="task-dot dot-green"></div>
-        <div class="task-text">
-          <div class="name"><strong>ReachInbox webhook → suppression events</strong></div>
-          <div class="note">
-            <code style="color:var(--cyan);">POST /kjle/v1/dnc/webhooks/reachinbox</code> · HMAC-SHA256 signed<br>
-            Events: unsubscribed, bounced_hard, replied (stop keywords), complained
-          </div>
-        </div>
-      </div>
-      <div class="task">
-        <div class="task-dot dot-green"></div>
-        <div class="task-text">
-          <div class="name"><strong>Local Scraper daemon → lead ingest (Phase 4.2)</strong></div>
-          <div class="note">
-            <code style="color:var(--cyan);">POST /kjle/v1/ingest/localscraper</code> · HMAC-SHA256 signed<br>
-            Caller: workers/local_scraper_daemon/daemon.py on Z820 + VPS<br>
-            Pipeline: ingest → classify → DNC/TCPA filter → leads table
-          </div>
-        </div>
-      </div>
-      <div class="task">
-        <div class="task-dot dot-green"></div>
-        <div class="task-text">
-          <div class="name"><strong>Local Scraper workers → job polling</strong></div>
-          <div class="note">
-            <code style="color:var(--cyan);">GET /kjle/v1/scrape/jobs/poll?worker_id={z820|vps}</code><br>
-            Auth: <code>X-Worker-API-Key</code> (separate from master key)<br>
-            Atomic claim from scrape_jobs table
-          </div>
-        </div>
-      </div>
-      <div class="task">
-        <div class="task-dot dot-green"></div>
-        <div class="task-text">
-          <div class="name"><strong>Operator UI → start scrape</strong></div>
-          <div class="note">
-            <code style="color:var(--cyan);">POST /kjle/v1/scrape/start</code> · Auth: x-api-key<br>
-            Caller: KJLE Lead Finder UI "Start Scrape" button
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <h3 style="font-size: 14px; color: var(--accent); margin: 24px 0 12px; font-weight: 600;">⬆️ Outgoing — what KJLE SENDS</h3>
-    <div class="task-grid">
-      <div class="task">
-        <div class="task-dot dot-green"></div>
-        <div class="task-text">
-          <div class="name"><strong>EmpireSenderz → routing layer (3-step flow)</strong></div>
-          <div class="note">
-            (1) <code style="color:var(--cyan);">POST /sender/v1/route</code> → returns account_ids<br>
-            (2) <code style="color:var(--cyan);">POST /kjle/v1/reachinbox/campaigns/create</code> with account_ids<br>
-            (3) <code style="color:var(--cyan);">POST /sender/v1/route/{id}/attach</code> with provider_campaign_id<br>
-            <span style="color:var(--text-dim);">Contract LOCKED: account_ids = List[int]</span>
-          </div>
-        </div>
-      </div>
-      <div class="task">
-        <div class="task-dot dot-green"></div>
-        <div class="task-text">
-          <div class="name"><strong>ReachInbox → campaign send (KJLE owns all RI campaign I/O)</strong></div>
-          <div class="note">
-            Base: <code>api.reachinbox.ai/api/v1</code> · Bearer auth<br>
-            Endpoints used: campaigns/create, add-sequence, set-schedule, update-details, set-accounts (key: <strong>accountsToUse</strong>), <strong>/leads/add</strong> (NOT addLeadsToCampaign), start, pause<br>
-            <span style="color: var(--warn);">⚠️ RI has NO delete endpoint — orphan cleanup is manual</span>
-          </div>
-        </div>
-      </div>
-      <div class="task">
-        <div class="task-dot dot-green"></div>
-        <div class="task-text">
-          <div class="name"><strong>DemoEnginez → lead push</strong></div>
-          <div class="note">
-            <code style="color:var(--cyan);">https://wvqifxycceixsiwsudve.supabase.co/functions/v1/receive-kjle-leads</code><br>
-            Edge function, API key in body, dedup by phone<br>
-            <span style="color: var(--green);">Last verified: 2026-04-11</span>
-          </div>
-        </div>
-      </div>
-      <div class="task">
-        <div class="task-dot dot-yellow"></div>
-        <div class="task-text">
-          <div class="name"><strong>DemoBoosterz → lead push (pending)</strong></div>
-          <div class="note">
-            Architecture scaffolded, not wired. Pending DemoBoosterz Tour demo completion.
-          </div>
-        </div>
-      </div>
-      <div class="task">
-        <div class="task-dot dot-yellow"></div>
-        <div class="task-text">
-          <div class="name"><strong>ReputationBombz → webhook (pending integration)</strong></div>
-          <div class="note">
-            Not yet wired. RB SC proposes contract first; KJLE builds push endpoint to match.
-          </div>
-        </div>
-      </div>
-      <div class="task">
-        <div class="task-dot dot-green"></div>
-        <div class="task-text">
-          <div class="name"><strong>EmpireSenderz → shared Supabase</strong></div>
-          <div class="note">
-            Shared project: dhzpwobfihrprlcxqjbq<br>
-            <strong>KJLE owns:</strong> leads, segments, dnc_*, scrape_jobs, enrichment_*<br>
-            <strong>Sender owns (read-only from KJLE):</strong> mailbox_fleet, sending_domains, webhook_events
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <p style="color: var(--text-faint); font-size: 11px; margin-top: 18px; font-style: italic;">
-      Maintenance: whenever you change an integration contract, update this section in the SAME commit as the code change. Then ping the affected SC.
-      Full detail with auth specifics and payload shapes is in KJ_EMPIRE_ROADMAP.md.
-    </p>
-  </section>
-
-  <!-- Pinned -->
-  <section>
-    <h2>Standing reminders</h2>
-    <div class="pin"><span class="label">📌 Pin</span>Roadmap.html + .md update discipline — refresh BOTH after every successful task</div>
-    <div class="pin"><span class="label">📌 Pin</span>Cost protocol: state verified cost BEFORE any T3+ dispatch, get explicit Y/N</div>
-    <div class="pin"><span class="label">📌 Pin</span>Build card v9 refresh (current is v8 from April 2026, pre-Phase 4)</div>
-    <div class="pin"><span class="label">📌 Pin</span>Add/test "Send to DemoBoosterz" from Lead Finder after DemoBoosterz Tour demo</div>
-    <div class="pin"><span class="label">📌 Pin</span>Schedule local backups for Documents/GitHub folder</div>
-    <div class="pin"><span class="label">📌 Pin</span>EmpireSenderz: prune 83 stale Instantly rows in mailbox_fleet</div>
-  </section>
-
-  <footer>
-    KJ Empire centralized roadmap · v1.2 with calibrated cost annotations · ✓ = real dispatch data · ? = no calibration yet · Claude updates HTML + MD after every successful task
-  </footer>
+  <footer>Auto-generated by scripts/build_roadmap_html.py · edit the .md, the .html rebuilds itself.</footer>
 </div>
 </body>
 </html>
