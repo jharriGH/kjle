@@ -32,6 +32,7 @@ from ..database import get_db
 from ..lib import cost_guard
 from ..lib.cache_refresh import refresh_phone_in_background
 from ..lib.dnc_provider import DNCResult, get_active_provider
+from ..lib.carrier_lookup import lookup_line_type_from_prefix
 from ..lib.phone_filters import classify_phone_quality
 from ..lib.phone_utils import normalize_phone
 from ..lib.tcpa_check import is_tcpa_litigator
@@ -51,6 +52,12 @@ def verify_api_key(x_api_key: str = Header(...)):
 # ── Constants ────────────────────────────────────────────────────────────────
 SEARCHBUG_COST_PER_LOOKUP_USD = 0.0214
 SCRUB_BATCH_MAX               = 100
+
+# Hard state-level suppression — calls into FL/OK/TX are categorically
+# blocked regardless of federal/provider status. State derived from
+# nanpa_carrier_prefixes (7-char npa_nxx_x primary key, with 6-char fallback)
+# via carrier_lookup.lookup_line_type_from_prefix().
+STATE_DNC_BLOCKED = {"FL", "OK", "TX"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -281,6 +288,40 @@ async def _perform_check(
             phone_normalized=phone, is_dnc=True,
             reason="tcpa_litigator_match",
             tcpa=True,
+        )
+
+    # 1.6 State-level hard block (FL / OK / TX)
+    #
+    #     Categorical state suppression layered on top of federal/provider DNC.
+    #     Resolved from nanpa_carrier_prefixes via carrier_lookup
+    #     (7-char npa_nxx_x PK, with npa+nxx block-0 fallback). Free, indexed,
+    #     fast, and runs BEFORE the cache so a state-blocked number never
+    #     burns a Searchbug $0.0214 or a cache row.
+    #
+    #     Inconclusive lookup (unknown prefix, DB hiccup) is treated as
+    #     "fall through" — this layer is hardening, not gating.
+    try:
+        carrier_row = lookup_line_type_from_prefix(phone)
+    except Exception as e:
+        logger.warning(f"dnc: state lookup failed for {phone}: {e}")
+        carrier_row = None
+    resolved_state = (carrier_row or {}).get("state") or ""
+    resolved_state = str(resolved_state).strip().upper()
+    if resolved_state in STATE_DNC_BLOCKED:
+        reason = f"state_dnc_{resolved_state}"
+        _audit(
+            phone=phone, source=src, result="state_dnc_block",
+            is_dnc=True, cost_usd=0.0, requesting_lead_id=lead_id,
+            metadata={
+                "state":       resolved_state,
+                "source":      carrier_row.get("source"),
+                "npa_nxx_x":   carrier_row.get("npa_nxx_x"),
+            },
+        )
+        return _serialize_response(
+            result_source="state_dnc_block",
+            phone_normalized=phone, is_dnc=True,
+            reason=reason,
         )
 
     # 2. Cache lookup with soft TTL (Phase 4 Layer 2 Slice 2B)

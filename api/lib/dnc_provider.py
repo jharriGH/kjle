@@ -90,8 +90,15 @@ def _build_searchbug() -> DNCProvider:
     return SearchbugProvider()
 
 
+def _build_realvalidito() -> DNCProvider:
+    # Lazy import so this module has no hard dep on httpx / the impl.
+    from .realvalidito_provider import RealValiditoProvider
+    return RealValiditoProvider()
+
+
 _PROVIDER_REGISTRY = {
-    "searchbug": _build_searchbug,
+    "searchbug":    _build_searchbug,
+    "realvalidito": _build_realvalidito,
 }
 
 
@@ -106,10 +113,10 @@ def get_active_provider() -> DNCProvider:
         from ..database import get_db
         db = get_db()
         res = db.table("admin_settings").select("value").eq("key", "dnc_provider").execute()
-        provider_name = (res.data[0].get("value") if res.data else "") or "searchbug"
+        provider_name = (res.data[0].get("value") if res.data else "") or "realvalidito"
     except Exception as e:
-        logger.warning(f"get_active_provider: admin_settings read failed ({e}); defaulting to 'searchbug'")
-        provider_name = "searchbug"
+        logger.warning(f"get_active_provider: admin_settings read failed ({e}); defaulting to 'realvalidito'")
+        provider_name = "realvalidito"
 
     builder = _PROVIDER_REGISTRY.get(provider_name)
     if builder is None:
