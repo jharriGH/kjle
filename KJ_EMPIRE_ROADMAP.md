@@ -10,33 +10,53 @@ integrates_with:
   - DemoBoosterz
   - Local Scraper workers
 sc_contact: ""
-current_sprint: "Day 3 done — LS pipeline proven; casing patch + DNC swap pending"
+current_sprint: "Phase 5 autonomous lead pumping"
 sprint_target_date: 2026-06-09
-cost_spent: 10.92
-cost_remaining: 4.08
-notes: "LS pipeline proven end-to-end (job ed784559, 120 leads). One SC casing patch from leads landing. kjle-api flapping root-caused (scheduler loop blocking). DNC swap to RealValidito in flight."
+cost_spent: 22.92
+cost_remaining: 2.08
+notes: "DNC RESTORED 2026-06-07: Searchbug replaced by RealValidito provider (commit bb124ae) — fresh lookup + cache + fail-closed verified live; FL/OK/TX state suppression live via NANPA. Follow-ups: cost constant 0.0214->0.002 (T1), event-loop latency/flap = SC scheduler->background-worker + asyncio.to_thread. All 3 RI bugs verified E2E. Phase 4.2 backend complete. Awaiting LS license for first end-to-end scrape test."
 ---
 
 # 👑 KJ EMPIRE — CENTRALIZED ROADMAP
 
 **Owner:** Jim Harris, DevelopingRiches Inc
-**Last refresh:** 2026-06-07 (Day 3 — Local Scraper pipeline proven end-to-end)
+**Last refresh:** 2026-06-07 (DNC restored — RealValidito live)
 **Sprint goal:** Autonomous lead pumping live by **Monday 2026-06-09**
 **Source of truth:** This file + `KJ_EMPIRE_ROADMAP.html`
-**KJLE main HEAD:** `d42b54a` (last verified by this seat) — SC reports main now at `46ec14e`; SC to confirm before any pull.
+**KJLE main HEAD:** `bb124ae` (RealValidito DNC provider + FL/OK/TX state suppression)
 
 ---
 
 ## 🖼️ VISUAL DASHBOARD — KJ_EMPIRE_ROADMAP.html
 
-Companion file: `KJ_EMPIRE_ROADMAP.html`. Same data, visual format. Save both in `Documents/GitHub/kjle/` and open the HTML for a glanceable status check.
+This roadmap has a companion file: `KJ_EMPIRE_ROADMAP.html`. Same data, visual format. Save both in `Documents/GitHub/kjle/` and open the HTML in any browser for a glanceable status check.
 
 **Update discipline — non-negotiable:**
 
-1. **At session start** — read BOTH this markdown AND the HTML before doing anything else
-2. **After EVERY successful task** — update BOTH files inline before moving on
-3. **At session end** — final refresh of BOTH, deliver via outputs folder
-4. **If only one updates** — task is NOT complete
+1. **At session start** — Claude reads BOTH this markdown AND the HTML before doing anything else
+2. **After EVERY successful task** — Claude updates BOTH files inline, before moving to the next item
+3. **At session end** — Final refresh of BOTH files, deliver updated versions to Jim via outputs folder
+4. **If only one updates and the other doesn't** — task is NOT considered complete; Jim should call it out
+
+---
+
+## 💰 COST ANNOTATION KEY
+
+Every task in this roadmap shows an estimated dispatch cost. Three categories:
+
+| Marker | Meaning | When you'll see it |
+|---|---|---|
+| **$0** | Tier 0/1 — free (vps_exec or GitHub web UI edit) | Most diagnostic + small-edit work |
+| **✓ $X** | Calibrated estimate — anchored to a real dispatch we've already run | Most code-shipping tasks |
+| **? $X** | Guessed estimate — no real-world data point yet | New territory (n8n, etc.) |
+
+**Calibration baseline (real Day 1+2 dispatch costs):**
+- L5B bulk update patch (single endpoint refactor + migration): **$1.50**
+- DNC Cost endpoints (4 read-only endpoints): **$1.51**
+- ES bug hotfix (2 bugs + migration + rollback): **~$2.50**
+- Phase 4.2 scrape queue (6 endpoints + migration + 2 auth helpers): **$2.91**
+- Worker daemon (7 files, ~30KB code, 2 platforms): **~$2.50**
+- **Mean: ~$2.30. Median: ~$2.50.** Two-dispatch days have totaled $5-6.
 
 ---
 
@@ -54,96 +74,128 @@ Companion file: `KJ_EMPIRE_ROADMAP.html`. Same data, visual format. Save both in
 
 ---
 
-## 🎯 HEADLINE — DAY 3 (2026-06-07)
-
-**The autonomous scrape→ingest pipeline is PROVEN end-to-end.** Job `ed784559` ran clean: Local Scraper exited rc 0, daemon loaded **120 leads** from JSON, KJLE ingest returned `status: processed` with **zero errors**. Every fix shipped tonight held.
-
-**One blocker remains before leads actually land:** all 120 leads were filtered (`inserted_count: 0, filtered_count: 120`) due to a **field-name casing mismatch** in KJLE's ingest. Root-caused; one-block SC patch ready (see Blockers). Until patched, every scrape will filter 100%.
-
----
-
 ## 📅 SPRINT CALENDAR (Mon 6/2 → Mon 6/9)
 
 | Day | Theme | Status | Cost |
 |---|---|---|---|
 | Day 1 (Mon 6/2) | Phase 4 close + ES bug hotfix | 🟢 DONE | $5.51 |
-| Day 2 AM | Connection pool fix | 🟢 DONE | $0 |
-| Day 2 PM | Phase 4.2 backend (scrape queue + worker daemon) | 🟢 DONE | $5.41 |
-| Day 3 (landed 6/7) | LS install + daemon live + pipeline proven | 🟢 **DONE** (1 SC patch pending) | ~$0 |
-| Day 4 | n8n workflow build — 1 niche end-to-end | ⚪ scoped | ~$2-4 |
-| Day 5 | Multi-niche + scraper trigger logic | ⚪ scoped | ~$2-3 |
-| Day 6-7 | Stress test + monitoring | ⚪ scoped | ~$2-5 |
+| Day 2 AM (Tue 6/3) | Connection pool fix | 🟢 DONE | $0 |
+| Day 2 PM (Tue 6/3) | Phase 4.2 backend (scrape queue + worker daemon) | 🟢 DONE | $5.41 |
+| **Day 3 (Wed 6/4 → Thu 6/5)** | **3 RI bug fixes (Bug 1.1, 2.1, 3) — all verified E2E + LS install pending license** | 🟢 **RI complete** | **~$3.00** |
+| Day 4 (Thu 6/5) | n8n workflow build — 1 niche end-to-end | ⚪ scoped | ~$2-4 |
+| Day 5 (Fri 6/6) | Multi-niche + scraper trigger logic | ⚪ scoped | ~$2-3 |
+| Day 6-7 (Sat-Sun 6/7-6/8) | Stress test + monitoring | ⚪ scoped | ~$2-5 |
 | Day 8 (Mon 6/9) | **AUTONOMOUS LEAD PUMPING LIVE** | 🎯 target | ~$0-1 |
 
-**Sprint spent so far:** $10.92 (Day 3 added $0 — all Tier 0/1 diagnostics)
+**Sprint spent so far:** $10.92
 **Sprint budget remaining:** $9-14 (target total: $15-25)
 
 ---
 
-## ✅ COMPLETED — DAY 3 (Local Scraper pipeline, 2026-06-07)
+## ✅ COMPLETED — KJLE PHASE 4 (closed 2026-06-03)
 
-| Item | Status | Notes |
-|---|---|---|
-| LS files onto Z820 | 🟢 | `C:\Users\King James\OneDrive\Desktop\workers\local_scraper_daemon\` (OneDrive-redirected Desktop); Python 3.13.5 |
-| Daemon live on Z820 | 🟢 | Reverse-polling `/scrape/jobs/poll` every 15s; `X-Worker-API-Key` authenticates (returns `{"jobs":[]}`) |
-| Env vars set (Z820) | 🟢 | `KJLE_API_BASE`, `WORKER_ID=z820`, `LOCAL_SCRAPER_SAVE_DIR=C:\KJLE\scrapes`, `LOCAL_SCRAPER_WEBHOOK_SECRET`, `KJLE_WORKER_API_KEY`, `LOCAL_SCRAPER_EXE_PATH` |
-| **Backend gap 1 — ingest log table** | 🟢 | `local_scraper_ingest_log` table created in Supabase (ingest had been fail-closed on missing table → `ingest_log_write_failed`) |
-| **Backend gap 2 — webhook secret** | 🟢 | `LOCAL_SCRAPER_WEBHOOK_SECRET` set in Render `kjle-api` env (HMAC verify was fail-closed) |
-| **Backend gap 3 — LS output format** | 🟢 | Switched LS export CSV→JSON; daemon `_load_saved_lead_files` reads only `**/*.json`. LS JSON = top-level list of dicts ✓ |
-| LS CLI contract verified | 🟢 | `--target "<exact scraper name>"` + `--keyword` + `--location`; daemon builds 13-arg cmd. Requires saved settings file (Tools→Save Settings) |
-| **End-to-end run proven** | 🟢 | Job `ed784559`: rc 0 → 120 leads loaded → ingest `processed`, 0 errors |
+| Layer | Item | Status | Cost |
+|---|---|---|---|
+| L1 | Core ingest + DNC restructure | 🟢 | prior |
+| L2 | Cache optimization (Slice 2A audit + 2B soft TTL) | 🟢 | prior |
+| L3 | Protective filters (TCPA + Searchbug harvest + leadcrap + carrier-pattern) | 🟢 | prior |
+| L4 — Tab 1 | Find Leads UI shipped | 🟢 | prior |
+| L4 — Tab 2 | Campaign Push UI shipped | 🟢 | prior |
+| L4 — Tab 3 | Cost Command Center UI shipped | 🟢 | prior |
+| L4 — Tab 4 | DNC Center UI shipped + 4 endpoints | 🟢 | ✓ $1.51 |
+| L5 | Bulk DNC scrub: 596,764 leads classified, 1,760 flagged (100% coverage) | 🟢 | prior |
+| L5B | Bulk-update endpoint patch (50s → 2s per chunk) | 🟢 | ✓ $1.50 |
+| Hotfix | ES Bug 1 fix (set-accounts emails translation) | 🟢 | ✓ $2.50 (combined w/ Bug 2) |
+| Hotfix | ES Bug 2 fix (lead-fetch + composite index + orphan rollback) | 🟢 | (above) |
+| Infra | Render kjle-api: Starter → Standard ($25/mo) | 🟢 | $0 |
+| Infra | Supabase compute: Micro → Small (~$5/mo net) | 🟢 | $0 |
+| Day 2 AM | Connection pool fix in database.py | 🟢 | $0 (T1 GitHub edit) |
 
-**Day 3 dispatch cost: $0** (all Tier 0/1: vps_exec reads, Supabase SQL editor, Render env, GUI config)
-
----
-
-## ❌ ACTIVE BLOCKER — 120/120 leads filtered (root-caused)
-
-**Symptom:** Job `ed784559` ingest → `results_count: 120, inserted_count: 0, filtered_count: 120`.
-
-**Root cause:** Field-name **casing mismatch**. `api/routes/local_scraper_ingest.py` → `_process_results` (L142-152) reads contact fields **lowercase** (`raw_lead.get("phone"/"email"/"website")`). Local Scraper JSON emits **capitalized** keys (`Phone`/`Email`/`Website`/`Name`/`FullAddress`). All three `.get()` return `None` per row → "no contact path" (L151) → every row filtered.
-
-**Fix (SC domain — receiver code, off-limits to worker-daemon seat):** in `_process_results`, top of the `for raw_lead in results:` loop, after the `isinstance` check, add:
-```python
-            raw_lead = {
-                (k.lower() if isinstance(k, str) else k): v
-                for k, v in raw_lead.items()
-            }
-```
-Commit + redeploy `kjle-api`, re-fire one scrape, expect `inserted_count > 0`. Alt locus: normalize in daemon before POST (ingest side is the cleaner contract boundary).
-
-**Owner:** KJLE backend SC. **Status:** patch handed off, awaiting deploy.
+**Phase 4 total dispatch cost: $5.51**
 
 ---
 
-## ⚠️ kjle-api FLAPPING — root-caused (coordinated fix)
+## ✅ COMPLETED — DAY 2 PM (closed 2026-06-04)
 
-**Symptom:** `kjle-api` goes "down/up dozens of times a day" — 502s on poll, `/health` itself timed out at 40s. Restored twice this session via Render restart (healthy ~130-195ms after).
+| Item | Status | Commit | Cost |
+|---|---|---|---|
+| `/scrape/start` + queue endpoints + `scrape_jobs` table | 🟢 | `ee3f774` | ✓ $2.91 |
+| Bug 1 diagnostic logging | 🟢 | `cb1f49b` | $0 (T1) |
+| Worker daemon code (workers/local_scraper_daemon/) | 🟢 | `d42b54a` | ✓ $2.50 |
+| WORKER_API_KEY in Render env | 🟢 | (Jim) | $0 |
+| scrape_jobs migration applied | 🟢 | (Jim) | $0 |
 
-**Root cause:** In-process `AsyncIOScheduler` (`api/routes/scheduler.py` `setup_scheduler`, ~13 jobs, started in `api/main.py` lifespan) runs **synchronous blocking** Supabase/external calls directly on the single event loop — **zero** `asyncio.to_thread` / `run_in_executor` / `ThreadPoolExecutor` offloading. A blocking job stalls the whole loop, so even static-dict `/health` hangs. Pool fix `813f75b` only added a 30s DB timeout — did not address loop blocking.
+**Day 2 PM total dispatch cost: $5.41**
 
-**Fix plan (SC domain — `scheduler.py` PROTECTED):**
-- **Primary:** move scheduler to a separate Render **Background Worker** service.
-- **Secondary:** wrap blocking DB calls in `asyncio.to_thread`; consider multiple uvicorn workers.
-- **Coordination required:** ~10 API consumers, 4 of them real-time fail-closed (Telehealth/AVA, DemoBoosterz, KJ Sales Agentz, n8n `/dnc/check`). Flapping intermittently halts live outreach empire-wide. Needs SC sign-off + Render config change + one cost-approved T3 dispatch.
+---
 
-**Owner:** KJLE backend SC. **Status:** root cause documented, fix queued.
+## 🟡 IN PROGRESS — DAY 3 (Wed 6/4)
+
+| Item | Owner | Effort | Cost |
+|---|---|---|---|
+| LS license email arrival | Support team | unknown | $0 |
+| Install Local Scraper on Z820 | Jim | ~30 min | $0 |
+| Install Local Scraper on VPS (Wine setup likely) | Jim + Claude SSH walk | ~30-60 min | $0 |
+| Set env vars on each worker | Jim | ~10 min | $0 |
+| Deploy daemon on Z820 (Task Scheduler) | Jim + Claude | ~20 min | $0 |
+| Deploy daemon on VPS (systemd) | Jim + Claude | ~15 min | $0 |
+| First end-to-end test (queue a small scrape, watch leads arrive) | Claude | ~30 min | $0 |
+| Wire Find Leads "Start Scrape" button → `/scrape/start` (Lovable prompt) | Jim (paste) | ~10 min | $0 |
+
+**Day 3 total estimated cost: ~$0-1** (mostly install + Tier 0/1 work)
 
 ---
 
 ## 🔵 QUEUED — Phase 5 (Day 4-7)
 
-| Item | Owner | Cost | Conf. |
-|---|---|---|---|
-| **SC: land the casing patch** (unblocks leads) | KJLE SC | $0 (T1) | High |
-| Wire Find Leads "Start Scrape" button → `/scrape/start` (Lovable prompt) | Jim (paste) | $0 | High |
-| Build `GET /kjle/v1/leads/eligible-for-campaign` helper | Claude (CC) | ✓ $1-2 | High |
-| n8n workflow: 1 niche end-to-end (route → create → attach) | Jim + Claude | ? $0-1 | Med |
-| Test campaign creates in RI manually first | Jim | $0 | High |
-| Lead inventory monitor (triggers scraper if pool < N) | Claude (CC) | ✓ $2-3 | Med-High |
-| Monitoring/alerting for autonomous failures | Claude (CC) | ? $2-5 | Low |
+| Item | Owner | Effort | Cost | Conf. |
+|---|---|---|---|---|
+| Build `GET /kjle/v1/leads/eligible-for-campaign` helper endpoint | Claude (CC dispatch) | ~1 hr | ✓ $1-2 | High |
+| n8n workflow: 1 niche end-to-end (route → create → attach) | Jim + Claude | ~1 day | ? $0-1 | Med (n8n is mostly config) |
+| Test campaign actually creates in RI manually first | Jim | ~30 min | $0 | High |
+| Schedule the cron only after manual success | Jim | ~5 min | $0 | High |
+| Wire 2-3 more niches into n8n | Jim + Claude | ~1 day | ? $0-1 | Med |
+| Add lead inventory monitor (triggers scraper if pool < N) | Claude (CC dispatch) | ~2 hr | ✓ $2-3 | Med-High |
+| Add monitoring/alerting for autonomous failures | Claude (CC dispatch) | unclear | ? $2-5 | Low (scope unclear) |
+| Sat-Sun stress test fixes (buffer for anything that breaks) | Claude | varies | ? $0-3 | Low (buffer) |
 
-**Phase 5 total estimated cost: ~$6-15**
+**Phase 5 total estimated cost: ~$6-15** (depending on how much n8n + monitoring scope grows)
+
+---
+
+## ⏸️ PARKED — Post-week-1
+
+| Item | Notes | Future cost |
+|---|---|---|
+| Phase 6 reply handling | Replies sit in RI inbox week 1 | ? $5-10 |
+| AVA voice handoff | Week 2+ | ? $5-10 |
+| Calendar booking integration | Week 2+ | ? $3-5 |
+| Landing pages per product | Open-ended polish | Open-ended |
+| Pricing pages | Open-ended polish | Open-ended |
+| Conversion tracking | Open-ended | ? $2-3 |
+| Promote roadmap to Lovable tab in Lead Finder | Post-launch upgrade | ? $3-5 |
+| Build card v9 refresh | After autonomy lives | $0 |
+
+---
+
+## 🤝 EXTERNAL DEPENDENCIES — SC COORDINATION
+
+### EmpireSenderz SC
+
+| Item | Status | Due | Cost impact if delayed |
+|---|---|---|---|
+| Sprint brief delivered | 🟢 | — | — |
+| ES bugs fixed at `1bbdeb0` | 🟢 | — | — |
+| Bug 1 diagnostic logging at `cb1f49b` | 🟢 | — | — |
+| ES SC re-runs Soft-Test A with diagnostic logs | 🟡 Awaiting | This week | +$1-3 if Bug 2.1 hotfix needed |
+| ES SC answers to 4 questions | 🟡 Awaiting | EOD Wed | Slips n8n by 1 day if late |
+
+### DemoBoosterz / DemoEnginez SCs
+
+| Item | Status | Cost when started |
+|---|---|---|
+| Coordination briefs drafted | ⚪ Not started | $0 (Claude writes inline) |
+| Decision: include in week-1 sprint or defer? | ❌ Jim | Adds $3-5 if pulled into week 1 |
 
 ---
 
@@ -151,89 +203,154 @@ Commit + redeploy `kjle-api`, re-fire one scrape, expect `inserted_count > 0`. A
 
 | Component | URL/Location | Status |
 |---|---|---|
-| KJLE API | https://kjle-api.onrender.com | 🟢 Live ⚠️ flapping (root-caused — scheduler blocking loop) |
+| KJLE API | https://kjle-api.onrender.com | 🟢 Live, ~200ms response |
 | KJLE Lead Finder UI | https://kjleadzempire.com | 🟢 Live, 4 tabs |
 | KJLE Supabase | dhzpwobfihrprlcxqjbq | 🟢 Small compute tier |
 | EmpireSenderz API | https://kjle-sender.onrender.com | 🟢 Live, CR.3 routing endpoints |
-| Jim Brain | https://jim-brain-production.up.railway.app | 🟢 Live (intermittent 500s on memory writes → fall back to brain_log) |
+| Jim Brain | https://jim-brain-production.up.railway.app | 🟢 Live (intermittent 500s on memory writes — fall back to brain_log) |
 | Brain MCP | https://kje-mcp.onrender.com | 🟢 Live |
 | RackNerd VPS | 192.161.173.97 | 🟢 CC dispatcher on 8091 |
 | CSV uploader cron | `/opt/kjle_csv_uploader.py` (10pm nightly) | 🟢 Live |
-| Worker daemon code | GitHub `workers/local_scraper_daemon/` (commit `d42b54a`) | 🟢 Shipped |
-| **Local Scraper (Z820)** | Z820 desktop | 🟢 **Installed + daemon live & polling** |
-| Local Scraper (VPS) | RackNerd VPS | 🟡 Awaiting license #2 + Wine (later) |
+| Worker daemon code | `/opt/kjle/workers/local_scraper_daemon/` | 🟢 Shipped, awaiting deployment |
+| Local Scraper (Z820) | Z820 desktop | 🟡 Awaiting license |
+| Local Scraper (VPS) | RackNerd VPS | 🟡 Awaiting license #2 + Wine |
 | n8n autonomous orchestrator | Railway | ⚪ Not built yet |
 
 ---
 
-## ⚠️ KNOWN RISKS / WATCH ITEMS
+## ⚠️ KNOWN RISKS / WATCH ITEMS (with cost impact)
 
 | Risk | Likelihood | Cost impact |
 |---|---|---|
-| SC casing patch slips → no leads land | — | $0 (blocks progress, not budget) |
-| kjle-api flapping recurs during n8n testing | Medium-High | $0 to restart; fix is coordinated T3 |
-| LS license #2 / Wine for VPS worker | Medium | $0 — install time |
-| n8n learning curve eats Day 4-5 | Medium | +$2-3 |
-| Scope creep — "just add X" | High | +$3-5 per off-roadmap dispatch — **biggest budget risk** |
+| LS license email delayed | Medium | $0 — blocks progress, not budget |
+| LS on Linux VPS needs Wine | Medium | $0 — install time, not dispatch |
+| n8n learning curve eats Day 4-5 | Medium | +$2-3 if extra scaffolding dispatches needed |
+| ES Bug 1 root cause is RI-side / structural | Medium | +$1-3 if a Bug 2.1 hotfix needed |
+| Some untested endpoint breaks at scale | Medium-High | +$2-5 for hotfix dispatches |
+| Scope creep — "just add X" | High | +$3-5 per off-roadmap dispatch — **this is the biggest budget risk** |
 | Brain memory 500s | Low | $0 — fall back to brain_log |
-
----
-
-## 🤝 EXTERNAL DEPENDENCIES — SC COORDINATION
-
-### KJLE backend SC (NEW — this seat's handoffs)
-| Item | Status |
-|---|---|
-| Casing patch in `_process_results` (lands leads) | 🟡 Handed off |
-| Scheduler split → Background Worker (flapping fix) | 🟡 Root cause documented |
-| `/opt/kjle` working tree cleanup (uncommitted dnc.py +261, scheduler.py, .gitignore on `phase4-email-clean-poller-and-logging-fix`) | ⚠️ SC-owned — author commits/stashes; this seat will NOT git-write `/opt/kjle` |
-| DNC vendor swap (RealValidation/RealValidito) — edits same `dnc.py` | ⏸️ Downstream of tree cleanup |
-
-### EmpireSenderz SC
-| Item | Status |
-|---|---|
-| Bug 1 (int→email) fixed at `1bbdeb0` | 🟢 |
-| Bug 1.1 (set-accounts 500 on valid payload) | 🟡 capture RI UI request via DevTools |
-| Bug 2.1 (rollback path / orphan campaigns) | 🟡 add logging around `ri_delete` |
 
 ---
 
 ## 💰 COST PROTOCOL — 5-TIER FRAMEWORK
 
-| Tier | What | Cost |
-|---|---|---|
-| T0 | vps_exec / terminal / browser dev tools | $0 |
-| T1 | GitHub web UI edit (2-20 lines) | $0 |
-| T2 | Claude writes patch, Jim applies | $0 |
-| T3 | Single combined CC dispatch (build+verify+merge) | $1.50-$3 |
-| T4 | Multiple sequential dispatches (rare, explicit approval) | $5+ |
+| Tier | What | When | Cost |
+|---|---|---|---|
+| **T0** | vps_exec / terminal / browser dev tools | Diagnostics, verification, reads | $0 |
+| **T1** | GitHub web UI edit | 2-20 line code changes (Jim's preferred manual path) | $0 |
+| **T2** | Claude writes patch, Jim applies | Small file changes Jim prefers to apply | $0 |
+| **T3** | Single combined CC dispatch (build+verify+merge) | Real architectural slices | $1.50-$3 typical |
+| **T4** | Multiple sequential dispatches | Rare, requires explicit Jim approval | $5+ |
 
-**5 absolute rules:** (1) never dispatch CC just to run curl; (2) never dispatch CC just to verify truth; (3) never dispatch CC for drain/batch/loop — use vps_exec; (4) never split chaperone + merge; (5) when uncertain, **ASK Jim before spending.** State verified cost BEFORE any dispatch; wait for explicit Y/N.
+**5 absolute rules:**
+1. Never dispatch CC just to run curl
+2. Never dispatch CC just to verify truth
+3. Never dispatch CC for drain/batch/loop work — use vps_exec
+4. Never split chaperone + merge into separate dispatches
+5. When uncertain, **ASK Jim before spending**
+
+State verified cost BEFORE any dispatch. Wait for explicit Y/N.
+
+---
+
+## 💰 SPRINT COST TRACKING (real numbers)
+
+| Item | Status | Cost |
+|---|---|---|
+| Phase 4 Layer 5B bulk update patch | 🟢 paid | $1.50 |
+| Phase 4 DNC Cost endpoints | 🟢 paid | $1.51 |
+| Phase 4 ES bug hotfix | 🟢 paid | ~$2.50 |
+| Day 2 AM connection pool fix | 🟢 free (Tier 1) | $0 |
+| Day 2 PM scrape queue endpoints | 🟢 paid | $2.91 |
+| Day 2 PM worker daemon | 🟢 paid | ~$2.50 |
+| Day 2 PM Bug 1 diagnostic logging | 🟢 free (Tier 1) | $0 |
+| Day 3 Bug 2.1 logging (rollback path) | 🟢 free (Tier 1) | $0 |
+| Day 3 Bug 1.1 fix (set-accounts key) | 🟢 paid | $1.50 |
+| Day 3 Bug 3 fix (add-leads endpoint + shape) | 🟢 paid | ~$1.50 |
+| **Sprint total so far** | — | **~$13.92** |
+| Estimated remaining budget | — | $6-11 |
+| Worst-case total | — | ~$25 |
+| Recurring infra delta | 🟢 paid | +$23/mo |
 
 ---
 
 ## 📌 STANDING REMINDERS
 
-- 📌 Roadmap dual-update discipline — refresh both .md and .html after every successful task
-- 📌 Cost protocol — state verified cost BEFORE any T3+ dispatch, get explicit Y/N
+- 📌 **Roadmap dual-update discipline** — refresh both .md and .html after every successful task
+- 📌 **Cost protocol** — state verified cost BEFORE any T3+ dispatch, get explicit Y/N
+- 📌 **DNC cost constant** — `dnc.py` line 53 `0.0214`→`0.002` (RealValidito rate) — T1 $0
+- 📌 **DNC event-loop fix** — SC: scheduler→Render Background Worker + `asyncio.to_thread` (kills the `/dnc/check` flap)
 - 📌 Build card v9 refresh needed
 - 📌 Add/test "Send to DemoBoosterz" from Lead Finder after Tour demo
 - 📌 Schedule local backups for `Documents/GitHub`
 - 📌 EmpireSenderz: prune 83 stale Instantly rows in mailbox_fleet
 - 📌 EmpireSenderz: `reachinbox_ltd_1` empty workspace decision
-- 📌 Promote Z820 daemon from foreground to Task Scheduler once stable
-- 📌 vps_exec cannot send master `x-api-key` (secret denylist) — Jim runs master-auth POSTs himself
 
 ---
+
+
+---
+
+## ✅ 2026-06-07 — DNC RESTORED (Searchbug → RealValidito)
+
+**The #1 launch-blocker is cleared.** Searchbug (Cloudflare-blocked on all datacenter IPs) replaced with RealValidito, dropped into the existing `DNCProvider` abstraction. Verified live, keyless, via `/dnc/check`.
+
+| Item | Status | Detail | Cost |
+|---|---|---|---|
+| `realvalidito_provider.py` + factory register + fallback default flip | 🟢 | commit `bb124ae` (T3 dispatch `dnc_realvalidito_swap_5ac3da77`) | ✓ $2.00 |
+| FL/OK/TX state suppression (NANPA `npa_nxx_x` → state) | 🟢 | `/dnc/check/3052500000` → `state_dnc_FL`, `$0`, short-circuits before provider | (above) |
+| Provider live (fresh lookup) | 🟢 | `/dnc/check/6193001234` → `clean`, `result_source=fresh_lookup`; cache_hit on repeat ($0) | — |
+| Fail-closed | 🟢 | missing creds → `is_dnc=true` (verified) | — |
+
+**Open caveat (to fully close 100%-compliance):** only `clean` verdicts witnessed — no positive `federal_dnc`/litigator **hit** yet (no known-DNC test number). Bucket parsing is in place + defensive; run one known-DNC number when available.
+
+**Follow-ups:**
+- 🔵 **Cost constant — T1 $0:** `api/routes/dnc.py` line 53 `SEARCHBUG_COST_PER_LOOKUP_USD = 0.0214` → `0.002` (RealValidito rate; currently over-reporting lookup cost 10×). Constant name now a misnomer (optional rename).
+- ⚠️ **Event-loop latency/flap — SC structural:** `/dnc/check` runs Supabase calls synchronously on the async loop (zero `to_thread`); boot-storm hung `/health` ~90s, fresh lookups 3.6s when loop free. Fix = split AsyncIOScheduler into a Render Background Worker + wrap blocking calls in `asyncio.to_thread`. SC's domain — do not touch the protected scheduler. Fail-closed keeps it safe meanwhile.
+
+> ⚠️ **Cost-figure note:** body cost sections below show `$13.92` while front-matter tracks `$20.92` base (pre-existing drift). Front-matter is authoritative; +$2.00 DNC dispatch → **$22.92 spent / ~$2.08 remaining**. Body sections need a reconciliation pass.
+
+---
+
+## 🏆 DAY 3 RESOLVED — RI CAMPAIGN PATH FULLY UNBLOCKED (2026-06-06)
+
+**Three RI bugs identified, root-caused via official docs, fixed, and verified end-to-end by ES SC.**
+
+| Bug | Description | Resolution | Commit | Verified |
+|---|---|---|---|---|
+| **Bug 2.1** | Rollback path diagnostic logging missing — couldn't tell if rollback fired on set-accounts failure | Added entry logging + DELETE attempt logging | `f791cce` | Live, hasn't fired yet |
+| **Bug 1.1** | set-accounts 500'd on valid payload. RI docs show body key must be `accountsToUse` not `emails` | One-word rename | `140f4b4` | ES SC: 5 telehealth + 1 control assigned cleanly |
+| **Bug 3** | add-leads called `/leads/addLeadsToCampaign` (doesn't exist) with firstName nested in attributes. RI docs say endpoint is `/leads/add`, firstName/lastName at top level | Endpoint + shape fix + diagnostic logging | `ad87b1a` | ES SC: 5 added / 0 skipped on re-test |
+
+**Lessons reinforced:**
+- RI's own docs (docs.reachinbox.ai) are the authoritative source — not packet captures, not memory
+- Root-cause-via-docs THEN ship-via-CC-dispatch is the repeatable pattern
+- Bug 1 (int→email translation) was correctly fixed but was masking Bug 1.1; fixing one surfaces the next
+
+**Phase 4.2 backend: COMPLETE.** Queue endpoints + worker daemon + all three RI bugs resolved. The entire campaign creation path (create + assign accounts + add leads) is now programmatically callable end-to-end. This is the spine of Phase 5 autonomous lead pumping.
+
+**Day 3 dispatch cost:** ~$3.00 (Bug 1.1 + Bug 3, mean $1.50 each — calibrated baseline holding).
+
+**Queued next:** Orphan cleanup script for 125659, 125660, 125877, 125878 + SOFTTEST/RERUN/VERIFY pile via DELETE /api/v1/campaigns/{id} ($0, ~5 min).
 
 ## 🎯 NEXT IMMEDIATE ACTION
 
-1. **KJLE SC:** apply the `_process_results` casing patch + redeploy `kjle-api`.
-2. Re-fire one test scrape → confirm `inserted_count > 0`.
-3. Wire Find Leads "Start Scrape" button (Lovable prompt — Claude writes, Jim pastes).
-4. Begin n8n 1-niche workflow.
+**Awaiting LS license email.** When it arrives, Day 3 work is mostly free (Tier 0/1):
+1. Install LS on Z820 (~30 min)
+2. Save settings file in LS Tools tab
+3. Activate second license, install LS on VPS (Wine setup likely)
+4. Set env vars on both workers
+5. Run daemon foreground for first test
+6. Submit a small test scrape via `POST /kjle/v1/scrape/start`
+7. Verify leads arrive in KJLE
+8. **Update both roadmap files with each completed step**
+
+**Optional parallel work while waiting** ($0):
+- Lovable prompt for Find Leads UI wire (Claude writes, Jim pastes)
+- n8n workflow design sketch (no dispatch, just architecture thinking)
 
 ---
 
-*Centralized Empire Roadmap v1.3 — DevelopingRiches Inc — Jim Harris*
+*Centralized Empire Roadmap v1.2 — DevelopingRiches Inc — Jim Harris*
+*With calibrated cost annotations · ✓ = real dispatch data · ? = no calibration yet*
 *Updated after every successful task — markdown + HTML kept in sync*

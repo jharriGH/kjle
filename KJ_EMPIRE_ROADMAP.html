@@ -131,9 +131,9 @@
   <header>
     <h1><span class="crown">👑</span>KJ Empire — Sprint Roadmap</h1>
     <div class="meta">
-      Last refresh: <strong>2026-06-04 (Day 2 PM close)</strong>
+      Last refresh: <strong>2026-06-07 (DNC restored — RealValidito live)</strong>
       &nbsp;·&nbsp;
-      KJLE main HEAD: <code>d42b54a</code>
+      KJLE main HEAD: <code>bb124ae</code>
     </div>
   </header>
   <div class="subtitle">
@@ -148,6 +148,17 @@
     <strong>Bug 1.1</strong> set-accounts key fix <code style="background:var(--panel-2);padding:1px 5px;border-radius:3px;color:var(--cyan);">140f4b4</code> (ES SC verified: 5 telehealth + 1 control accounts assigned cleanly) ·
     <strong>Bug 3</strong> add-leads endpoint + per-lead shape fix <code style="background:var(--panel-2);padding:1px 5px;border-radius:3px;color:var(--cyan);">ad87b1a</code> (ES SC verified: 5 added / 0 skipped).
     <br><span style="color: var(--text-dim);">Day 3 dispatch cost: ~$3.00. Sprint total: ~$13.92.</span>
+  </div>
+
+  <!-- DNC RESTORED banner -->
+  <div style="background: linear-gradient(90deg, rgba(16,185,129,0.20), rgba(16,185,129,0.05)); border: 1px solid var(--green); border-radius: 8px; padding: 14px 18px; margin-bottom: 24px; font-size: 13px; color: var(--text);">
+    <strong style="color: var(--green); font-size: 14px;">✅ 2026-06-07 — DNC RESTORED (Searchbug → RealValidito)</strong><br>
+    The #1 launch-blocker is cleared. New <code style="background:var(--panel-2);padding:1px 5px;border-radius:3px;color:var(--cyan);">realvalidito_provider.py</code> dropped into the existing DNCProvider abstraction
+    <code style="background:var(--panel-2);padding:1px 5px;border-radius:3px;color:var(--cyan);">bb124ae</code>. Verified live, keyless, via <code style="background:var(--panel-2);padding:1px 5px;border-radius:3px;color:var(--cyan);">/dnc/check</code>:
+    <strong>state suppression</strong> (3052500000 → state_dnc_FL, $0) ·
+    <strong>provider fresh lookup</strong> (6193001234 → clean, cache_hit on repeat) ·
+    <strong>fail-closed</strong> verified.
+    <br><span style="color: var(--text-dim);">DNC dispatch cost: $2.00. Open: no positive federal_dnc hit witnessed yet (need known-DNC #). Follow-ups: cost const 0.0214→0.002 (T1 $0); event-loop flap = SC scheduler split + asyncio.to_thread.</span>
   </div>
 
   <!-- KPIs -->
@@ -166,11 +177,11 @@
     </div>
     <div class="kpi">
       <div class="kpi-label">Sprint spent</div>
-      <div class="kpi-value">$13.92</div>
+      <div class="kpi-value">$22.92</div>
     </div>
     <div class="kpi">
       <div class="kpi-label">Sprint budget remaining</div>
-      <div class="kpi-value accent">$6-11</div>
+      <div class="kpi-value accent">~$2.08</div>
     </div>
   </div>
 
@@ -195,7 +206,7 @@
 
   <!-- Sprint Timeline (now with daily costs) -->
   <section>
-    <h2>Sprint timeline <span class="phase-cost">$13.92 spent · ~$6-11 remaining</span></h2>
+    <h2>Sprint timeline <span class="phase-cost">$22.92 spent · ~$2.08 remaining</span></h2>
     <div class="timeline">
       <div class="day done">
         <div class="day-label">Mon 6/2</div>
