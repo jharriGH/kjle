@@ -34,3 +34,10 @@
 # ── Protection layer itself ──────────────────────────────────────────────────
 /PROTECTED.md                            @jharriGH
 /.github/CODEOWNERS                      @jharriGH
+
+# ── Roadmap dashboard (auto-generated + validated by CI) ─────────────────────
+# Generated/validated by roadmap-sync and gated by the path-scoped auto-merge guard.
+# Intentionally UNOWNED so roadmap updates need no human code-owner review.
+# (Last-match-wins: these override the `* @jharriGH` catch-all for these two files.)
+/KJ_EMPIRE_ROADMAP.md
+/KJ_EMPIRE_ROADMAP.html
