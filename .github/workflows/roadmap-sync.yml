@@ -1,0 +1,81 @@
+name: Roadmap sync
+
+# Keeps KJ_EMPIRE_ROADMAP.html generated from KJ_EMPIRE_ROADMAP.md, and makes a
+# dropped/blank YAML `project:` key impossible to merge silently.
+#
+# On a PR touching the .md: validate the front-matter, regenerate the .html, and commit
+# it back to the PR branch (pushed with ROADMAP_BOT_TOKEN so the new commit re-triggers
+# this check — required for auto-merge to see a green status on the final commit).
+#
+# On push to main: validate + verify the .html is in sync (safety net).
+
+on:
+  pull_request:
+    paths:
+      - "KJ_EMPIRE_ROADMAP.md"
+      - "scripts/build_roadmap_html.py"
+  push:
+    branches: [main]
+    paths:
+      - "KJ_EMPIRE_ROADMAP.md"
+      - "scripts/build_roadmap_html.py"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: roadmap-sync-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # PR: check out the head branch so we can commit the regenerated HTML back.
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          fetch-depth: 0
+          # Push the regen commit with a PAT (not GITHUB_TOKEN) so it re-triggers this
+          # workflow and posts a status on the new head SHA. Falls back to GITHUB_TOKEN
+          # (regen still works; auto-merge then needs the PAT to fire).
+          token: ${{ secrets.ROADMAP_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pyyaml markdown
+
+      - name: Validate + verify sync (push to main)
+        if: github.event_name == 'push'
+        run: |
+          python scripts/build_roadmap_html.py --check
+
+      - name: Validate front-matter (pull request)
+        if: github.event_name == 'pull_request'
+        run: |
+          python scripts/build_roadmap_html.py --html /tmp/_validate.html
+
+      - name: Regenerate HTML (pull request)
+        if: github.event_name == 'pull_request'
+        run: |
+          python scripts/build_roadmap_html.py
+
+      - name: Commit regenerated HTML back to the PR branch
+        if: >
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          if git diff --quiet -- KJ_EMPIRE_ROADMAP.html; then
+            echo "KJ_EMPIRE_ROADMAP.html already in sync — nothing to commit."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add KJ_EMPIRE_ROADMAP.html
+          git commit -m "chore(roadmap): regenerate HTML from .md"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
