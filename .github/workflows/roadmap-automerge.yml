@@ -1,0 +1,76 @@
+name: Roadmap auto-merge
+
+# Arms GitHub auto-merge for a PR ONLY when it changes nothing but the roadmap files.
+# Any PR that also touches code (api/, anything else) is left for a human — this is the
+# safety substitute for the old "no autonomous push" rule: code can never ride the
+# roadmap lane. Auto-merge then waits for the required roadmap-sync check to pass.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: roadmap-automerge-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  guard-and-arm:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    env:
+      HAS_BOT_TOKEN: ${{ secrets.ROADMAP_BOT_TOKEN != '' }}
+    steps:
+      - name: List changed files
+        id: changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          files=$(gh api --paginate \
+            "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            --jq '.[].filename')
+          {
+            echo "files<<__EOF__"
+            echo "$files"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Determine roadmap-only scope
+        id: scope
+        run: |
+          roadmap_only=true
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            if [ "$f" != "KJ_EMPIRE_ROADMAP.md" ] && [ "$f" != "KJ_EMPIRE_ROADMAP.html" ]; then
+              roadmap_only=false
+            fi
+          done <<< '${{ steps.changed.outputs.files }}'
+          echo "roadmap_only=$roadmap_only" >> "$GITHUB_OUTPUT"
+          echo "roadmap_only=$roadmap_only"
+          printf 'changed files:\n%s\n' '${{ steps.changed.outputs.files }}'
+
+      - name: Held for human review (touches non-roadmap files)
+        if: steps.scope.outputs.roadmap_only != 'true'
+        run: echo "PR changes non-roadmap files — auto-merge NOT armed. A human must review and merge."
+
+      # Only needed if roadmap files still require a code-owner review (i.e. NOT exempted
+      # in CODEOWNERS). Non-fatal: if review isn't required, or the token owner can't
+      # approve its own PR, we ignore it and let the required check gate the merge.
+      - name: Auto-approve roadmap-only PR (best-effort)
+        if: steps.scope.outputs.roadmap_only == 'true' && env.HAS_BOT_TOKEN == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.ROADMAP_BOT_TOKEN }}
+        run: |
+          gh pr review "${{ github.event.pull_request.number }}" --approve \
+            --body "Roadmap-only change; validated by roadmap-sync. Auto-approved."
+
+      - name: Arm auto-merge
+        if: steps.scope.outputs.roadmap_only == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.ROADMAP_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr merge "${{ github.event.pull_request.number }}" --auto --squash
