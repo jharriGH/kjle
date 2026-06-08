@@ -139,6 +139,15 @@ def _process_results(db, results: list, run_id: str, worker_id: str,
                 filtered += 1
                 continue
 
+            # Local Scraper emits capitalized field names (Phone/Email/
+            # Website/Name/City/State/Zip). Normalize keys to lowercase so the
+            # .get() lookups below resolve. Validation is unchanged — a real
+            # contact path is still required.
+            raw_lead = {
+                (k.lower() if isinstance(k, str) else k): v
+                for k, v in raw_lead.items()
+            }
+
             phone_raw = raw_lead.get("phone")
             email_raw = raw_lead.get("email")
             website_raw = raw_lead.get("website")
