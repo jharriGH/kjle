@@ -2,7 +2,7 @@
 project: KJLE
 status: active
 description: Lead engine — scraping, classification, DNC compliance, RI campaign creation. Data hub for the empire.
-last_updated: 2026-06-07
+last_updated: 2026-06-09
 integrates_with:
   - EmpireSenderz
   - TH
