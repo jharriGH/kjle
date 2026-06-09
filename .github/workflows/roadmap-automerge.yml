@@ -65,7 +65,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.ROADMAP_BOT_TOKEN }}
         run: |
-          gh pr review "${{ github.event.pull_request.number }}" --approve \
+          gh pr review "${{ github.event.pull_request.number }}" -R "${{ github.repository }}" --approve \
             --body "Roadmap-only change; validated by roadmap-sync. Auto-approved."
 
       - name: Arm auto-merge
@@ -73,4 +73,4 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.ROADMAP_BOT_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
-          gh pr merge "${{ github.event.pull_request.number }}" --auto --squash
+          gh pr merge "${{ github.event.pull_request.number }}" -R "${{ github.repository }}" --auto --squash
