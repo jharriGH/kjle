@@ -98,13 +98,25 @@ async def lifespan(app: FastAPI):
     logger.info(f"   Access & Auth : ✓ ready")
     logger.info(f"   Email Clean   : ✓ ready (Truelist nightly job active)")
 
-    _scheduler = setup_scheduler()
-    _scheduler.start()
-    logger.info(f"   Scheduler     : ⏰ APScheduler started ({len(_scheduler.get_jobs())} jobs active)")
+    # Scheduler ownership is env-gated so the 13 jobs can run in a SEPARATE
+    # process (kjle-scheduler Background Worker) instead of blocking the API
+    # event loop. Default "true" preserves legacy in-process behavior when the
+    # var is unset, so a missing var degrades LOUDLY (flapping returns) rather
+    # than SILENTLY (all 13 jobs vanish). Cutover sets RUN_SCHEDULER=false on
+    # kjle-api ONLY; the worker is the sole owner thereafter.
+    run_scheduler = os.getenv("RUN_SCHEDULER", "true").lower() not in ("false", "0", "no")
+    _scheduler = None
+    if run_scheduler:
+        _scheduler = setup_scheduler()
+        _scheduler.start()
+        logger.info(f"   Scheduler     : ⏰ APScheduler started ({len(_scheduler.get_jobs())} jobs active)")
+    else:
+        logger.info("   Scheduler     : ⏸️  in-process scheduler DISABLED (RUN_SCHEDULER=false) — owned by kjle-scheduler worker")
 
     yield
 
-    _scheduler.shutdown(wait=False)
+    if _scheduler is not None:
+        _scheduler.shutdown(wait=False)
     logger.info("🛑 KJLE API shutting down")
 
 
