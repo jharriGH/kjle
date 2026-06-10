@@ -15,6 +15,10 @@ sprint_target_date: 2026-06-09
 cost_spent: 10.92
 cost_remaining: 4.08
 notes: "LS pipeline proven end-to-end (job ed784559, 120 leads). One SC casing patch from leads landing. kjle-api flapping root-caused (scheduler loop blocking). DNC swap to RealValidito in flight."
+repo: jharriGH/kjle
+api_url: https://kjle-api.onrender.com
+facts_doc: PROJECT_FACTS.md
+vault_key: API_SECRET_KEY
 ---
 
 # 👑 KJ EMPIRE — CENTRALIZED ROADMAP
