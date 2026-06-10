@@ -200,6 +200,180 @@ async def bulk_action(payload: BulkActionRequest, x_api_key: str = Header(...)):
 
 
 # ─────────────────────────────────────────────────
+# GET /kjle/v1/leads/eligible-for-campaign
+# Registered BEFORE /leads/{lead_id} to avoid route shadowing.
+# Returns campaign-ready leads for the n8n route→create→attach flow:
+# passes compliance (email valid, internal phone suppressions, dnc_status)
+# and targeting filters (niche / pain / segment scoping).
+# ─────────────────────────────────────────────────
+
+# dnc_status values that mean "do not contact". Allowed states are NULL
+# (column unpopulated = not yet evaluated) plus 'unchecked' / 'searchbug_clean'.
+# Enum source: migrations/leads_dnc_status.sql.
+_DNC_STATUS_BLOCKED = (
+    "fed_dnc_flagged",
+    "tcpa_litigator_flagged",
+    "searchbug_dnc",
+    "internal_suppression",
+    "leadcrap_filtered",
+)
+
+
+@router.get("/leads/eligible-for-campaign")
+async def eligible_for_campaign(
+    vertical: Optional[str] = Query(None, description="Vertical (alias for niche)"),
+    niche: Optional[str] = Query(None, description="niche_slug filter; takes precedence over `vertical`"),
+    segment_id: Optional[str] = Query(None, description="Saved segment id; applies its stored filters and passes through"),
+    pain_min: Optional[int] = Query(None, description="Minimum pain_score (inclusive)"),
+    limit: int = Query(500, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
+    require_email_valid: bool = Query(True, description="When true, restrict to email_status='valid' + email_valid=true"),
+    x_api_key: str = Header(...),
+):
+    verify_api_key(x_api_key)
+    supabase = get_supabase()
+
+    skipped_filters: List[str] = []
+
+    # ── segment_id passthrough — apply stored filters when available ───────
+    seg_niche: Optional[str] = None
+    seg_pain_min: Optional[int] = None
+    seg_label: Optional[str] = None
+    if segment_id:
+        try:
+            seg_res = (
+                supabase.table("segments")
+                .select("id, segment_label, niche_slug, filters")
+                .eq("id", segment_id)
+                .limit(1)
+                .execute()
+            )
+            seg_rows = seg_res.data or []
+            if not seg_rows:
+                raise HTTPException(status_code=404, detail=f"Segment '{segment_id}' not found")
+            seg = seg_rows[0]
+            seg_filters = seg.get("filters") or {}
+            if not isinstance(seg_filters, dict):
+                seg_filters = {}
+            seg_niche = seg.get("niche_slug") or seg_filters.get("niche_slug")
+            seg_label = seg.get("segment_label") or seg_filters.get("segment_label")
+            seg_pain_min = seg_filters.get("min_pain")
+        except HTTPException:
+            raise
+        except Exception as e:
+            skipped_filters.append(f"segment_lookup_failed:{e}")
+
+    effective_niche = niche or vertical or seg_niche
+    effective_pain_min = pain_min if pain_min is not None else seg_pain_min
+
+    # ── targeting + base query ─────────────────────────────────────────────
+    select_cols = "id, business_name, email, phone, niche_slug, pain_score, dnc_status"
+    query = supabase.table("leads").select(select_cols).eq("is_active", True)
+    count_query = supabase.table("leads").select("id", count="exact").eq("is_active", True)
+
+    if effective_niche:
+        query = query.eq("niche_slug", effective_niche)
+        count_query = count_query.eq("niche_slug", effective_niche)
+
+    if seg_label and seg_label != "custom":
+        query = query.eq("segment_label", seg_label)
+        count_query = count_query.eq("segment_label", seg_label)
+
+    if effective_pain_min is not None:
+        query = query.gte("pain_score", int(effective_pain_min))
+        count_query = count_query.gte("pain_score", int(effective_pain_min))
+
+    # ── email presence + Truelist validity ─────────────────────────────────
+    query = query.neq("email", None)
+    count_query = count_query.neq("email", None)
+    if require_email_valid:
+        query = query.eq("email_status", "valid").eq("email_valid", True)
+        count_query = count_query.eq("email_status", "valid").eq("email_valid", True)
+
+    # ── dnc_status: allow NULL (not-yet-evaluated) or non-blocked values ───
+    blocked_csv = ",".join(_DNC_STATUS_BLOCKED)
+    dnc_or = f"dnc_status.is.null,dnc_status.not.in.({blocked_csv})"
+    query = query.or_(dnc_or)
+    count_query = count_query.or_(dnc_or)
+
+    # ── active-campaign attachment exclusion ───────────────────────────────
+    # No campaign_leads / attached_to_campaign table exists in this schema
+    # (campaign_performance is aggregate-only). Skip and surface in artifact.
+    skipped_filters.append("active_campaign_attachment_table_missing")
+
+    # ── pre-suppression total ──────────────────────────────────────────────
+    try:
+        count_result = count_query.execute()
+        total = count_result.count if count_result.count is not None else 0
+    except Exception as e:
+        logger.error(f"eligible_for_campaign count failed: {e}")
+        raise HTTPException(status_code=500, detail=f"count_query_failed: {e}")
+
+    # ── fetch the page, ordered by pain_score desc ─────────────────────────
+    try:
+        page = (
+            query.order("pain_score", desc=True)
+            .range(offset, offset + limit - 1)
+            .execute()
+        )
+        rows = page.data or []
+    except Exception as e:
+        logger.error(f"eligible_for_campaign fetch failed: {e}")
+        raise HTTPException(status_code=500, detail=f"lead_query_failed: {e}")
+
+    # ── dnc_suppressions (phone-based internal suppression list) ───────────
+    # Read-only batch lookup mirrors api/lib/dnc_check.py::_check_internal_suppression
+    # but vectorized to one round-trip per page.
+    if rows:
+        from ..lib import phone_utils  # local import; module is pure-function
+        phone_norm_by_row: dict = {}
+        unique_norms: set = set()
+        for r in rows:
+            np = phone_utils.normalize_phone(r.get("phone"))
+            if np:
+                phone_norm_by_row[r["id"]] = np
+                unique_norms.add(np)
+
+        suppressed: set = set()
+        if unique_norms:
+            try:
+                sup_res = (
+                    supabase.table("dnc_suppressions")
+                    .select("phone")
+                    .in_("phone", list(unique_norms))
+                    .execute()
+                )
+                suppressed = {row["phone"] for row in (sup_res.data or []) if row.get("phone")}
+            except Exception as e:
+                logger.warning(f"eligible_for_campaign dnc_suppressions lookup failed: {e}")
+                skipped_filters.append(f"dnc_suppressions_lookup_failed:{e}")
+
+        if suppressed:
+            rows = [r for r in rows if phone_norm_by_row.get(r["id"]) not in suppressed]
+
+    leads_out = [
+        {
+            "id": r.get("id"),
+            "business_name": r.get("business_name"),
+            "email": r.get("email"),
+            "phone": r.get("phone"),
+            "niche": r.get("niche_slug"),
+            "pain_score": r.get("pain_score"),
+            "dnc_status": r.get("dnc_status"),
+        }
+        for r in rows
+    ]
+
+    return {
+        "total": total,
+        "count": len(leads_out),
+        "leads": leads_out,
+        "skipped_filters": skipped_filters,
+        "segment_id": segment_id,
+    }
+
+
+# ─────────────────────────────────────────────────
 # GET /kjle/v1/leads/{lead_id}
 # ─────────────────────────────────────────────────
 
