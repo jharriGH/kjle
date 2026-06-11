@@ -442,8 +442,16 @@ def process_job(job: dict) -> None:
 
     ls_proc_rc: int | None = None
     try:
-        ls_proc = subprocess.run(ls_args, capture_output=True, text=True)
-        ls_proc_rc = ls_proc.returncode
+        # Non-blocking spawn. Local Scraper v1.96 does NOT honor --auto-close,
+        # so we must NOT block on it exiting. Instead we watch for the
+        # completion marker (written by ls-webhook-handler.py when LS delivers
+        # its 'scrape complete' webhook) and terminate LS ourselves once the
+        # scrape has finished.
+        ls_proc = subprocess.Popen(
+            ls_args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     except OSError as e:
         _log("ls_spawn_failed", level=logging.ERROR, job_id=job_id,
              error=str(e))
@@ -453,14 +461,51 @@ def process_job(job: dict) -> None:
         _cleanup_save_dir(save_dir)
         return
 
+    # Wait for the completion marker OR LS self-exit, whichever comes first.
+    # Hard backstop (handler self-timeout + 5 min) so a scrape that never
+    # reports can't jam the single-job queue.
+    ls_deadline = time.time() + (WEBHOOK_HANDLER_MAX_MIN * 60 + 300)
+    marker: dict | None = None
+    while time.time() < ls_deadline:
+        if marker_path.exists():
+            # Scrape finished and webhook was delivered.
+            try:
+                with open(marker_path, "r", encoding="utf-8") as f:
+                    marker = json.load(f)
+            except (OSError, ValueError) as e:
+                _log("marker_read_failed", level=logging.WARNING,
+                     path=str(marker_path), error=str(e))
+                marker = {}  # present but unreadable — still treat as complete
+            break
+        if ls_proc.poll() is not None:
+            # LS exited on its own; give the marker a brief moment to land.
+            marker = _wait_for_marker(marker_path, WEBHOOK_TIMEOUT_SEC)
+            break
+        if _shutdown_requested:
+            break
+        time.sleep(1.0)
+
+    # LS does not self-close — terminate it now that the scrape is done (or the
+    # backstop fired). Mirrors _terminate_handler.
+    if ls_proc.poll() is None:
+        try:
+            ls_proc.terminate()
+            try:
+                ls_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                ls_proc.kill()
+        except OSError as e:
+            _log("ls_terminate_error", level=logging.WARNING,
+                 job_id=job_id, error=str(e))
+    ls_proc_rc = ls_proc.returncode
+
     _log("ls_exited", job_id=job_id, returncode=ls_proc_rc)
 
-    marker = _wait_for_marker(marker_path, WEBHOOK_TIMEOUT_SEC)
     _terminate_handler(handler_proc)
 
     if marker is None:
-        msg = (f"no webhook marker after LS exit "
-               f"(rc={ls_proc_rc}, timeout={WEBHOOK_TIMEOUT_SEC}s)")
+        msg = (f"no webhook marker within backstop "
+               f"({WEBHOOK_HANDLER_MAX_MIN}m, rc={ls_proc_rc})")
         _log("marker_timeout", level=logging.WARNING, job_id=job_id)
         post_complete(job_id, success=False, run_id=run_id, error=msg)
         _cleanup_save_dir(save_dir)
