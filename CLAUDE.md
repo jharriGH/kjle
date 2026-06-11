@@ -1,3 +1,11 @@
+## 👑 Empire onboarding — read every session
+Single source of truth: this repo (jharriGH/kjle). On session start, follow EMPIRE_SC_HANDOFF.md
+and EMPIRE_INTEGRATION_STANDARD.md at the repo root.
+KJLE's roadmap file is KJ_EMPIRE_ROADMAP.md (managed by the hands-free pipeline via
+scripts/submit_roadmap_update.sh) — keep its front-matter current. Keep PROJECT_FACTS.md current.
+Vault key NAMES only — never secret values. Repo edits: explicit paths, never `git add -A`.
+
+
 # 🧠 KJLE — CLAUDE.md
 # Auto-healed by claude_md_healer.py from Jim Brain state
 # Last healed: 2026-05-12 00:00:25 UTC
