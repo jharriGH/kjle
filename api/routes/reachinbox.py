@@ -544,16 +544,22 @@ async def create_full_campaign(body: CreateCampaignRequest):
         raise
     except Exception as e:
         if campaign_id is not None:
+            # ReachInbox exposes NO campaign-delete endpoint (verified against
+            # their API docs + live 404s on every delete variant). Best-effort
+            # rollback = PAUSE the orphan draft so it can never send, then leave
+            # it for manual deletion in the RI web UI.
             try:
-                await ri_delete(f"/campaigns/{campaign_id}")
+                await ri_post("/campaigns/pause", {"campaignId": campaign_id})
                 logger.warning(
-                    f"[reachinbox.create] rollback: deleted orphan campaign "
-                    f"{campaign_id} after failure at step {len(steps_completed)+1}"
+                    f"[reachinbox.create] rollback: paused orphan campaign "
+                    f"{campaign_id} after failure at step {len(steps_completed)+1} "
+                    f"(RI has no delete API - delete it manually in the RI web UI)"
                 )
-            except Exception as del_err:
+            except Exception as pause_err:
                 logger.error(
-                    f"[reachinbox.create] rollback DELETE failed for campaign "
-                    f"{campaign_id}: {del_err}"
+                    f"[reachinbox.create] rollback pause failed for campaign "
+                    f"{campaign_id}: {pause_err} "
+                    f"(orphan left as draft - delete it manually in the RI web UI)"
                 )
         logger.error(f"Campaign creation failed at step {len(steps_completed)+1}: {e}")
         raise HTTPException(
