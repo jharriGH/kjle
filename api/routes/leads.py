@@ -27,6 +27,14 @@ async def list_leads(
     enrichment_stage:   Optional[int]  = Query(None, description="0-4"),
     email_state:        Optional[str]  = Query(None, description="ok|risky"),
     email_sub_state:    Optional[str]  = Query(None, description="Truelist sub-state (e.g. is_role, accept_all, failed_mx_check)"),
+    min_stars:      Optional[float] = Query(None, description="Minimum Google rating (e.g. 0)"),
+    max_stars:      Optional[float] = Query(None, description="Maximum Google rating (e.g. 3.5 for reputation targets)"),
+    min_reviews:    Optional[int]   = Query(None, description="Minimum Google review count"),
+    max_reviews:    Optional[int]   = Query(None, description="Maximum Google review count (e.g. 20 for low-review targets)"),
+    has_facebook:   Optional[bool]  = Query(None, description="True = only leads with a Facebook URL; False = only without"),
+    has_instagram:  Optional[bool]  = Query(None, description="True = only leads with an Instagram URL; False = only without"),
+    has_linkedin:   Optional[bool]  = Query(None, description="True = only leads with a LinkedIn URL; False = only without"),
+    source:         Optional[str]   = Query(None, description="Filter by ingest source (e.g. local_scraper, csv)"),
     is_active:          bool           = Query(True),
     page:           int             = Query(1, ge=1),
     page_size:      int             = Query(50, ge=1, le=500),
@@ -39,7 +47,9 @@ async def list_leads(
     query = db.table("leads").select(
         "id, business_name, phone, email, website, city, state, niche_slug, "
         "pain_score, fit_demoenginez, fit_reputation, fit_schema_ranker, fit_voicedrop, "
-        "google_stars, google_review_count, g_maps_claimed, enrichment_stage, "
+        "google_stars, google_review_count, g_maps_claimed, "
+        "facebook, instagram, twitter, linkedin, timezone, "
+        "enrichment_stage, "
         "data_quality_score, email_state, email_sub_state, email_status, email_valid, is_active, created_at"
     ).eq("is_active", is_active)
 
@@ -82,6 +92,42 @@ async def list_leads(
     if email_sub_state:
         query = query.eq("email_sub_state", email_sub_state)
         count_query = count_query.eq("email_sub_state", email_sub_state)
+    if min_stars is not None:
+        query = query.gte("google_stars", min_stars)
+        count_query = count_query.gte("google_stars", min_stars)
+    if max_stars is not None:
+        query = query.lte("google_stars", max_stars)
+        count_query = count_query.lte("google_stars", max_stars)
+    if min_reviews is not None:
+        query = query.gte("google_review_count", min_reviews)
+        count_query = count_query.gte("google_review_count", min_reviews)
+    if max_reviews is not None:
+        query = query.lte("google_review_count", max_reviews)
+        count_query = count_query.lte("google_review_count", max_reviews)
+    if source:
+        query = query.eq("source", source)
+        count_query = count_query.eq("source", source)
+    if has_facebook is not None:
+        if has_facebook:
+            query = query.not_.is_("facebook", "null")
+            count_query = count_query.not_.is_("facebook", "null")
+        else:
+            query = query.is_("facebook", "null")
+            count_query = count_query.is_("facebook", "null")
+    if has_instagram is not None:
+        if has_instagram:
+            query = query.not_.is_("instagram", "null")
+            count_query = count_query.not_.is_("instagram", "null")
+        else:
+            query = query.is_("instagram", "null")
+            count_query = count_query.is_("instagram", "null")
+    if has_linkedin is not None:
+        if has_linkedin:
+            query = query.not_.is_("linkedin", "null")
+            count_query = count_query.not_.is_("linkedin", "null")
+        else:
+            query = query.is_("linkedin", "null")
+            count_query = count_query.is_("linkedin", "null")
 
     # Get total count
     count_result = count_query.execute()

@@ -140,6 +140,24 @@ def _to_bool(v) -> Optional[bool]:
     return str(v).strip().lower() in ("true", "yes", "1", "y", "verified", "claimed")
 
 
+_HOURS_DAYS = ("monday", "tuesday", "wednesday", "thursday",
+               "friday", "saturday", "sunday")
+
+
+def _s(v) -> Optional[str]:
+    """Trim a string; empty -> None."""
+    if v in (None, ""):
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _hours(raw: dict) -> Optional[dict]:
+    """Collect '<day> hours' keys into a {day: value} dict; None if all empty."""
+    h = {d: _s(raw.get(f"{d} hours")) for d in _HOURS_DAYS}
+    return h if any(h.values()) else None
+
+
 def _process_results(db, results: list, run_id: str, worker_id: str,
                      scraper_id: str, settings: dict) -> dict:
     """
@@ -252,6 +270,22 @@ def _process_results(db, results: list, run_id: str, worker_id: str,
                 "google_stars":        _to_float(raw_lead.get("rating")),
                 "google_review_count": _to_int(raw_lead.get("reviews")),
                 "g_maps_claimed":      _to_bool(raw_lead.get("business verified")),
+                # Phase B — rich fields promoted to their own columns.
+                # Keys are the scraper's actual (lowercased) field names,
+                # confirmed from a live Quick-mode lead.
+                "facebook":         _s(raw_lead.get("facebook")),
+                "instagram":        _s(raw_lead.get("instagram")),
+                "twitter":          _s(raw_lead.get("twitter")),
+                "linkedin":         _s(raw_lead.get("linkedin")),
+                "description":      _s(raw_lead.get("description")),
+                "timezone":         _s(raw_lead.get("timezone")),
+                "lat":              _to_float(raw_lead.get("lat")),
+                "lng":              _to_float(raw_lead.get("long")),
+                "business_hours":   _hours(raw_lead),
+                "review_url":       _s(raw_lead.get("review url")),
+                "extra_categories": _s(raw_lead.get("extra categories")),
+                "image_url":        _s(raw_lead.get("image url")),
+                "price_text":       _s(raw_lead.get("price text")),
                 "source":        "local_scraper",
                 # Preserve the ENTIRE scraped lead (socials, hours, geo,
                 # description, etc.) in jsonb so no field is ever dropped.
