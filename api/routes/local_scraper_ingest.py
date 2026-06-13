@@ -112,6 +112,34 @@ def _normalize_website(raw: Optional[str]) -> Optional[str]:
     return s or None
 
 
+def _to_float(v) -> Optional[float]:
+    """Parse a rating-like value ('4.5') to float. None/garbage -> None."""
+    if v in (None, ""):
+        return None
+    try:
+        return float(str(v).replace(",", "").strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def _to_int(v) -> Optional[int]:
+    """Parse a review-count-like value ('1,234', '(1,234)') to int by
+    extracting digits. None/no-digits -> None."""
+    if v in (None, ""):
+        return None
+    digits = "".join(ch for ch in str(v) if ch.isdigit())
+    return int(digits) if digits else None
+
+
+def _to_bool(v) -> Optional[bool]:
+    """Parse a verified/claimed-like value to bool. None/'' -> None."""
+    if isinstance(v, bool):
+        return v
+    if v in (None, ""):
+        return None
+    return str(v).strip().lower() in ("true", "yes", "1", "y", "verified", "claimed")
+
+
 def _process_results(db, results: list, run_id: str, worker_id: str,
                      scraper_id: str, settings: dict) -> dict:
     """
@@ -217,8 +245,18 @@ def _process_results(db, results: list, run_id: str, worker_id: str,
                 "zip":           (raw_lead.get("zip") or "").strip() or None,
                 "niche_slug":    (raw_lead.get("niche_slug") or
                                   raw_lead.get("category") or "").strip() or None,
+                # Google Maps signals -> existing columns (already surfaced by
+                # the Lead Finder API + feed fit_reputation). Local Scraper
+                # provides these; CSV import does not, so they were previously
+                # NULL on scraped leads.
+                "google_stars":        _to_float(raw_lead.get("rating")),
+                "google_review_count": _to_int(raw_lead.get("reviews")),
+                "g_maps_claimed":      _to_bool(raw_lead.get("business verified")),
                 "source":        "local_scraper",
-                "source_metadata": source_metadata,
+                # Preserve the ENTIRE scraped lead (socials, hours, geo,
+                # description, etc.) in jsonb so no field is ever dropped.
+                # Phase B can promote specific keys to their own columns later.
+                "source_metadata": {**source_metadata, "raw": raw_lead},
                 "dnc_status":    "unchecked",
                 "is_active":     True,
                 "enrichment_stage": 0,
