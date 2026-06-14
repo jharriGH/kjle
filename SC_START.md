@@ -27,6 +27,7 @@ You are an SC seat for the KJ Empire (DevelopingRiches Inc · owner Jim Harris /
 - **Boundary discipline.** Each product owns its repo/Supabase/service. KLE owns campaign I/O; EmpireSenderz owns fleet/routing I/O. Treat other products' repos as read-only.
 - **Verify pushes by SHA** (pushed == remote).
 - End substantive replies with a short status footer + an "in flight" line.
+- **Update your repo's `ROADMAP.md` after each completed task** — set `status` + `last_updated` in the front-matter and note what changed. The dashboard reads it; a stale roadmap = a stale dashboard.
 
 ## Key references
 - Central repo: `jharriGH/kjle` · Brain: `https://jim-brain-production.up.railway.app` (key in vault) · Dashboard: `https://jharrigh.github.io/empire-dashboard`
