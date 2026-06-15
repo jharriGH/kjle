@@ -1,3 +1,17 @@
+## Empire onboarding -- read every session
+Single source of truth: jharriGH/kjle. On session start, fetch + follow:
+- https://raw.githubusercontent.com/jharriGH/kjle/main/EMPIRE_SC_HANDOFF.md
+- https://raw.githubusercontent.com/jharriGH/kjle/main/EMPIRE_INTEGRATION_STANDARD.md
+Keep current at this repo root:
+1. ROADMAP.md -- valid YAML front-matter (project, status, description, last_updated, repo,
+   api_url, facts_doc, vault_key, integrates_with). The empire dashboard reads this; bump
+   last_updated on any change.
+2. PROJECT_FACTS.md -- integration contract (endpoints, schema, auth), verified against the
+   live system. Vault key NAMES only, never secret values.
+To learn about another project: brain_search for "<project> integration" or read EMPIRE_INDEX.md
+in jharriGH/kjle -> that project's PROJECT_FACTS.md -> brain_vault_search for its key.
+Repo edits: this repo only, explicit file paths only.
+
 ## 👑 Empire onboarding — read every session
 Single source of truth: this repo (jharriGH/kjle). On session start, follow EMPIRE_SC_HANDOFF.md
 and EMPIRE_INTEGRATION_STANDARD.md at the repo root.
