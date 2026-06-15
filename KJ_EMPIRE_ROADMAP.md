@@ -23,6 +23,12 @@ vault_key: API_SECRET_KEY
 
 # 👑 KJ EMPIRE — CENTRALIZED ROADMAP
 
+## ✅ COMPLETED — 2026-06-13 (RI bugs + TH DNC)
+- **RI Bug 1.1** (set-accounts 500): RESOLVED — prod already correctly keyed (397 mailboxes, set-accounts 200); old 500s were stale.
+- **RI Bug 2.1** (rollback orphan): FIXED, kjle commit `c3f72ce` — RI has no delete API; both rollback paths now pause-instead-of-delete.
+- **TH DNC**: CASE A verified; 5 fail-closed gates LIVE on Cash Cow Engine `8bW4A5YdfJyU1Pl1` (intake + pre-RVM + pre-SMS-D7/D10/After-AVA); onError audit-consistency patch shipped; compliant + verified on live.
+- **Follow-ups**: pin a permanent internal DNC test number (`+19095813010` drifted clean); rotate the n8n key (was inlined).
+
 **Owner:** Jim Harris, DevelopingRiches Inc
 **Last refresh:** 2026-06-14 (AVA Smart Routing Phase C2 section added — Empire Inbound Router; outbound-lock-gated)
 **Sprint goal:** Autonomous lead pumping live by **Monday 2026-06-09**
