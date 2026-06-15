@@ -213,29 +213,37 @@ async def import_csv(upload_id: str, opts: ImportOptions, db=Depends(get_db)):
     failed = 0
     failed_rows: List[dict] = []
 
-    # Pre-fetch existing phones for dedup (only if needed)
+    # Dedup prefetch — TARGETED: only pull the existing phones that actually
+    # collide with THIS chunk (scales with chunk size, not the whole leads table).
+    # The prior version paginated all ~600K phones on every chunk import, which
+    # made each chunk take minutes. Here we clean the chunk's phones first (same
+    # logic as the per-row pass below) and fetch matches with a single IN query.
     existing_phones: set = set()
     if opts.skip_duplicates:
-        try:
-            page_size = 1000
-            offset = 0
-            while True:
-                res = (
-                    db.table("leads")
-                    .select("phone")
-                    .not_.is_("phone", "null")
-                    .range(offset, offset + page_size - 1)
-                    .execute()
-                )
-                batch = res.data or []
-                for r in batch:
-                    if r.get("phone"):
-                        existing_phones.add(re.sub(r"\D", "", r["phone"]))
-                if len(batch) < page_size:
-                    break
-                offset += page_size
-        except Exception as e:
-            logger.warning(f"[csv-import] Could not pre-fetch phones for dedup: {e}")
+        phone_cols = [c for c, f in mapping.items() if f == "phone"]
+        chunk_phones: set = set()
+        for row in rows:
+            for c in phone_cols:
+                cp = _clean_phone(row.get(c, ""))
+                if cp:
+                    chunk_phones.add(cp)
+        if chunk_phones:
+            try:
+                # Chunk the IN list to keep query strings well within limits.
+                phone_list = list(chunk_phones)
+                for i in range(0, len(phone_list), 500):
+                    sub = phone_list[i:i + 500]
+                    res = (
+                        db.table("leads")
+                        .select("phone")
+                        .in_("phone", sub)
+                        .execute()
+                    )
+                    for r in (res.data or []):
+                        if r.get("phone"):
+                            existing_phones.add(re.sub(r"\D", "", r["phone"]))
+            except Exception as e:
+                logger.warning(f"[csv-import] Could not fetch existing phones for dedup: {e}")
 
     for idx, row in enumerate(rows):
         row_num = idx + 1
