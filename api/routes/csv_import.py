@@ -8,8 +8,7 @@ import io
 import logging
 import re
 import uuid
-from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -21,10 +20,15 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# ── In-memory upload store (max 50, evict oldest) ─────────────────────────────
+# ── Shared upload store (Supabase table: csv_uploads) ─────────────────────────
+# Uploads are persisted to Supabase rather than process memory so that ANY API
+# worker can retrieve them at /csv/import time. A prior in-memory dict broke
+# under multi-worker deployments (Render Standard): the upload landed in one
+# worker's memory and the follow-up import request load-balanced to a different
+# worker, yielding 404 "not found or expired". The shared table is immune to
+# that and self-cleans (rows are deleted on import + purged after the TTL).
 
-_upload_store: OrderedDict[str, dict] = OrderedDict()
-_UPLOAD_STORE_MAX = 50
+_UPLOAD_TTL_SECONDS = 3600  # uploads unused for >1h are considered expired
 
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 PREVIEW_ROWS = 5
@@ -67,10 +71,38 @@ class ImportOptions(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _store_upload(upload_id: str, data: dict) -> None:
-    if len(_upload_store) >= _UPLOAD_STORE_MAX:
-        _upload_store.popitem(last=False)  # evict oldest
-    _upload_store[upload_id] = data
+def _purge_expired_uploads(db) -> None:
+    """Best-effort cleanup of stale upload rows (older than the TTL)."""
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=_UPLOAD_TTL_SECONDS)).isoformat()
+        db.table("csv_uploads").delete().lt("created_at", cutoff).execute()
+    except Exception as e:
+        logger.warning(f"[csv-import] Could not purge expired uploads: {e}")
+
+
+def _store_upload(db, upload_id: str, data: dict) -> None:
+    """Persist an upload to the shared Supabase store so any worker can read it."""
+    _purge_expired_uploads(db)
+    db.table("csv_uploads").insert({"upload_id": upload_id, "payload": data}).execute()
+
+
+def _fetch_upload(db, upload_id: str) -> Optional[dict]:
+    """Retrieve a previously stored upload payload, or None if missing/expired."""
+    res = (
+        db.table("csv_uploads")
+        .select("payload")
+        .eq("upload_id", upload_id)
+        .execute()
+    )
+    if not res.data:
+        return None
+    return res.data[0].get("payload")
+
+
+def _delete_upload(db, upload_id: str) -> bool:
+    """Remove an upload row from the shared store. Returns True if a row existed."""
+    res = db.table("csv_uploads").delete().eq("upload_id", upload_id).execute()
+    return bool(res.data)
 
 
 def _suggest_mappings(headers: List[str]) -> Dict[str, str]:
@@ -141,7 +173,7 @@ async def upload_csv(file: UploadFile = File(...), db=Depends(get_db)):
     preview = rows[:PREVIEW_ROWS]
     suggested = _suggest_mappings(headers)
 
-    _store_upload(upload_id, {
+    _store_upload(db, upload_id, {
         "filename": file.filename,
         "headers": headers,
         "rows": rows,
@@ -164,7 +196,7 @@ async def upload_csv(file: UploadFile = File(...), db=Depends(get_db)):
 async def import_csv(upload_id: str, opts: ImportOptions, db=Depends(get_db)):
     """Import leads from a previously uploaded CSV using caller-supplied field mapping."""
 
-    upload = _upload_store.get(upload_id)
+    upload = _fetch_upload(db, upload_id)
     if not upload:
         raise HTTPException(
             status_code=404,
@@ -317,6 +349,9 @@ async def import_csv(upload_id: str, opts: ImportOptions, db=Depends(get_db)):
     except Exception as e:
         logger.warning(f"[csv-import] Could not write to import_log: {e}")
 
+    # ── clean up the shared upload row now that it's imported ───────────────
+    _delete_upload(db, upload_id)
+
     return {
         "status": "complete",
         "upload_id": upload_id,
@@ -361,8 +396,7 @@ async def get_import(import_id: str, db=Depends(get_db)):
 
 @router.delete("/csv/uploads/{upload_id}")
 async def delete_upload(upload_id: str, db=Depends(get_db)):
-    """Remove an upload session from in-memory store."""
-    if upload_id not in _upload_store:
+    """Remove an upload session from the shared store."""
+    if not _delete_upload(db, upload_id):
         raise HTTPException(status_code=404, detail=f"Upload ID '{upload_id}' not found.")
-    del _upload_store[upload_id]
     return {"status": "deleted", "upload_id": upload_id}
