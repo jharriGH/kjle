@@ -2,7 +2,7 @@
 project: KJLE
 status: active
 description: Lead engine — scraping, classification, DNC compliance, RI campaign creation. Data hub for the empire.
-last_updated: 2026-06-09
+last_updated: 2026-06-14
 integrates_with:
   - EmpireSenderz
   - TH
@@ -24,7 +24,7 @@ vault_key: API_SECRET_KEY
 # 👑 KJ EMPIRE — CENTRALIZED ROADMAP
 
 **Owner:** Jim Harris, DevelopingRiches Inc
-**Last refresh:** 2026-06-07 (Day 3 — Local Scraper pipeline proven end-to-end)
+**Last refresh:** 2026-06-14 (AVA Smart Routing Phase C2 section added — Empire Inbound Router; outbound-lock-gated)
 **Sprint goal:** Autonomous lead pumping live by **Monday 2026-06-09**
 **Source of truth:** This file + `KJ_EMPIRE_ROADMAP.html`
 **KJLE main HEAD:** `d42b54a` (last verified by this seat) — SC reports main now at `46ec14e`; SC to confirm before any pull.
@@ -180,6 +180,59 @@ Commit + redeploy `kjle-api`, re-fire one scrape, expect `inserted_count > 0`. A
 | n8n learning curve eats Day 4-5 | Medium | +$2-3 |
 | Scope creep — "just add X" | High | +$3-5 per off-roadmap dispatch — **biggest budget risk** |
 | Brain memory 500s | Low | $0 — fall back to brain_log |
+
+---
+
+## 📡 AVA SMART ROUTING — PHASE C2 (Empire Inbound Router)
+
+**Updated:** 2026-06-14
+**Scope:** AVA-using products
+**New repo:** `empire-inbound-router` (not yet deployed)
+**Config schema:** `ava_router`
+
+**Summary:** Empire inbound router for the shared 866. A call back to 866 is identified by caller number and routed to the correct AVA context (`reviewbombz_crisis_inbound`, `telehealth_closer_inbound`, `kjwidgetz_warm_inbound`) with IVR/default fallback for unknown callers. Built as a NEW standalone sidecar with **zero edits** to the live outbound AVA stack.
+
+### ❌ HARD GATE — AVA outbound LOCKED Brain log missing
+
+No AVA outbound LOCKED Brain log exists. **All deploy, flip, and test items are HELD** until the outbound AVA SC posts the lock.
+
+### 🟢 Done & verified
+
+| Item | Status |
+|---|---|
+| Sidecar `main.py` + `lookup.py` import-clean | 🟢 |
+| Fail-safe to default IVR | 🟢 |
+| Read-only parameterized lookup | 🟢 |
+| AVA-only scope enforced in code | 🟢 |
+| Routing precedence: recent outbound call → product tables → unknown/default | 🟢 |
+| SIP target hardened off loopback to `sip:192.161.173.97:5060` with `/health` warning | 🟢 |
+| Full GOAT admin config drafted (`ava_router` schema: `routes`, `personas`, `settings`, `route_log`; idempotent migration, **NOT applied**) | 🟢 |
+| `config_store.py` loader + `render_contexts` generator drafted | 🟢 |
+| `vps_exec` guard widened (`/home/ccrunner` readable live; `/opt/ava/src` + dotfile deny committed `86bb484`, Render cutover) | 🟢 |
+
+### 🔵 / ⏸️ Pending — blocked / queued
+
+| Item | Status |
+|---|---|
+| Admin panel UI — NEW AVA Router module on the KJLE Command Deck (`deck.kjle.com`); placement decided, **NOT** in ReviewBombz UI | 🔵 Queued |
+| Apply `ava_router` migration to Supabase (manual rule) — gates the panel | 🔵 Queued |
+| Inbound contexts into `ai-agent.local.yaml` | ⏸️ Parked on outbound lock |
+| Asterisk reload | ⏸️ Parked on outbound lock |
+| 866 `voice_url` flip | ⏸️ Parked on outbound lock |
+| Inbound test calls | ⏸️ Parked on outbound lock |
+
+### ⚙️ Admin panel option set
+
+- **Voice / persona:** voice (alloy default; echo / shimmer / ash / ballad / coral / sage / verse), tone, agent_name, language, greeting, persona_prompt, temperature, speaking_rate
+- **Audio / turn:** vad_threshold, noise_reduction (near_field), silence_hangup 8s, max_call
+- **Routing:** product, category, direction, match_source, priority, business_hours, timezone, fallback
+- **Ops:** route_log feed, health, unknown-caller rate; guarded 866 `voice_url` flip + rollback
+
+### 🤝 SC coordination
+
+- Outbound AVA SC owns the **AVA outbound LOCKED** signal
+- Jim is confirming outbound status
+- No C2 deploy moves until the lock lands
 
 ---
 

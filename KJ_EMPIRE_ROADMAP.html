@@ -78,13 +78,13 @@
   </div>
   <p class="card-desc">Lead engine — scraping, classification, DNC compliance, RI campaign creation. Data hub for the empire.</p><p class="card-notes">LS pipeline proven end-to-end (job ed784559, 120 leads). One SC casing patch from leads landing. kjle-api flapping root-caused (scheduler loop blocking). DNC swap to RealValidito in flight.</p>
   <div class="meta-grid">
-    <div class="meta-row"><span class="meta-k">Sprint</span><span class="meta-v">Day 3 done — LS pipeline proven; casing patch + DNC swap pending</span></div><div class="meta-row"><span class="meta-k">Target date</span><span class="meta-v">2026-06-09</span></div><div class="meta-row"><span class="meta-k">Last updated</span><span class="meta-v">2026-06-09</span></div><div class="meta-row"><span class="meta-k">Integrates with</span><span class="meta-v">EmpireSenderz, TH, DemoEnginez, DemoBoosterz, Local Scraper workers</span></div><div class="meta-row"><span class="meta-k">Budget</span><span class="meta-v">$10.92 spent · $4.08 remaining</span></div>
+    <div class="meta-row"><span class="meta-k">Sprint</span><span class="meta-v">Day 3 done — LS pipeline proven; casing patch + DNC swap pending</span></div><div class="meta-row"><span class="meta-k">Target date</span><span class="meta-v">2026-06-09</span></div><div class="meta-row"><span class="meta-k">Last updated</span><span class="meta-v">2026-06-14</span></div><div class="meta-row"><span class="meta-k">Integrates with</span><span class="meta-v">EmpireSenderz, TH, DemoEnginez, DemoBoosterz, Local Scraper workers</span></div><div class="meta-row"><span class="meta-k">Budget</span><span class="meta-v">$10.92 spent · $4.08 remaining</span></div>
   </div>
 </div>
   <div class="body">
 <h1 id="kj-empire-centralized-roadmap">👑 KJ EMPIRE — CENTRALIZED ROADMAP</h1>
 <p><strong>Owner:</strong> Jim Harris, DevelopingRiches Inc
-<strong>Last refresh:</strong> 2026-06-07 (Day 3 — Local Scraper pipeline proven end-to-end)
+<strong>Last refresh:</strong> 2026-06-14 (AVA Smart Routing Phase C2 section added — Empire Inbound Router; outbound-lock-gated)
 <strong>Sprint goal:</strong> Autonomous lead pumping live by <strong>Monday 2026-06-09</strong>
 <strong>Source of truth:</strong> This file + <code>KJ_EMPIRE_ROADMAP.html</code>
 <strong>KJLE main HEAD:</strong> <code>d42b54a</code> (last verified by this seat) — SC reports main now at <code>46ec14e</code>; SC to confirm before any pull.</p>
@@ -454,6 +454,110 @@
 </tr>
 </tbody>
 </table>
+<hr />
+<h2 id="ava-smart-routing-phase-c2">📡 AVA SMART ROUTING — PHASE C2 (Empire Inbound Router)</h2>
+<p><strong>Updated:</strong> 2026-06-14
+<strong>Scope:</strong> AVA-using products
+<strong>New repo:</strong> <code>empire-inbound-router</code> (not yet deployed)
+<strong>Config schema:</strong> <code>ava_router</code></p>
+<p><strong>Summary:</strong> Empire inbound router for the shared 866. A call back to 866 is identified by caller number and routed to the correct AVA context (<code>reviewbombz_crisis_inbound</code>, <code>telehealth_closer_inbound</code>, <code>kjwidgetz_warm_inbound</code>) with IVR/default fallback for unknown callers. Built as a NEW standalone sidecar with <strong>zero edits</strong> to the live outbound AVA stack.</p>
+<h3 id="c2-hard-gate">❌ HARD GATE — AVA outbound LOCKED Brain log missing</h3>
+<p>No AVA outbound LOCKED Brain log exists. <strong>All deploy, flip, and test items are HELD</strong> until the outbound AVA SC posts the lock.</p>
+<h3 id="c2-done-verified">🟢 Done &amp; verified</h3>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sidecar <code>main.py</code> + <code>lookup.py</code> import-clean</td>
+<td>🟢</td>
+</tr>
+<tr>
+<td>Fail-safe to default IVR</td>
+<td>🟢</td>
+</tr>
+<tr>
+<td>Read-only parameterized lookup</td>
+<td>🟢</td>
+</tr>
+<tr>
+<td>AVA-only scope enforced in code</td>
+<td>🟢</td>
+</tr>
+<tr>
+<td>Routing precedence: recent outbound call → product tables → unknown/default</td>
+<td>🟢</td>
+</tr>
+<tr>
+<td>SIP target hardened off loopback to <code>sip:192.161.173.97:5060</code> with <code>/health</code> warning</td>
+<td>🟢</td>
+</tr>
+<tr>
+<td>Full GOAT admin config drafted (<code>ava_router</code> schema: <code>routes</code>, <code>personas</code>, <code>settings</code>, <code>route_log</code>; idempotent migration, <strong>NOT applied</strong>)</td>
+<td>🟢</td>
+</tr>
+<tr>
+<td><code>config_store.py</code> loader + <code>render_contexts</code> generator drafted</td>
+<td>🟢</td>
+</tr>
+<tr>
+<td><code>vps_exec</code> guard widened (<code>/home/ccrunner</code> readable live; <code>/opt/ava/src</code> + dotfile deny committed <code>86bb484</code>, Render cutover)</td>
+<td>🟢</td>
+</tr>
+</tbody>
+</table>
+<h3 id="c2-pending">🔵 / ⏸️ Pending — blocked / queued</h3>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Admin panel UI — NEW AVA Router module on the KJLE Command Deck (<code>deck.kjle.com</code>); placement decided, <strong>NOT</strong> in ReviewBombz UI</td>
+<td>🔵 Queued</td>
+</tr>
+<tr>
+<td>Apply <code>ava_router</code> migration to Supabase (manual rule) — gates the panel</td>
+<td>🔵 Queued</td>
+</tr>
+<tr>
+<td>Inbound contexts into <code>ai-agent.local.yaml</code></td>
+<td>⏸️ Parked on outbound lock</td>
+</tr>
+<tr>
+<td>Asterisk reload</td>
+<td>⏸️ Parked on outbound lock</td>
+</tr>
+<tr>
+<td>866 <code>voice_url</code> flip</td>
+<td>⏸️ Parked on outbound lock</td>
+</tr>
+<tr>
+<td>Inbound test calls</td>
+<td>⏸️ Parked on outbound lock</td>
+</tr>
+</tbody>
+</table>
+<h3 id="c2-admin-panel-options">⚙️ Admin panel option set</h3>
+<ul>
+<li><strong>Voice / persona:</strong> voice (alloy default; echo / shimmer / ash / ballad / coral / sage / verse), tone, agent_name, language, greeting, persona_prompt, temperature, speaking_rate</li>
+<li><strong>Audio / turn:</strong> vad_threshold, noise_reduction (near_field), silence_hangup 8s, max_call</li>
+<li><strong>Routing:</strong> product, category, direction, match_source, priority, business_hours, timezone, fallback</li>
+<li><strong>Ops:</strong> route_log feed, health, unknown-caller rate; guarded 866 <code>voice_url</code> flip + rollback</li>
+</ul>
+<h3 id="c2-sc-coordination">🤝 SC coordination</h3>
+<ul>
+<li>Outbound AVA SC owns the <strong>AVA outbound LOCKED</strong> signal</li>
+<li>Jim is confirming outbound status</li>
+<li>No C2 deploy moves until the lock lands</li>
+</ul>
 <hr />
 <h2 id="external-dependencies-sc-coordination">🤝 EXTERNAL DEPENDENCIES — SC COORDINATION</h2>
 <h3 id="kjle-backend-sc-new-this-seats-handoffs">KJLE backend SC (NEW — this seat's handoffs)</h3>
