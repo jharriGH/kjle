@@ -61,6 +61,7 @@ from .routes import scrape_jobs
 from .routes import dnc_webhooks
 from .routes import webhooks_truelist
 from .routes import backlog_scrub
+from .routes import ava_router
 from .routes.scheduler import setup_scheduler
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -183,6 +184,7 @@ app.include_router(webhooks_truelist.router,      prefix=PREFIX,                
 app.include_router(backlog_scrub.router,          prefix=PREFIX,                  tags=["Backlog Scrub"])
 app.include_router(admin_settings.router,         prefix=PREFIX,                  tags=["Admin Settings"])
 app.include_router(campaigns.router,              prefix=PREFIX,                  tags=["Campaign Performance"])
+app.include_router(ava_router.router,             prefix=PREFIX,                  tags=["AVA Router"])
 
 
 # ── Empire-wide notification endpoints (top-level, x-brain-key auth) ──────────
