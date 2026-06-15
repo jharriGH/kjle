@@ -73,10 +73,15 @@ async def run_segment(
     offset = (page - 1) * page_size
 
     # Build query from filters
+    # NOTE: socials + timezone added so saved segments are a complete, single-call
+    # pull interface for empire consumers (REK realtor segment, RBz low-rep segment,
+    # etc.). Column names mirror the /leads list select verbatim. business_hours/geo
+    # live in source_metadata jsonb — fetch per-lead via /leads/{id} if needed.
     query = db.table("leads").select(
         "id, business_name, phone, email, website, city, state, niche_slug, "
         "pain_score, fit_demoenginez, fit_reputation, fit_schema_ranker, fit_voicedrop, "
-        "google_stars, google_review_count, g_maps_claimed, enrichment_stage, email_state"
+        "google_stars, google_review_count, g_maps_claimed, enrichment_stage, email_state, "
+        "facebook, instagram, twitter, linkedin, timezone"
     ).eq("is_active", True)
 
     # Apply filters dynamically
