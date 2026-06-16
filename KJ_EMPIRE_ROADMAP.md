@@ -23,6 +23,12 @@ vault_key: API_SECRET_KEY
 
 # 👑 KJ EMPIRE — CENTRALIZED ROADMAP
 
+## ✅ COMPLETED — 2026-06-15 (EmpireSenderz #2 — autonomous one-niche flow)
+- n8n workflow `tEuEc8oK2K0tO6oj` transformed → autonomous: **Schedule + PullEligible + GateAndCount** added in front of Route→Create→Attach (10 nodes / 9 edges, `active=False`).
+- **Validated end-to-end** via manual run: 429,827 eligible → capped 25 → 5 reputation mailboxes → draft campaign **127840** (25 leads, 5 accounts, `auto_launch=false`) → attached (routing log 14). Test draft deleted in RI.
+- RI Bug 1.1 (int→email translation) confirmed working in the real path (5 ids translated, 0 skipped).
+- **Remaining for autonomous-live** (gated on #1 seed deliverability): flip Schedule `active`; solve lead dedup before daily cadence (no KJLE attachment-exclusion yet).
+
 ## ✅ COMPLETED — 2026-06-13 (RI bugs + TH DNC)
 - **RI Bug 1.1** (set-accounts 500): RESOLVED — prod already correctly keyed (397 mailboxes, set-accounts 200); old 500s were stale.
 - **RI Bug 2.1** (rollback orphan): FIXED, kjle commit `c3f72ce` — RI has no delete API; both rollback paths now pause-instead-of-delete.
