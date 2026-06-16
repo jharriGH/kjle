@@ -245,6 +245,7 @@ async def import_csv(upload_id: str, opts: ImportOptions, db=Depends(get_db)):
             except Exception as e:
                 logger.warning(f"[csv-import] Could not fetch existing phones for dedup: {e}")
 
+    to_insert: List[tuple] = []  # (row_num, lead) queued for bulk insert
     for idx, row in enumerate(rows):
         row_num = idx + 1
         try:
@@ -321,16 +322,35 @@ async def import_csv(upload_id: str, opts: ImportOptions, db=Depends(get_db)):
             # ── strip empty strings ───────────────────────────────────────
             lead = {k: v for k, v in lead.items() if v != "" and v is not None}
 
-            # ── insert ────────────────────────────────────────────────────
-            db.table("leads").insert(lead).execute()
-
-            existing_phones.add(clean_phone)  # update local set
-            imported += 1
+            # ── queue for bulk insert (actual insert happens after loop) ───
+            to_insert.append((row_num, lead))
+            existing_phones.add(clean_phone)  # update local set (intra-batch dedup)
 
         except Exception as e:
             failed += 1
             logger.error(f"[csv-import] Failed row {row_num}: {e}")
             failed_rows.append({"row": row_num, "data": row, "reason": str(e)})
+
+    # ── bulk insert: one round-trip per 500 rows instead of one per row ─────
+    # (per-row inserts were ~100ms each → ~51s/500 rows; bulk is <1s/500 rows)
+    BULK_BATCH = 500
+    for i in range(0, len(to_insert), BULK_BATCH):
+        pair_batch = to_insert[i:i + BULK_BATCH]
+        lead_batch = [lead for (_rn, lead) in pair_batch]
+        try:
+            db.table("leads").insert(lead_batch).execute()
+            imported += len(lead_batch)
+        except Exception as bulk_err:
+            # One bad row shouldn't sink the batch — fall back to per-row for this batch only
+            logger.warning(f"[csv-import] Bulk insert failed at offset {i}, retrying per-row: {bulk_err}")
+            for rnum, lead in pair_batch:
+                try:
+                    db.table("leads").insert(lead).execute()
+                    imported += 1
+                except Exception as row_err:
+                    failed += 1
+                    logger.error(f"[csv-import] Failed row {rnum} insert: {row_err}")
+                    failed_rows.append({"row": rnum, "data": lead, "reason": str(row_err)})
 
     total_rows = len(rows)
     skipped_total = skipped_duplicate + skipped_invalid
