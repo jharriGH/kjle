@@ -15,6 +15,7 @@ Complete campaign creation from KJLE Lead Finder:
 
 import logging
 import httpx
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
@@ -159,6 +160,30 @@ async def ri_delete(path: str) -> dict:
             raise HTTPException(status_code=r.status_code, detail=f"ReachInbox error: {r.text[:200]}")
         return r.json() if r.text else {}
 
+def _reattach_cutoff_iso() -> Optional[str]:
+    """ISO cutoff for reattach-cooldown dedup, or None when disabled.
+
+    Reads admin_settings 'campaign_reattach_cooldown_days' (default 30).
+    Returns None when days <= 0, else (utcnow - days) as ISO-8601.
+    """
+    db = get_db()
+    try:
+        res = (
+            db.table("admin_settings")
+            .select("value")
+            .eq("key", "campaign_reattach_cooldown_days")
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        days = int(rows[0]["value"]) if rows else 30
+    except Exception:
+        days = 30
+    if days <= 0:
+        return None
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
 def fetch_kjle_leads(filters: CampaignLeadFilter) -> list:
     """Pull leads from KJLE database based on filters."""
     db = get_db()
@@ -179,6 +204,13 @@ def fetch_kjle_leads(filters: CampaignLeadFilter) -> list:
         query = query.eq("state", filters.state.upper())
     if filters.segment_label:
         query = query.eq("segment_label", filters.segment_label)
+
+    # Exclude leads attached to a campaign within the reattach-cooldown window
+    # (admin_settings 'campaign_reattach_cooldown_days', default 30). NULL =
+    # never attached, so it always passes.
+    cutoff = _reattach_cutoff_iso()
+    if cutoff:
+        query = query.or_(f"last_campaign_attached_at.is.null,last_campaign_attached_at.lt.{cutoff}")
 
     # Deterministic ordering so LIMIT cuts at the same boundary every call,
     # and the partial-index planner (leads_campaign_eligible_idx) gets a
@@ -481,8 +513,12 @@ async def create_full_campaign(body: CreateCampaignRequest):
             )
 
         # ── Step 6: Add pre-fetched KJLE leads to campaign ────────────────────
-        ri_leads = [map_lead_to_ri(lead) for lead in kjle_leads if lead.get("email")]
+        # Keep KJLE rows and their RI payloads index-aligned so the success
+        # branch can record exactly which lead_ids were attached.
+        kjle_with_email = [l for l in kjle_leads if l.get("email")]
+        ri_leads = [map_lead_to_ri(l) for l in kjle_with_email]
 
+        attached_lead_ids = []
         batch_size = 100
         for i in range(0, len(ri_leads), batch_size):
             batch = ri_leads[i:i+batch_size]
@@ -497,6 +533,7 @@ async def create_full_campaign(body: CreateCampaignRequest):
                     f"result={str(add_result)[:200]}"
                 )
                 leads_added += len(batch)
+                attached_lead_ids.extend(l["id"] for l in kjle_with_email[i:i+batch_size])
             except Exception as e:
                 logger.warning(
                     f"[reachinbox.add_leads] batch {i} FAILED: "
@@ -595,6 +632,20 @@ async def create_full_campaign(body: CreateCampaignRequest):
         logger.warning(f"[auto-register] non-fatal (campaign_id={campaign_id}): {e}")
         steps_completed.append(f"⚠️ auto-register skipped: {str(e)[:100]}")
 
+    # ── Record campaign_lead_attachments (non-fatal) ─────────────────────────
+    # Powers the reattach-cooldown dedup on future fetch_kjle_leads calls.
+    # Only reached on the no-exception path, so attached_lead_ids is defined.
+    if attached_lead_ids:
+        try:
+            rows = [{"lead_id": lid, "provider_campaign_id": str(campaign_id),
+                     "vertical": body.lead_filter.niche_slug, "source": "reachinbox_create"}
+                    for lid in attached_lead_ids]
+            get_db().table("campaign_lead_attachments").upsert(
+                rows, on_conflict="lead_id,provider_campaign_id", ignore_duplicates=True).execute()
+            steps_completed.append(f"🔒 {len(attached_lead_ids)} attachments recorded")
+        except Exception as e:
+            logger.warning(f"[attach-record] non-fatal (campaign_id={campaign_id}): {e}")
+
     return {
         "status":          "success",
         "campaign_id":     campaign_id,
@@ -621,8 +672,10 @@ async def add_leads_to_campaign(body: AddLeadsRequest):
     if not kjle_leads:
         return {"status": "success", "added": 0, "message": "No matching leads found"}
 
-    ri_leads    = [map_lead_to_ri(lead) for lead in kjle_leads if lead.get("email")]
+    kjle_with_email = [l for l in kjle_leads if l.get("email")]
+    ri_leads    = [map_lead_to_ri(l) for l in kjle_with_email]
     leads_added = 0
+    attached_lead_ids = []
 
     batch_size = 100
     for i in range(0, len(ri_leads), batch_size):
@@ -638,11 +691,23 @@ async def add_leads_to_campaign(body: AddLeadsRequest):
                 f"result={str(add_result)[:200]}"
             )
             leads_added += len(batch)
+            attached_lead_ids.extend(l["id"] for l in kjle_with_email[i:i+batch_size])
         except Exception as e:
             logger.warning(
                 f"[reachinbox.add_leads] batch {i} FAILED: "
                 f"sample_payload={str(add_payload)[:300]!r} error={e!r}"
             )
+
+    # ── Record campaign_lead_attachments (non-fatal) ─────────────────────────
+    if attached_lead_ids:
+        try:
+            rows = [{"lead_id": lid, "provider_campaign_id": str(body.campaign_id),
+                     "vertical": body.lead_filter.niche_slug, "source": "reachinbox_add"}
+                    for lid in attached_lead_ids]
+            get_db().table("campaign_lead_attachments").upsert(
+                rows, on_conflict="lead_id,provider_campaign_id", ignore_duplicates=True).execute()
+        except Exception as e:
+            logger.warning(f"[attach-record] non-fatal (campaign_id={body.campaign_id}): {e}")
 
     return {
         "status":      "success",

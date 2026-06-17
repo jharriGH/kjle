@@ -5,6 +5,7 @@ File: api/routes/lead_management.py
 
 import os
 import logging
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 from fastapi import APIRouter, HTTPException, Header, Query
 from pydantic import BaseModel
@@ -27,6 +28,29 @@ def verify_api_key(x_api_key: str = Header(...)):
     if x_api_key != API_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     return x_api_key
+
+
+def _reattach_cutoff_iso(supabase) -> Optional[str]:
+    """ISO cutoff for reattach-cooldown dedup, or None when disabled.
+
+    Reads admin_settings 'campaign_reattach_cooldown_days' (default 30).
+    Returns None when days <= 0, else (utcnow - days) as ISO-8601.
+    """
+    try:
+        res = (
+            supabase.table("admin_settings")
+            .select("value")
+            .eq("key", "campaign_reattach_cooldown_days")
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        days = int(rows[0]["value"]) if rows else 30
+    except Exception:
+        days = 30
+    if days <= 0:
+        return None
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
 
 def score_to_segment(pain_score) -> str:
@@ -296,10 +320,15 @@ async def eligible_for_campaign(
     query = query.or_(dnc_or)
     count_query = count_query.or_(dnc_or)
 
-    # ── active-campaign attachment exclusion ───────────────────────────────
-    # No campaign_leads / attached_to_campaign table exists in this schema
-    # (campaign_performance is aggregate-only). Skip and surface in artifact.
-    skipped_filters.append("active_campaign_attachment_table_missing")
+    # ── reattach-cooldown exclusion ────────────────────────────────────────
+    # Exclude leads attached to a campaign within the cooldown window
+    # (admin_settings 'campaign_reattach_cooldown_days', default 30). NULL =
+    # never attached, so it always passes. Same predicate on BOTH queries.
+    cutoff = _reattach_cutoff_iso(supabase)
+    if cutoff:
+        attached_or = f"last_campaign_attached_at.is.null,last_campaign_attached_at.lt.{cutoff}"
+        query = query.or_(attached_or)
+        count_query = count_query.or_(attached_or)   # SAME predicate on BOTH
 
     # ── pre-suppression total ──────────────────────────────────────────────
     try:
