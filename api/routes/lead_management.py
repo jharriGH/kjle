@@ -293,7 +293,7 @@ async def eligible_for_campaign(
     # ── targeting + base query ─────────────────────────────────────────────
     select_cols = "id, business_name, email, phone, niche_slug, pain_score, dnc_status"
     query = supabase.table("leads").select(select_cols).eq("is_active", True)
-    count_query = supabase.table("leads").select("id", count="exact").eq("is_active", True)
+    count_query = supabase.table("leads").select("id", count="estimated").eq("is_active", True)
 
     if effective_niche:
         query = query.eq("niche_slug", effective_niche)
