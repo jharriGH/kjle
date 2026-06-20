@@ -1,0 +1,12 @@
+name: Roadmap sync
+on:
+  pull_request:
+    paths-ignore:
+      - "KJ_EMPIRE_ROADMAP.md"
+      - "scripts/build_roadmap_html.py"
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: No roadmap files changed — pass required check
+        run: echo "PR does not touch roadmap files; sync passes trivially."
