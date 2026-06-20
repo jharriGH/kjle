@@ -637,11 +637,21 @@ async def create_full_campaign(body: CreateCampaignRequest):
     # Only reached on the no-exception path, so attached_lead_ids is defined.
     if attached_lead_ids:
         try:
-            rows = [{"lead_id": lid, "provider_campaign_id": str(campaign_id),
-                     "vertical": body.lead_filter.niche_slug, "source": "reachinbox_create"}
-                    for lid in attached_lead_ids]
-            get_db().table("campaign_lead_attachments").upsert(
-                rows, on_conflict="lead_id,provider_campaign_id", ignore_duplicates=True).execute()
+            lead_by_id = {l["id"]: l for l in kjle_with_email}
+            attach_rows = [
+                {
+                    "lead_id": lid,
+                    "email": lead_by_id.get(lid, {}).get("email"),
+                    "phone": lead_by_id.get(lid, {}).get("phone"),
+                    "reachinbox_campaign_id": str(campaign_id),
+                    "campaign_name": body.name,
+                    "project": "kjle",
+                    "kje_product": None,
+                    "metadata": {"domain": body.domain_used} if body.domain_used else None,
+                }
+                for lid in attached_lead_ids
+            ]
+            get_db().table("campaign_lead_attachments").insert(attach_rows).execute()
             steps_completed.append(f"🔒 {len(attached_lead_ids)} attachments recorded")
         except Exception as e:
             logger.warning(f"[attach-record] non-fatal (campaign_id={campaign_id}): {e}")
@@ -701,11 +711,21 @@ async def add_leads_to_campaign(body: AddLeadsRequest):
     # ── Record campaign_lead_attachments (non-fatal) ─────────────────────────
     if attached_lead_ids:
         try:
-            rows = [{"lead_id": lid, "provider_campaign_id": str(body.campaign_id),
-                     "vertical": body.lead_filter.niche_slug, "source": "reachinbox_add"}
-                    for lid in attached_lead_ids]
-            get_db().table("campaign_lead_attachments").upsert(
-                rows, on_conflict="lead_id,provider_campaign_id", ignore_duplicates=True).execute()
+            lead_by_id = {l["id"]: l for l in kjle_with_email}
+            attach_rows = [
+                {
+                    "lead_id": lid,
+                    "email": lead_by_id.get(lid, {}).get("email"),
+                    "phone": lead_by_id.get(lid, {}).get("phone"),
+                    "reachinbox_campaign_id": str(body.campaign_id),
+                    "campaign_name": None,
+                    "project": "kjle",
+                    "kje_product": None,
+                    "metadata": None,
+                }
+                for lid in attached_lead_ids
+            ]
+            get_db().table("campaign_lead_attachments").insert(attach_rows).execute()
         except Exception as e:
             logger.warning(f"[attach-record] non-fatal (campaign_id={body.campaign_id}): {e}")
 
