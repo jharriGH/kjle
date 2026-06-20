@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 from typing import Optional
 
 from ..database import get_db
@@ -227,6 +227,8 @@ async def log_halt(
     metadata: Optional[dict] = None,
 ) -> None:
     """Insert one row into budget_halt_log. Swallows all exceptions."""
+    occurred_at = datetime.now(timezone.utc).isoformat()
+    _insert_ok = False
     try:
         db = get_db()
         row = {
@@ -237,14 +239,63 @@ async def log_halt(
             "cap_value_usd":            round(float(cap_value), 5),
             "leads_affected":           int(leads_affected or 0),
             "metadata":                 metadata,
-            "occurred_at":              datetime.now(timezone.utc).isoformat(),
+            "occurred_at":              occurred_at,
         }
         db.table("budget_halt_log").insert(row).execute()
         logger.warning(
             f"BUDGET HALT [{service}] job={job_name} spent=${current_spend:.4f} cap=${cap_value:.2f}"
         )
+        _insert_ok = True
     except Exception as e:
         logger.error(f"cost_guard.log_halt failed (service={service}): {e}")
+
+    if not _insert_ok:
+        return
+
+    try:
+        from .email_sender import send_email, is_configured
+        if not is_configured():
+            return
+        sixty_min_ago = (datetime.now(timezone.utc) - timedelta(minutes=60)).isoformat()
+        db = get_db()
+        prior = (
+            db.table("budget_halt_log")
+            .select("occurred_at")
+            .eq("service", service)
+            .gte("occurred_at", sixty_min_ago)
+            .limit(2)
+            .execute()
+            .data or []
+        )
+        if len(prior) > 1:
+            return
+        try:
+            res = db.table("admin_settings").select("value").eq("key", "daily_cost_report_email").execute()
+            recipient = (res.data[0].get("value") if res.data else "") or "sales@mobilewebmds.com"
+        except Exception:
+            recipient = "sales@mobilewebmds.com"
+        recipient = recipient.strip() or "sales@mobilewebmds.com"
+        breach_type = (metadata or {}).get("breach", "unknown")
+        if breach_type == "per_service_daily":
+            cap_key = SERVICE_TO_CAP_KEY.get(service, TOTAL_CAP_KEY)
+        elif breach_type == "monthly_total":
+            cap_key = MONTHLY_CAP_KEY
+        else:
+            cap_key = TOTAL_CAP_KEY
+        subject = f"KJLE BUDGET HALT [{service}] - {breach_type}"
+        body_text = (
+            f"BUDGET HALT TRIGGERED\n\n"
+            f"Job:          {job_name}\n"
+            f"Service:      {service}\n"
+            f"Breach type:  {breach_type}\n"
+            f"Daily spend:  ${round(float(current_spend), 4):.4f}\n"
+            f"Cap value:    ${round(float(cap_value), 2):.2f}\n"
+            f"Occurred at:  {occurred_at}\n\n"
+            f"To adjust the cap: update admin_settings key '{cap_key}'.\n"
+        )
+        await send_email(to=recipient, subject=subject, body_text=body_text)
+    except Exception as e:
+        logger.warning(f"cost_guard: halt email notify failed (service={service}): {e}")
 
 
 # ── Pricing helpers (public — callers compute actuals, then log) ────────────
