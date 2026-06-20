@@ -106,7 +106,6 @@ class GuardrailUpsertRequest(BaseModel):
     period: str                # "daily" | "monthly"
     limit_amount: float
     action: str                # "alert" | "pause"
-    active: bool = True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -414,7 +413,7 @@ async def get_spend_anomalies():
 @router.post("/costs/guardrails")
 async def upsert_guardrail(body: GuardrailUpsertRequest):
     """
-    Create or update a budget guardrail by name.
+    Create or update a budget guardrail by (service, period).
     Upserts into budget_guardrails table.
     """
     if body.period not in ("daily", "monthly"):
@@ -428,15 +427,7 @@ async def upsert_guardrail(body: GuardrailUpsertRequest):
 
     db = get_db()
 
-    payload = {
-        "service":      body.service,
-        "period":       body.period,
-        "limit_amount": body.limit_amount,
-        "action":       body.action,
-        "active":       body.active,
-    }
-
-    # Upsert key is (service, period); service may be NULL (global guardrail)
+    # Check if guardrail exists by (service, period); service may be NULL (global guardrail)
     query = db.table("budget_guardrails").select("id").eq("period", body.period)
     if body.service is None:
         query = query.is_("service", "null")
@@ -445,44 +436,48 @@ async def upsert_guardrail(body: GuardrailUpsertRequest):
     existing = query.execute().data or []
 
     if existing:
-        upd = db.table("budget_guardrails").update(payload).eq("period", body.period)
-        if body.service is None:
-            upd = upd.is_("service", "null")
-        else:
-            upd = upd.eq("service", body.service)
-        upd.execute()
+        db.table("budget_guardrails").update({
+            "limit_amount": body.limit_amount,
+            "action":       body.action,
+            "active":       True,
+        }).eq("id", existing[0]["id"]).execute()
         operation = "updated"
     else:
-        payload["created_at"] = datetime.now(timezone.utc).isoformat()
-        db.table("budget_guardrails").insert(payload).execute()
+        db.table("budget_guardrails").insert({
+            "service":      body.service,
+            "period":       body.period,
+            "limit_amount": body.limit_amount,
+            "action":       body.action,
+            "active":       True,
+        }).execute()
         operation = "created"
 
     return {
         "status": "success",
         "operation": operation,
         "guardrail": {
-            "service":      body.service,
-            "period":       body.period,
-            "limit_usd":    body.limit_amount,
-            "action":       body.action,
-            "active":       body.active,
+            "service":   body.service,
+            "period":    body.period,
+            "limit_usd": body.limit_amount,
+            "action":    body.action,
+            "active":    True,
         },
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NEW — DELETE /costs/guardrails/{name}
-# Soft delete guardrail by name
+# NEW — DELETE /costs/guardrails/{id}
+# Soft delete guardrail by id
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.delete("/costs/guardrails/{id}")
 async def delete_guardrail(id: str):
     """
-    Soft-deletes a budget guardrail by setting active=false.
+    Soft-deletes a budget guardrail by id (sets active=false).
     """
     db = get_db()
 
-    existing = db.table("budget_guardrails").select("id, service, active").eq("id", id).execute().data or []
+    existing = db.table("budget_guardrails").select("id, active").eq("id", id).execute().data or []
 
     if not existing:
         raise HTTPException(status_code=404, detail=f"Guardrail '{id}' not found")
@@ -491,7 +486,7 @@ async def delete_guardrail(id: str):
 
     return {
         "status": "success",
-        "message": f"Guardrail '{id}' has been deactivated",
+        "message": f"Guardrail '{id}' has been deactivated (soft delete)",
         "id": id,
     }
 

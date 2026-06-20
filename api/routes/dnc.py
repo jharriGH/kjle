@@ -388,7 +388,7 @@ async def _perform_check(
     # 3. Budget guard — fail-closed if cap exceeded
     try:
         budget_ok = await cost_guard.check_budget(
-            service="searchbug",
+            service="realvalidito",
             estimated_cost_usd=SEARCHBUG_COST_PER_LOOKUP_USD,
             job_name="dnc_check",
             leads_affected=1,
@@ -496,7 +496,7 @@ async def _perform_check(
     try:
         await cost_guard.log_cost(
             stage="dnc",
-            service="searchbug",
+            service="realvalidito",
             cost_usd=SEARCHBUG_COST_PER_LOOKUP_USD,
             lead_id=lead_id,
             items_fetched=1,
