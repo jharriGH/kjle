@@ -37,9 +37,10 @@ ANTHROPIC_SONNET4_OUTPUT_PER_MTOK = 15.00  # USD per 1M output tokens
 
 # ── Admin-settings key mapping ───────────────────────────────────────────────
 SERVICE_TO_CAP_KEY = {
-    "outscraper": "daily_outscraper_cap_usd",
-    "firecrawl":  "daily_firecrawl_cap_usd",
-    "anthropic":  "daily_anthropic_cap_usd",
+    "outscraper":    "daily_outscraper_cap_usd",
+    "firecrawl":     "daily_firecrawl_cap_usd",
+    "anthropic":     "daily_anthropic_cap_usd",
+    "realvalidito":  "daily_realvalidito_cap_usd",
 }
 TOTAL_CAP_KEY   = "daily_total_api_cap_usd"
 MONTHLY_CAP_KEY = "monthly_total_api_cap_usd"
@@ -48,11 +49,12 @@ MONTHLY_CAP_KEY = "monthly_total_api_cap_usd"
 # Default caps used ONLY if admin_settings lookup fails (DB down etc).
 # Intentionally conservative — if the DB can't be reached, be cheap.
 _DEFAULT_CAPS = {
-    "outscraper": 30.00,
-    "firecrawl":  10.00,
-    "anthropic":  10.00,
-    "_total_":    50.00,
-    "_monthly_": 500.00,
+    "outscraper":   30.00,
+    "firecrawl":    10.00,
+    "anthropic":    10.00,
+    "realvalidito":  3.00,
+    "_total_":      50.00,
+    "_monthly_":   500.00,
 }
 
 
