@@ -217,7 +217,22 @@ def fetch_kjle_leads(filters: CampaignLeadFilter) -> list:
     # stable sort key — prevents statement_timeout on the 596K-row table.
     query = query.order("pain_score", desc=True).order("id").limit(limit)
     result = query.execute()
-    return result.data or []
+
+    rows = result.data or []
+    if rows:
+        emails = sorted({(r.get("email") or "").strip().lower() for r in rows if r.get("email")})
+        suppressed = set()
+        for i in range(0, len(emails), 100):
+            chunk = emails[i:i+100]
+            try:
+                sup = db.table("email_suppressions").select("email").in_("email", chunk).execute().data or []
+                suppressed.update((s.get("email") or "").lower() for s in sup)
+            except Exception as e:
+                logger.warning(f"reachinbox: email_suppressions scrub failed for chunk: {e}")
+        before = len(rows)
+        rows = [r for r in rows if (r.get("email") or "").strip().lower() not in suppressed]
+        logger.info(f"reachinbox: suppression scrub removed {before - len(rows)} of {before} leads")
+    return rows
 
 def map_lead_to_ri(lead: dict) -> dict:
     """Map KJLE lead to ReachInbox lead format.
