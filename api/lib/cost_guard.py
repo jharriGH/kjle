@@ -15,9 +15,11 @@ they coexist during the transition and do no harm.
 """
 from __future__ import annotations
 
+import httpx
 import json
 import logging
-from datetime import datetime, timezone, date
+import os
+from datetime import datetime, timezone, date, timedelta
 from typing import Optional
 
 from ..database import get_db
@@ -227,6 +229,7 @@ async def log_halt(
     metadata: Optional[dict] = None,
 ) -> None:
     """Insert one row into budget_halt_log. Swallows all exceptions."""
+    _insert_ok = False
     try:
         db = get_db()
         row = {
@@ -243,8 +246,74 @@ async def log_halt(
         logger.warning(
             f"BUDGET HALT [{service}] job={job_name} spent=${current_spend:.4f} cap=${cap_value:.2f}"
         )
+        _insert_ok = True
     except Exception as e:
         logger.error(f"cost_guard.log_halt failed (service={service}): {e}")
+
+    if not _insert_ok:
+        return
+
+    # ── SMS notification ──────────────────────────────────────────────────────
+    try:
+        # 1. Throttle: skip if another halt for this service fired in the last 60 min.
+        #    The row just inserted is included in the query; len > 1 means a prior halt exists.
+        sixty_min_ago = (datetime.now(timezone.utc) - timedelta(minutes=60)).isoformat()
+        db = get_db()
+        prior = (
+            db.table("budget_halt_log")
+            .select("occurred_at")
+            .eq("service", service)
+            .gte("occurred_at", sixty_min_ago)
+            .limit(2)
+            .execute()
+            .data or []
+        )
+        if len(prior) > 1:
+            pass  # throttled — halt row still recorded, SMS skipped
+        else:
+            # 2. Read env vars; skip if any missing.
+            sid    = os.environ.get("TWILIO_ACCOUNT_SID", "")
+            token  = os.environ.get("TWILIO_AUTH_TOKEN", "")
+            sender = os.environ.get("TWILIO_SENDER", "")
+            to_num = os.environ.get("HALT_ALERT_SMS_TO", "")
+            if not all([sid, token, sender, to_num]):
+                logger.warning(
+                    f"cost_guard: TWILIO env vars not fully set — skipping halt SMS (service={service})"
+                )
+            else:
+                # 3. Pick the admin_settings lever key from the breach type.
+                breach = (metadata or {}).get("breach", "unknown")
+                if breach == "per_service_daily":
+                    cap_key = SERVICE_TO_CAP_KEY.get(service, TOTAL_CAP_KEY)
+                elif breach == "monthly_total":
+                    cap_key = MONTHLY_CAP_KEY
+                else:
+                    cap_key = TOTAL_CAP_KEY
+
+                # 4. Build concise SMS (<300 chars).
+                sms_text = (
+                    f"KJLE BUDGET HALT [{service}] {breach}: "
+                    f"spent ${current_spend:.4f} vs cap ${cap_value:.2f} "
+                    f"(job {job_name}). Lever: admin_settings.{cap_key}."
+                )
+
+                # 5. Send via Twilio REST. Log status only — never log auth or body.
+                resp = httpx.post(
+                    f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json",
+                    data={"From": sender, "To": to_num, "Body": sms_text},
+                    auth=(sid, token),
+                    timeout=10.0,
+                )
+                if resp.status_code // 100 != 2:
+                    logger.warning(
+                        f"cost_guard: Twilio SMS non-2xx status={resp.status_code} (service={service})"
+                    )
+                else:
+                    logger.info(
+                        f"cost_guard: halt SMS sent status={resp.status_code} (service={service})"
+                    )
+    except Exception as e:
+        logger.warning(f"cost_guard: halt SMS notify failed (service={service}): {e}")
 
 
 # ── Pricing helpers (public — callers compute actuals, then log) ────────────
