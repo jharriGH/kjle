@@ -102,11 +102,10 @@ async def get_costs():
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GuardrailUpsertRequest(BaseModel):
-    name: str
+    service: Optional[str] = None
     period: str                # "daily" | "monthly"
     limit_amount: float
-    action: str                # "warn" | "stop"
-    active: bool = True
+    action: str                # "alert" | "pause"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -251,12 +250,12 @@ async def get_guardrails():
         breached = current >= limit
 
         results.append({
-            "name":          g.get("name"),
+            "service":       g.get("service"),
             "period":        period,
             "limit_usd":     limit,
             "current_usd":   current,
             "pct_used":      pct_used,
-            "action":        g.get("action", "warn"),
+            "action":        g.get("action", "alert"),
             "breached":      breached,
             "status":        "🔴 BREACHED" if breached else ("🟡 WARNING" if pct_used >= 80 else "🟢 OK"),
         })
@@ -414,79 +413,81 @@ async def get_spend_anomalies():
 @router.post("/costs/guardrails")
 async def upsert_guardrail(body: GuardrailUpsertRequest):
     """
-    Create or update a budget guardrail by name.
+    Create or update a budget guardrail by (service, period).
     Upserts into budget_guardrails table.
     """
     if body.period not in ("daily", "monthly"):
         raise HTTPException(status_code=422, detail="period must be 'daily' or 'monthly'")
 
-    if body.action not in ("warn", "stop"):
-        raise HTTPException(status_code=422, detail="action must be 'warn' or 'stop'")
+    if body.action not in ("alert", "pause"):
+        raise HTTPException(status_code=422, detail="action must be 'alert' or 'pause'")
 
     if body.limit_amount <= 0:
         raise HTTPException(status_code=422, detail="limit_amount must be greater than 0")
 
     db = get_db()
 
-    payload = {
-        "name":         body.name,
-        "period":       body.period,
-        "limit_amount": body.limit_amount,
-        "action":       body.action,
-        "active":       body.active,
-        "updated_at":   datetime.now(timezone.utc).isoformat(),
-    }
-
-    # Check if guardrail exists by name
-    existing = db.table("budget_guardrails").select("id").eq("name", body.name).execute().data or []
+    # Check if guardrail exists by (service, period); service may be NULL (global guardrail)
+    query = db.table("budget_guardrails").select("id").eq("period", body.period)
+    if body.service is None:
+        query = query.is_("service", "null")
+    else:
+        query = query.eq("service", body.service)
+    existing = query.execute().data or []
 
     if existing:
-        db.table("budget_guardrails").update(payload).eq("name", body.name).execute()
+        db.table("budget_guardrails").update({
+            "limit_amount": body.limit_amount,
+            "action":       body.action,
+            "active":       True,
+        }).eq("id", existing[0]["id"]).execute()
         operation = "updated"
     else:
-        payload["created_at"] = datetime.now(timezone.utc).isoformat()
-        db.table("budget_guardrails").insert(payload).execute()
+        db.table("budget_guardrails").insert({
+            "service":      body.service,
+            "period":       body.period,
+            "limit_amount": body.limit_amount,
+            "action":       body.action,
+            "active":       True,
+        }).execute()
         operation = "created"
 
     return {
         "status": "success",
         "operation": operation,
         "guardrail": {
-            "name":         body.name,
-            "period":       body.period,
-            "limit_usd":    body.limit_amount,
-            "action":       body.action,
-            "active":       body.active,
+            "service":   body.service,
+            "period":    body.period,
+            "limit_usd": body.limit_amount,
+            "action":    body.action,
+            "active":    True,
         },
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NEW — DELETE /costs/guardrails/{name}
-# Soft delete guardrail by name
+# NEW — DELETE /costs/guardrails/{id}
+# Soft delete guardrail by id
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.delete("/costs/guardrails/{name}")
-async def delete_guardrail(name: str):
+@router.delete("/costs/guardrails/{id}")
+async def delete_guardrail(id: str):
     """
-    Soft-deletes a budget guardrail by setting active=false.
+    Soft-deletes a budget guardrail by id (sets active=false).
     """
     db = get_db()
 
-    existing = db.table("budget_guardrails").select("id, name, active").eq("name", name).execute().data or []
+    existing = db.table("budget_guardrails").select("id, active").eq("id", id).execute().data or []
 
     if not existing:
-        raise HTTPException(status_code=404, detail=f"Guardrail '{name}' not found")
+        raise HTTPException(status_code=404, detail=f"Guardrail '{id}' not found")
 
-    db.table("budget_guardrails").update({
-        "active":     False,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("name", name).execute()
+    db.table("budget_guardrails").update({"active": False}).eq("id", id).execute()
 
     return {
         "status": "success",
-        "message": f"Guardrail '{name}' has been deactivated (soft delete)",
-        "name": name,
+        "message": f"Guardrail '{id}' has been deactivated (soft delete)",
+        "id": id,
     }
 
 
