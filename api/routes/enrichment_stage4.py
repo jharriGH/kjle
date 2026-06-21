@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from ..database import get_db
@@ -344,13 +344,21 @@ async def enrich_stage4_single(lead_id: str, min_pain: int = DEFAULT_MIN_PAIN):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/stage4/batch")
-async def enrich_stage4_batch(body: BatchStage4Request):
+async def enrich_stage4_batch(
+    body: BatchStage4Request,
+    confirm: bool = Query(False, description="Must be true to spend Firecrawl credits"),
+):
     """
-    Enrich a batch of Stage 3 leads (enrichment_stage = 3, pain_score >= min_pain)
-    with Firecrawl deep extraction. Default limit is 10 — Firecrawl is the
-    highest-cost stage at $0.005/lead.
-    Returns summary with processed, succeeded, failed, skipped, and total cost.
+    Enrich a batch of Stage 3 leads with Firecrawl deep page extraction.
+
+    confirm=false (default) → dry-run: returns count + cost estimate, zero charges.
+    confirm=true            → live run: calls Firecrawl for each lead.
+
+    Hard limit: 500 leads per request. Cost: $0.005/lead.
     """
+    if body.limit > 500:
+        raise HTTPException(status_code=400, detail="limit must be ≤ 500 per request")
+
     db = get_db()
     effective_min = body.effective_min_pain()
 
@@ -374,6 +382,20 @@ async def enrich_stage4_batch(body: BatchStage4Request):
     query = query.order("pain_score", desc=True).limit(body.limit)
     result = query.execute()
     leads = result.data or []
+
+    estimated_cost = round(len(leads) * FIRECRAWL_COST_PER_RECORD, 4)
+
+    if not confirm:
+        return {
+            "dry_run":            True,
+            "eligible_count":     len(leads),
+            "estimated_cost_usd": estimated_cost,
+            "message": (
+                f"{len(leads)} leads eligible. Estimated cost: ${estimated_cost:.2f}. "
+                "Add ?confirm=true to run."
+            ),
+            "filters": {**body.model_dump(), "effective_min_pain": effective_min},
+        }
 
     if not leads:
         return {

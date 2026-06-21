@@ -2272,28 +2272,11 @@ def setup_scheduler() -> AsyncIOScheduler:
         misfire_grace_time=900,
     )
 
-    # Job 6: enrich_stage3_nightly — daily at 01:00 UTC
-    # Outscraper Google Maps enrichment — pain-gated, budget-guarded
-    scheduler.add_job(
-        job_enrich_stage3_nightly,
-        trigger=CronTrigger(hour=1, minute=0),
-        id="enrich_stage3_nightly",
-        name="Nightly Stage 3 Enrichment (Outscraper)",
-        replace_existing=True,
-        misfire_grace_time=1800,
-    )
-
-    # Job 7: enrich_stage4_nightly — daily at 03:00 UTC
-    # Firecrawl deep extraction — pain-gated, budget-guarded
-    # Runs 2hrs after Stage 3 to allow Stage 3 leads to be classified first
-    scheduler.add_job(
-        job_enrich_stage4_nightly,
-        trigger=CronTrigger(hour=3, minute=0),
-        id="enrich_stage4_nightly",
-        name="Nightly Stage 4 Enrichment (Firecrawl)",
-        replace_existing=True,
-        misfire_grace_time=1800,
-    )
+    # Job 6 (enrich_stage3_nightly) and Job 7 (enrich_stage4_nightly) are
+    # DELIVERABLE-TRIGGERED ONLY — not registered here. Trigger manually via
+    # POST /scheduler/run/enrich_stage3_nightly or enrich_stage4_nightly.
+    # Both jobs respect the admin_settings kill-switch
+    # (stage3_nightly_enabled / stage4_nightly_enabled) and cost_guard caps.
 
     # Job 8: daily_cost_report — daily at 16:00 UTC (09:00 PDT / 08:00 PST)
     # Rolling 24h cost + pipeline digest emailed via Resend
