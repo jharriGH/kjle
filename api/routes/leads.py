@@ -34,7 +34,13 @@ async def list_leads(
     has_facebook:   Optional[bool]  = Query(None, description="True = only leads with a Facebook URL; False = only without"),
     has_instagram:  Optional[bool]  = Query(None, description="True = only leads with an Instagram URL; False = only without"),
     has_linkedin:   Optional[bool]  = Query(None, description="True = only leads with a LinkedIn URL; False = only without"),
-    source:         Optional[str]   = Query(None, description="Filter by ingest source (e.g. local_scraper, csv)"),
+    has_website:       Optional[bool]  = Query(None, description="True = website IS NOT NULL; False = website IS NULL"),
+    ssl:               Optional[bool]  = Query(None, description="True = website LIKE 'https://%'; False = website LIKE 'http://%'"),
+    has_chatbot:       Optional[bool]  = Query(None, description="True = chatbot widget detected; False = none detected; None = not yet audited"),
+    mobile_friendly:   Optional[bool]  = Query(None, description="True = viewport meta present; False = absent; None = not yet audited"),
+    parked:            Optional[bool]  = Query(None, description="True = domain parked/broken; False = live; None = not yet audited"),
+    has_schema_markup: Optional[bool]  = Query(None, description="True = JSON-LD or microdata schema found; False = none; None = not yet audited"),
+    source:            Optional[str]   = Query(None, description="Filter by ingest source (e.g. local_scraper, csv)"),
     is_active:          bool           = Query(True),
     page:           int             = Query(1, ge=1),
     page_size:      int             = Query(50, ge=1, le=500),
@@ -50,7 +56,8 @@ async def list_leads(
         "google_stars, google_review_count, g_maps_claimed, "
         "facebook, instagram, twitter, linkedin, timezone, "
         "enrichment_stage, "
-        "data_quality_score, email_state, email_sub_state, email_status, email_valid, is_active, created_at"
+        "data_quality_score, email_state, email_sub_state, email_status, email_valid, is_active, created_at, "
+        "has_chatbot, mobile_friendly, is_parked, has_schema_markup"
     ).eq("is_active", is_active)
 
     count_query = db.table("leads").select("id", count="exact").eq("is_active", is_active)
@@ -128,6 +135,32 @@ async def list_leads(
         else:
             query = query.is_("linkedin", "null")
             count_query = count_query.is_("linkedin", "null")
+    if has_website is not None:
+        if has_website:
+            query = query.not_.is_("website", "null")
+            count_query = count_query.not_.is_("website", "null")
+        else:
+            query = query.is_("website", "null")
+            count_query = count_query.is_("website", "null")
+    if ssl is not None:
+        if ssl:
+            query = query.like("website", "https://%")
+            count_query = count_query.like("website", "https://%")
+        else:
+            query = query.like("website", "http://%")
+            count_query = count_query.like("website", "http://%")
+    if has_chatbot is not None:
+        query = query.eq("has_chatbot", has_chatbot)
+        count_query = count_query.eq("has_chatbot", has_chatbot)
+    if mobile_friendly is not None:
+        query = query.eq("mobile_friendly", mobile_friendly)
+        count_query = count_query.eq("mobile_friendly", mobile_friendly)
+    if parked is not None:
+        query = query.eq("is_parked", parked)
+        count_query = count_query.eq("is_parked", parked)
+    if has_schema_markup is not None:
+        query = query.eq("has_schema_markup", has_schema_markup)
+        count_query = count_query.eq("has_schema_markup", has_schema_markup)
 
     # Get total count
     count_result = count_query.execute()

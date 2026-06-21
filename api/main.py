@@ -63,6 +63,7 @@ from .routes import webhooks_truelist
 from .routes import backlog_scrub
 from .routes import ava_router
 from .routes import campaign_attachments
+from .routes import website_audit
 from .routes.scheduler import setup_scheduler
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -187,6 +188,7 @@ app.include_router(admin_settings.router,         prefix=PREFIX,                
 app.include_router(campaigns.router,              prefix=PREFIX,                  tags=["Campaign Performance"])
 app.include_router(ava_router.router,             prefix=PREFIX,                  tags=["AVA Router"])
 app.include_router(campaign_attachments.router,   prefix=PREFIX,                  tags=["Campaign Attachments"])
+app.include_router(website_audit.router,          prefix=PREFIX,                  tags=["Website Audit"])
 
 
 # ── Empire-wide notification endpoints (top-level, x-brain-key auth) ──────────

@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from ..database import get_db
@@ -301,12 +301,21 @@ async def enrich_stage3_single(lead_id: str, min_pain: int = DEFAULT_MIN_PAIN):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/stage3/batch")
-async def enrich_stage3_batch(body: BatchStage3Request):
+async def enrich_stage3_batch(
+    body: BatchStage3Request,
+    confirm: bool = Query(False, description="Must be true to spend Outscraper credits"),
+):
     """
-    Enrich a batch of Stage 2 leads (enrichment_stage = 2, pain_score >= min_pain)
-    with Outscraper Google Maps data.
-    Returns summary with processed, succeeded, failed, skipped, and total cost.
+    Enrich a batch of Stage 1 leads with Outscraper Google Maps data.
+
+    confirm=false (default) → dry-run: returns count + cost estimate, zero charges.
+    confirm=true            → live run: calls Outscraper for each lead.
+
+    Hard limit: 500 leads per request. Cost: $0.002/lead.
     """
+    if body.limit > 500:
+        raise HTTPException(status_code=400, detail="limit must be ≤ 500 per request")
+
     db = get_db()
     effective_min = body.effective_min_pain()
 
@@ -330,6 +339,20 @@ async def enrich_stage3_batch(body: BatchStage3Request):
     query = query.order("pain_score", desc=True).limit(body.limit)
     result = query.execute()
     leads = result.data or []
+
+    estimated_cost = round(len(leads) * OUTSCRAPER_COST_PER_RECORD, 4)
+
+    if not confirm:
+        return {
+            "dry_run":            True,
+            "eligible_count":     len(leads),
+            "estimated_cost_usd": estimated_cost,
+            "message": (
+                f"{len(leads)} leads eligible. Estimated cost: ${estimated_cost:.2f}. "
+                "Add ?confirm=true to run."
+            ),
+            "filters": {**body.model_dump(), "effective_min_pain": effective_min},
+        }
 
     if not leads:
         return {

@@ -43,6 +43,7 @@ SERVICE_TO_CAP_KEY = {
     "firecrawl":     "daily_firecrawl_cap_usd",
     "anthropic":     "daily_anthropic_cap_usd",
     "realvalidito":  "daily_realvalidito_cap_usd",
+    "website_audit": "daily_audit_cap_usd",
 }
 TOTAL_CAP_KEY   = "daily_total_api_cap_usd"
 MONTHLY_CAP_KEY = "monthly_total_api_cap_usd"
@@ -51,12 +52,13 @@ MONTHLY_CAP_KEY = "monthly_total_api_cap_usd"
 # Default caps used ONLY if admin_settings lookup fails (DB down etc).
 # Intentionally conservative — if the DB can't be reached, be cheap.
 _DEFAULT_CAPS = {
-    "outscraper":   30.00,
-    "firecrawl":    10.00,
-    "anthropic":    10.00,
-    "realvalidito":  3.00,
-    "_total_":      50.00,
-    "_monthly_":   500.00,
+    "outscraper":    30.00,
+    "firecrawl":     10.00,
+    "anthropic":     10.00,
+    "realvalidito":   3.00,
+    "website_audit":  5.00,
+    "_total_":       50.00,
+    "_monthly_":    500.00,
 }
 
 
@@ -104,8 +106,11 @@ def _get_today_spend(service: Optional[str] = None) -> float:
         rows = q.execute().data or []
         return round(sum(_safe_float(r.get("cost_usd")) for r in rows), 6)
     except Exception as e:
-        logger.warning(f"cost_guard: failed to read today's spend (service={service}): {e}")
-        return 0.0
+        logger.critical(
+            f"cost_guard: failed to read today's spend (service={service}): {e} "
+            "— returning inf to fail-closed (cap treated as exhausted)"
+        )
+        return float("inf")
 
 
 def _get_month_spend() -> float:
@@ -120,8 +125,11 @@ def _get_month_spend() -> float:
         )
         return round(sum(_safe_float(r.get("cost_usd")) for r in rows), 6)
     except Exception as e:
-        logger.warning(f"cost_guard: failed to read month spend: {e}")
-        return 0.0
+        logger.critical(
+            f"cost_guard: failed to read month spend: {e} "
+            "— returning inf to fail-closed (cap treated as exhausted)"
+        )
+        return float("inf")
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -216,7 +224,10 @@ async def log_cost(
         }
         db.table("enrichment_cost_log").insert(row).execute()
     except Exception as e:
-        logger.error(f"cost_guard.log_cost failed (stage={stage}, service={service}): {e}")
+        logger.critical(
+            f"cost_guard.log_cost FAILED — spend row NOT recorded "
+            f"(stage={stage}, service={service}, cost=${cost_usd:.5f}): {e}"
+        )
 
 
 async def log_halt(
