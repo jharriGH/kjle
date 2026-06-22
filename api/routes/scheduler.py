@@ -277,7 +277,7 @@ async def job_classify_segments() -> dict:
 
     def _apply_pain_filter(query, label: str):
         if label == "hot":
-            return query.gte("pain_score", 30)
+            return query.gte("pain_score", 30).neq("pain_score", 50)
         if label == "warm":
             return query.gte("pain_score", 15).lt("pain_score", 30)
         return query.lt("pain_score", 15)  # cold

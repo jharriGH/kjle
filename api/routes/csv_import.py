@@ -65,7 +65,7 @@ class ImportOptions(BaseModel):
     niche_slug_override: Optional[str] = None
     normalize_niche: bool = True
     skip_duplicates: bool = True
-    default_pain_score: int = 50
+    default_pain_score: Optional[int] = None
     state_override: Optional[str] = None
 
 
