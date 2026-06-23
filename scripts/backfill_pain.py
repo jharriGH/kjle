@@ -84,7 +84,7 @@ def _get_supabase():
 
 
 def _count_eligible(db) -> int:
-    res = db.table("leads").select("id", count="exact").eq("pain_score", 50).execute()
+    res = db.table("leads").select("id", count="estimated").eq("pain_score", 50).execute()
     return res.count or 0
 
 
@@ -107,13 +107,9 @@ def _bulk_upsert_pain(db, scores: dict) -> None:
     Write {lead_id: new_pain_score} back in UPDATE_BATCH-sized upsert calls.
     Only pain_score is included in the payload — no other columns are touched.
     """
-    items = list(scores.items())
-    for i in range(0, len(items), UPDATE_BATCH):
-        batch = items[i : i + UPDATE_BATCH]
-        db.table("leads").upsert(
-            [{"id": lid, "pain_score": pain} for lid, pain in batch],
-            on_conflict="id",
-        ).execute()
+    updates = [{"id": lid, "pain": pain} for lid, pain in scores.items()]
+    for i in range(0, len(updates), 1000):
+        db.rpc("bulk_update_pain", {"updates": updates[i:i + 1000]}).execute()
 
 
 # ── Faithfulness pre-flight ───────────────────────────────────────────────────
@@ -191,7 +187,7 @@ def run(args) -> None:
 
     # ── Count and announce ────────────────────────────────────────────────────
     eligible = _count_eligible(db)
-    cap = min(args.limit, eligible) if args.limit else eligible
+    cap = args.limit if args.limit else (1 << 62)
     mode = "DRY-RUN" if args.dry_run else "LIVE"
     log.info(
         f"Target: {eligible:,} leads with pain_score=50  "
