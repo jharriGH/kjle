@@ -260,7 +260,7 @@ async def commander_chat(body: ChatRequest):
                     "content-type": "application/json",
                 },
                 json={
-                    "model": "claude-sonnet-4-20250514",
+                    "model": "claude-sonnet-4-6",
                     "max_tokens": 1024,
                     "system": SYSTEM_PROMPT,
                     "messages": messages,
@@ -283,7 +283,7 @@ async def commander_chat(body: ChatRequest):
             cost_usd=cost_guard.anthropic_cost(in_tok, out_tok),
             tokens_used=in_tok + out_tok,
             metadata={
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-6",
                 "input_tokens": in_tok,
                 "output_tokens": out_tok,
                 "actions_taken": actions_taken,
@@ -294,7 +294,7 @@ async def commander_chat(body: ChatRequest):
         # blocks the response path.
         if _bridgedeck_logger is not None:
             asyncio.create_task(_bridgedeck_logger.log_manual(
-                model="claude-sonnet-4-20250514",
+                model="claude-sonnet-4-6",
                 tokens_in=in_tok,
                 tokens_out=out_tok,
                 cost_usd=cost_guard.anthropic_cost(in_tok, out_tok),
