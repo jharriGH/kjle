@@ -3,7 +3,6 @@ KJLE — Prompt 28: Lead Management Routes
 File: api/routes/lead_management.py
 """
 
-import asyncio
 import os
 import logging
 import time
@@ -103,99 +102,13 @@ async def lead_stats(x_api_key: str = Header(...)):
 
     supabase = get_supabase()
 
-    # (1) Total — reltuples estimate via RPC (pg_class is blocked by PGRST205)
-    def _total():
-        res = supabase.rpc("leads_total_estimate").execute()
-        return int(res.data) if res.data is not None else 0
-
-    # (2) Segment counts — one GROUP BY via PostgREST 12 aggregate syntax
-    def _segments():
-        res = supabase.from_("leads").select("segment_label, count()").execute()
-        result: dict = {}
-        for row in (res.data or []):
-            key = row.get("segment_label") or "unclassified"
-            result[key] = int(row.get("count", 0))
-        return result
-
-    # (3) Email status counts — one GROUP BY
-    def _email_status():
-        res = supabase.from_("leads").select("email_status, count()").execute()
-        result: dict = {}
-        for row in (res.data or []):
-            key = row.get("email_status") or "unknown"
-            result[key] = int(row.get("count", 0))
-        return result
-
-    # (4–6) DNC / has_phone / has_email — small index scans, run concurrently
-    def _dnc():
-        try:
-            res = (
-                supabase.table("leads")
-                .select("id", count="exact")
-                .eq("do_not_contact", True)
-                .execute()
-            )
-            return res.count or 0
-        except Exception:
-            return 0
-
-    def _has_phone():
-        res = (
-            supabase.table("leads")
-            .select("id", count="exact")
-            .neq("phone", None)
-            .execute()
-        )
-        return res.count or 0
-
-    def _has_email():
-        res = (
-            supabase.table("leads")
-            .select("id", count="exact")
-            .neq("email", None)
-            .execute()
-        )
-        return res.count or 0
-
     try:
-        (total, segments, email_statuses,
-         dnc_count, has_phone, has_email) = await asyncio.gather(
-            asyncio.to_thread(_total),
-            asyncio.to_thread(_segments),
-            asyncio.to_thread(_email_status),
-            asyncio.to_thread(_dnc),
-            asyncio.to_thread(_has_phone),
-            asyncio.to_thread(_has_email),
-        )
-
-        hot          = segments.get("hot",          0)
-        warm         = segments.get("warm",         0)
-        cold         = segments.get("cold",         0)
-        unclassified = segments.get("unclassified", 0)
-
-        data = {
-            "total": total,
-            "by_segment": {
-                "hot":          hot,
-                "warm":         warm,
-                "cold":         cold,
-                "unclassified": unclassified,
-            },
-            "by_email_status": {
-                "valid":         email_statuses.get("valid",         0),
-                "invalid":       email_statuses.get("invalid",       0),
-                "unknown":       email_statuses.get("unknown",       0),
-                "error":         email_statuses.get("error",         0),
-                "pending_batch": email_statuses.get("pending_batch", 0),
-            },
-            "dnc_count": dnc_count,
-            "has_phone":  has_phone,
-            "has_email":  has_email,
-        }
-
+        res = supabase.rpc("get_lead_stats").execute()
+        data = res.data
+        if not data:
+            raise ValueError("get_lead_stats returned no data")
         _stats_cache.update({"data": data, "ts": now})
         return data
-
     except Exception as e:
         logger.error(f"lead_stats error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
