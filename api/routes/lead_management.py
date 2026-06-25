@@ -103,16 +103,10 @@ async def lead_stats(x_api_key: str = Header(...)):
 
     supabase = get_supabase()
 
-    # (1) Total — reltuples estimate, no seq-scan
+    # (1) Total — reltuples estimate via RPC (pg_class is blocked by PGRST205)
     def _total():
-        res = (
-            supabase.from_("pg_class")
-            .select("reltuples")
-            .eq("relname", "leads")
-            .limit(1)
-            .execute()
-        )
-        return int(res.data[0]["reltuples"]) if res.data else 0
+        res = supabase.rpc("leads_total_estimate").execute()
+        return int(res.data) if res.data is not None else 0
 
     # (2) Segment counts — one GROUP BY via PostgREST 12 aggregate syntax
     def _segments():
