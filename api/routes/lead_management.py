@@ -3,8 +3,10 @@ KJLE — Prompt 28: Lead Management Routes
 File: api/routes/lead_management.py
 """
 
+import asyncio
 import os
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 from fastapi import APIRouter, HTTPException, Header, Query
@@ -87,66 +89,118 @@ class BulkActionRequest(BaseModel):
 # Registered BEFORE /leads/{lead_id} to avoid route shadowing
 # ─────────────────────────────────────────────────
 
+_stats_cache: dict = {}
+_CACHE_TTL = 60  # seconds
+
+
 @router.get("/leads/stats")
 async def lead_stats(x_api_key: str = Header(...)):
     verify_api_key(x_api_key)
+
+    now = time.monotonic()
+    if _stats_cache.get("ts") and now - _stats_cache["ts"] < _CACHE_TTL:
+        return _stats_cache["data"]
+
     supabase = get_supabase()
 
-    try:
-        total_res = supabase.table("leads").select("id", count="exact").execute()
-        total = total_res.count or 0
+    # (1) Total — reltuples estimate, no seq-scan
+    def _total():
+        res = (
+            supabase.from_("pg_class")
+            .select("reltuples")
+            .eq("relname", "leads")
+            .limit(1)
+            .execute()
+        )
+        return int(res.data[0]["reltuples"]) if res.data else 0
 
-        hot_res   = supabase.table("leads").select("id", count="exact").eq("segment_label", "hot").execute()
-        warm_res  = supabase.table("leads").select("id", count="exact").eq("segment_label", "warm").execute()
-        cold_res  = supabase.table("leads").select("id", count="exact").eq("segment_label", "cold").execute()
+    # (2) Segment counts — one GROUP BY via PostgREST 12 aggregate syntax
+    def _segments():
+        res = supabase.from_("leads").select("segment_label, count()").execute()
+        result: dict = {}
+        for row in (res.data or []):
+            key = row.get("segment_label") or "unclassified"
+            result[key] = int(row.get("count", 0))
+        return result
 
-        valid_res   = supabase.table("leads").select("id", count="exact").eq("email_status", "valid").execute()
-        invalid_res = supabase.table("leads").select("id", count="exact").eq("email_status", "invalid").execute()
-        unknown_res = supabase.table("leads").select("id", count="exact").eq("email_status", "unknown").execute()
-        error_res   = supabase.table("leads").select("id", count="exact").eq("email_status", "error").execute()
-        pending_res = supabase.table("leads").select("id", count="exact").eq("email_status", "pending_batch").execute()
+    # (3) Email status counts — one GROUP BY
+    def _email_status():
+        res = supabase.from_("leads").select("email_status, count()").execute()
+        result: dict = {}
+        for row in (res.data or []):
+            key = row.get("email_status") or "unknown"
+            result[key] = int(row.get("count", 0))
+        return result
 
-        hot  = hot_res.count  or 0
-        warm = warm_res.count or 0
-        cold = cold_res.count or 0
-        unclassified = total - hot - warm - cold
-
-        valid_email   = valid_res.count   or 0
-        invalid_email = invalid_res.count or 0
-        unknown_email = unknown_res.count or 0
-        error_email   = error_res.count   or 0
-        pending_email = pending_res.count or 0
-
-        # DNC count — graceful fallback if column doesn't exist yet
-        dnc_count = 0
+    # (4–6) DNC / has_phone / has_email — small index scans, run concurrently
+    def _dnc():
         try:
-            dnc_res   = supabase.table("leads").select("id", count="exact").eq("do_not_contact", True).execute()
-            dnc_count = dnc_res.count or 0
+            res = (
+                supabase.table("leads")
+                .select("id", count="exact")
+                .eq("do_not_contact", True)
+                .execute()
+            )
+            return res.count or 0
         except Exception:
-            dnc_count = 0
+            return 0
 
-        phone_res = supabase.table("leads").select("id", count="exact").neq("phone", None).execute()
-        email_res = supabase.table("leads").select("id", count="exact").neq("email", None).execute()
+    def _has_phone():
+        res = (
+            supabase.table("leads")
+            .select("id", count="exact")
+            .neq("phone", None)
+            .execute()
+        )
+        return res.count or 0
 
-        return {
+    def _has_email():
+        res = (
+            supabase.table("leads")
+            .select("id", count="exact")
+            .neq("email", None)
+            .execute()
+        )
+        return res.count or 0
+
+    try:
+        (total, segments, email_statuses,
+         dnc_count, has_phone, has_email) = await asyncio.gather(
+            asyncio.to_thread(_total),
+            asyncio.to_thread(_segments),
+            asyncio.to_thread(_email_status),
+            asyncio.to_thread(_dnc),
+            asyncio.to_thread(_has_phone),
+            asyncio.to_thread(_has_email),
+        )
+
+        hot          = segments.get("hot",          0)
+        warm         = segments.get("warm",         0)
+        cold         = segments.get("cold",         0)
+        unclassified = segments.get("unclassified", 0)
+
+        data = {
             "total": total,
             "by_segment": {
-                "hot": hot,
-                "warm": warm,
-                "cold": cold,
+                "hot":          hot,
+                "warm":         warm,
+                "cold":         cold,
                 "unclassified": unclassified,
             },
             "by_email_status": {
-                "valid":         valid_email,
-                "invalid":       invalid_email,
-                "unknown":       unknown_email,
-                "error":         error_email,
-                "pending_batch": pending_email,
+                "valid":         email_statuses.get("valid",         0),
+                "invalid":       email_statuses.get("invalid",       0),
+                "unknown":       email_statuses.get("unknown",       0),
+                "error":         email_statuses.get("error",         0),
+                "pending_batch": email_statuses.get("pending_batch", 0),
             },
             "dnc_count": dnc_count,
-            "has_phone": phone_res.count or 0,
-            "has_email": email_res.count or 0,
+            "has_phone":  has_phone,
+            "has_email":  has_email,
         }
+
+        _stats_cache.update({"data": data, "ts": now})
+        return data
 
     except Exception as e:
         logger.error(f"lead_stats error: {e}")
