@@ -445,6 +445,20 @@ async def _perform_check(
             error=result.error,
         )
 
+    # 4b. Line-type enrichment - RealValidito returns no line type (always "unknown"),
+    #     so fill it from the free in-process NANPA prefix table. Makes the cached row
+    #     and the response carry a real line_type/carrier, which SMS-vs-voice routing
+    #     (e.g. telehealth) depends on. Fail-safe: never breaks the check on lookup error.
+    if not result.line_type or result.line_type == "unknown":
+        try:
+            _pfx = lookup_line_type_from_prefix(phone)
+            if _pfx:
+                result.line_type = _pfx.get("line_type") or result.line_type
+                if _pfx.get("carrier"):
+                    result.carrier = _pfx["carrier"]
+        except Exception as e:
+            logger.warning(f"dnc: NANPA line-type enrichment failed for {phone}: {e}")
+
     # 5. Successful fresh lookup — cache, bill, audit, persist balance
     ttl_days = int(_get_admin_setting("dnc_cache_ttl_days", "14") or "14")
     ext_days = int(_get_admin_setting("dnc_soft_ttl_extension_days", "7") or "7")
