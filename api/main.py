@@ -40,6 +40,7 @@ from .routes import enrichment_stage2
 from .routes import enrichment_stage3
 from .routes import enrichment_stage4
 from .routes import enrichment_email_clean
+from .routes import enrichment_lookup
 from .routes import csv_import
 from .routes import lead_management
 from .routes import integration_hub
@@ -169,6 +170,7 @@ app.include_router(enrichment_stage2.router,      prefix=f"{PREFIX}/enrichment",
 app.include_router(enrichment_stage3.router,      prefix=f"{PREFIX}/enrichment",  tags=["Enrichment Stage 3"])
 app.include_router(enrichment_stage4.router,      prefix=f"{PREFIX}/enrichment",  tags=["Enrichment Stage 4"])
 app.include_router(enrichment_email_clean.router, prefix=f"{PREFIX}/enrichment",  tags=["Enrichment — Email Clean"])
+app.include_router(enrichment_lookup.router,      prefix=f"{PREFIX}/enrichment",  tags=["Enrichment — Lookup"])
 app.include_router(csv_import.router,             prefix=PREFIX,                  tags=["CSV Import"])
 app.include_router(export.router,                 prefix=PREFIX,                  tags=["Export"])
 app.include_router(push_demoenginez.router,       prefix=PREFIX,                  tags=["Push — DemoEnginez"])
