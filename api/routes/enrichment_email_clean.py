@@ -48,6 +48,7 @@ KNOWN HISTORY:
 from __future__ import annotations
 
 import csv
+import asyncio
 import io
 import logging
 import os
@@ -322,18 +323,33 @@ def select_uncleaned_leads(db, limit: int) -> list[dict]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def poll_batch(api_key: str, batch_id: str) -> dict:
-    """GET /api/v1/batches/{id} — returns the raw Truelist response dict."""
-    async with httpx.AsyncClient(timeout=POLL_TIMEOUT_SEC) as client:
-        r = await client.get(
-            f"{TRUELIST_BATCHES_URL}/{batch_id}",
-            headers={"Authorization": f"Bearer {api_key}"},
-        )
-    if r.status_code != 200:
+    """GET /api/v1/batches/{id} — returns the raw Truelist response dict.
+
+    Retries on HTTP 429 (Truelist rate limit) with exponential backoff so that
+    polling several in-flight batches in one cycle does not trip the limit and
+    fail the whole run. Non-429 errors raise immediately.
+    """
+    last_text = ""
+    for attempt in range(4):  # backoff between tries: 1.5s, 3s, 6s
+        async with httpx.AsyncClient(timeout=POLL_TIMEOUT_SEC) as client:
+            r = await client.get(
+                f"{TRUELIST_BATCHES_URL}/{batch_id}",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code == 429 and attempt < 3:
+            await asyncio.sleep(1.5 * (2 ** attempt))
+            last_text = r.text[:300]
+            continue
         raise HTTPException(
             status_code=502,
             detail=f"Truelist poll failed for {batch_id}: HTTP {r.status_code}: {r.text[:300]}",
         )
-    return r.json()
+    raise HTTPException(
+        status_code=502,
+        detail=f"Truelist poll failed for {batch_id}: HTTP 429 after retries: {last_text}",
+    )
 
 
 def _parse_annotated_csv(csv_text: str) -> dict[str, dict]:
