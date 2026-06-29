@@ -1,7 +1,7 @@
 # 🎯 KJLE — CLAUDE.md
 # Managed by brain_sync.py (Brain sections)
 # + Manual additions (never auto-updated)
-# Last synced: June 22, 2026 08:43 PM PST
+# Last synced: June 29, 2026 11:57 AM PST
 
 ---
 
@@ -85,6 +85,8 @@ Report: unified diff + one-line summary
   also write a deterministic record (build card / next_action), don't rely on search alone.
 - "Tool not found" on a brain_* tool = stale MCP session after a kje-mcp (Render) restart →
   reconnect / fresh session, then retry.
+- CRITICAL WRITES: For state that MUST be findable later (decisions, gotchas, session summaries), write via POST /memory/raw - it embeds deterministically into Qdrant. Plain POST /memory can silently dedup (returns added:false) and lose the write. Always verify the /memory/raw response shows embedded:true plus an id.
+- UNREGISTERED PROJECT: If PATCH /projects returns 404 for a slug that has memories, the project is missing from the empire_state.projects registry. Run register_missing.py in the jim-brain repo (it mirrors brain_register read-append-insert). Do NOT hand-write empire_state.
 
 # ───────────────────────────────────────────────────────────
 # 6. DEPLOY-AND-VERIFY
@@ -219,11 +221,11 @@ Then give a plain-English summary of what we accomplished.
 
 ## CURRENT STATUS
 <!-- BRAIN-SYNC:START:STATUS -->
-*Brain sync: June 22, 2026 08:43 PM PST*
+*Brain sync: June 29, 2026 11:57 AM PST*
 
 **Status:** ACTIVE
 **Description:** Lead empire backend — 32/32 done, 28,849 leads ready
-**Next Action:** ⚡ Clarify project scope and context for kjle before resuming work with Jim Brain.
+**Next Action:** ⚡ KJLE Lead Finder UI audit COMPLETE - 10 of 10 surfaces certified (AVA Router, History, Help finished and verified live via Claude-in-Chrome this session). Non-blocking follow-ups only: optionally surface localStorage CSV exports in the EXPORTS tab; confirm Help render null-safety holds on API cold-start; AVA-to-Kokoro voice migration scoped and PARKED pending Jim (handoff doc ready for a dedicated AVA SC seat).
 <!-- BRAIN-SYNC:END:STATUS -->
 
 ---
@@ -236,12 +238,12 @@ Then give a plain-English summary of what we accomplished.
 - Last decision: None
 
 **AI Costs:**
-- Today: $0.0000
-- This month: $0.0042
-- All time: $0.0042
+- Today: $0.0049
+- This month: $0.0049
+- All time: $0.0049
 
 **Empire:**
-- 2 live | 2 launch ready | 8 in progress
+- 2 live | 2 launch ready | 10 in progress
 <!-- BRAIN-SYNC:END:EMPIRE_STATE -->
 
 ---
@@ -262,24 +264,34 @@ Then give a plain-English summary of what we accomplished.
 
 ## BUILD STATE
 <!-- BRAIN-SYNC:START:BUILD_STATE -->
-**Card:** KJLE SESSION 2026-06-15
-**Saved:** 2026-06-15
+**Card:** KJLE UI AUDIT BUILD_STATE 2026-06-27
+**Saved:** 2026-06-28
 
-# KJLE Session Hand-off
-**Date:** 2026-06-15
-**Status:** completed
-**Session ID:** session_log_roadmap_c5d96ae2
+# KJLE UI AUDIT - BUILD STATE (2026-06-27)
 
-## Summary
-CC session 'session_log_roadmap_c5d96ae2' on kjle completed (rc=0, 358s). Prompt: TASK: Log this session's completed work to Brain, and append a completion entry to the roadmap. Edit ONLY /opt/kjle/KJ_EMPIRE_ROADMAP.md for the file change. Never print secrets. Write /tmp/log_result.json at the end.
+## STATUS: COMPLETE - 10 of 10 surfaces certified
 
-PART 1 — BRAIN. Write each of these as a separate brain_memory (concise, self-con
+### Certified (all 10)
+Find Leads, Campaign Push, Pipeline, Control, Cost Command Center, DNC Center, Admin Settings (prior 7) plus AVA Router, History, Help (this session).
 
-## Files Touched
-- KJ_EMPIRE_ROADMAP.md
-- CLAUDE.md
-- api/routes/csv_import.py
-- api/routes/segments.py
+### Fixes shipped + verified this session (all Lovable, 0 dollars)
+- History EXPORTS: was sourced from /csv/imports (50 import rows, no lead_count -> "Exported ? leads" + "Just now"). Repointed to server export-history. Verified: EXPORTS (3) demoenginez_push rows, real counts 5/1/2, real Apr 10 dates.
+- Help Scheduler article: corrected 7 jobs -> 13 with correct job names. Verified live.
+- Searchbug -> RealValidito rename across DNC Center + Cost Command Center. Verified: 0 Searchbug, 5 RealValidito.
+- Help render hardened against null-safety crash (TypeError reading section on cold-start). Watch-item, not a blocker.
+
+### AVA Router notes (fed to parked Kokoro handoff)
+- New Persona form: all 13 fields present, bindings clean.
+- voice dropdown = OpenAI TTS voices (alloy/echo/shimmer/ash/ballad/coral/sage/verse) -> AVA likely runs OpenAI TTS via Vapi today.
+- 5th sub-section "Voice URL Flip" exists - possible Kokoro migration lever.
+
+### Key gotcha (verify-before-trust)
+Inherited handoff claimed the History server source does not write a count. Live /export/history DID return count; real bug was the drawer sourcing /csv/imports. Caught by ground-truth curl.
+
+### Non-blocking follow-ups
+- Optionally also surface localStorage CSV exports in EXPORTS tab.
+- Confirm Help null-safety holds on API cold-start.
+- AVA-to-Kokoro voice migration: scoped, PARKED pending Jim. Handoff doc ready for a dedicated AVA SC seat.
 
 <!-- BRAIN-SYNC:END:BUILD_STATE -->
 
@@ -335,14 +347,5 @@ brain_save_card(
 
 ---
 
-*Synced: June 22, 2026 08:43 PM PST*
+*Synced: June 29, 2026 11:57 AM PST*
 *Refresh: `python brain_sync.py kjle`*
-
-<!-- KJE-ONBOARD-V1 -->
-## KJ Empire — SC Onboarding
-This repo belongs to the KJ Empire (DevelopingRiches Inc, owner Jim Harris / jharriGH).
-- Central repo: jharriGH/kjle. Brain: https://jim-brain-production.up.railway.app
-- New SC seats: run brain_status, brain_search this repo's slug, and verify live state before declaring anything done.
-- Decide-and-proceed. Cost-gate chargeable dispatches. Never echo secrets — pull keys from the Brain vault.
-- See ROADMAP.md for status.
-<!-- /KJE-ONBOARD-V1 -->
