@@ -365,17 +365,20 @@ async def get_push_status():
 
     # Eligible = is_active=true, phone not null
     def _eligible_count(segment: Optional[str]) -> int:
-        q = (
-            db.table("leads")
-            .select("id", count="exact")
-            .eq("is_active", True)
-            .not_.is_("phone", "null")
-            .neq("phone", "")
-        )
-        if segment:
-            q = q.eq("segment_label", segment)
-        r = q.execute()
-        return r.count if r.count is not None else 0
+        try:
+            q = (
+                db.table("leads")
+                .select("id", count="estimated", head=True)
+                .eq("is_active", True)
+                .not_.is_("phone", "null")
+                .neq("phone", "")
+            )
+            if segment:
+                q = q.eq("segment_label", segment)
+            r = q.execute()
+            return r.count or 0
+        except Exception:
+            return 0
 
     total_eligible = _eligible_count(None)
     hot_count   = _eligible_count("hot")
