@@ -152,18 +152,21 @@ async def get_segment_summary(
     db = get_db()
 
     def _count(label: str) -> int:
-        q = (
-            db.table("leads")
-            .select("id", count="exact")
-            .eq("is_active", True)
-            .eq("segment_label", label)
-        )
-        if niche_slug:
-            q = q.eq("niche_slug", niche_slug)
-        if state:
-            q = q.eq("state", state.upper())
-        r = q.execute()
-        return r.count if r.count is not None else 0
+        try:
+            q = (
+                db.table("leads")
+                .select("id", count="estimated", head=True)
+                .eq("is_active", True)
+                .eq("segment_label", label)
+            )
+            if niche_slug:
+                q = q.eq("niche_slug", niche_slug)
+            if state:
+                q = q.eq("state", state.upper())
+            r = q.execute()
+            return r.count or 0
+        except Exception:
+            return 0
 
     hot_count  = _count("hot")
     warm_count = _count("warm")
