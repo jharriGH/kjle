@@ -170,7 +170,7 @@ async def list_leads(
         total = 0
 
     # Ordering + pagination
-    query = query.order(order_by, desc=(order_dir == "desc"))
+    query = query.order(order_by, desc=(order_dir == "desc"), nullsfirst=False)
     query = query.range(offset, offset + page_size - 1)
 
     result = query.execute()
