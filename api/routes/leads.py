@@ -60,7 +60,7 @@ async def list_leads(
         "has_chatbot, mobile_friendly, is_parked, has_schema_markup"
     ).eq("is_active", is_active)
 
-    count_query = db.table("leads").select("id", count="exact").eq("is_active", is_active)
+    count_query = db.table("leads").select("id", count="estimated", head=True).eq("is_active", is_active)
 
     # Apply filters to both queries
     if niche_slug:
@@ -162,9 +162,12 @@ async def list_leads(
         query = query.eq("has_schema_markup", has_schema_markup)
         count_query = count_query.eq("has_schema_markup", has_schema_markup)
 
-    # Get total count
-    count_result = count_query.execute()
-    total = count_result.count if count_result.count is not None else 0
+    # Get total count (estimated — avoids full-table scan timeout on 1.5M-row table)
+    try:
+        count_result = count_query.execute()
+        total = count_result.count if count_result.count is not None else 0
+    except Exception:
+        total = 0
 
     # Ordering + pagination
     query = query.order(order_by, desc=(order_dir == "desc"))
