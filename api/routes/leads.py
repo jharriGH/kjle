@@ -41,6 +41,7 @@ async def list_leads(
     mobile_friendly:   Optional[bool]  = Query(None, description="True = viewport meta present; False = absent; None = not yet audited"),
     parked:            Optional[bool]  = Query(None, description="True = domain parked/broken; False = live; None = not yet audited"),
     has_schema_markup: Optional[bool]  = Query(None, description="True = JSON-LD or microdata schema found; False = none; None = not yet audited"),
+    g_maps_claimed:    Optional[str]   = Query(None, description="claimed | unclaimed"),
     source:            Optional[str]   = Query(None, description="Filter by ingest source (e.g. local_scraper, csv)"),
     is_active:          bool           = Query(True),
     page:           int             = Query(1, ge=1),
@@ -165,6 +166,14 @@ async def list_leads(
     if has_schema_markup is not None:
         query = query.eq("has_schema_markup", has_schema_markup)
         count_query = count_query.eq("has_schema_markup", has_schema_markup)
+    if g_maps_claimed == "claimed":
+        cond = "g_maps_claimed.eq.claimed,g_maps_claimed.like.http%"
+        query = query.or_(cond)
+        count_query = count_query.or_(cond)
+    elif g_maps_claimed == "unclaimed":
+        cond = "g_maps_claimed.is.null,g_maps_claimed.eq.unclaimed,g_maps_claimed.eq.false"
+        query = query.or_(cond)
+        count_query = count_query.or_(cond)
 
     # Get total count (estimated — avoids full-table scan timeout on 1.5M-row table)
     try:
