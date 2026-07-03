@@ -27,6 +27,7 @@ async def list_leads(
     enrichment_stage:   Optional[int]  = Query(None, description="0-4"),
     email_state:        Optional[str]  = Query(None, description="ok|risky"),
     email_sub_state:    Optional[str]  = Query(None, description="Truelist sub-state (e.g. is_role, accept_all, failed_mx_check)"),
+    email_status:       Optional[str]  = Query(None, description="Truelist validity: valid|invalid|unknown|error|pending_batch"),
     min_stars:      Optional[float] = Query(None, description="Minimum Google rating (e.g. 0)"),
     max_stars:      Optional[float] = Query(None, description="Maximum Google rating (e.g. 3.5 for reputation targets)"),
     min_reviews:    Optional[int]   = Query(None, description="Minimum Google review count"),
@@ -99,6 +100,9 @@ async def list_leads(
     if email_sub_state:
         query = query.eq("email_sub_state", email_sub_state)
         count_query = count_query.eq("email_sub_state", email_sub_state)
+    if email_status:
+        query = query.eq("email_status", email_status)
+        count_query = count_query.eq("email_status", email_status)
     if min_stars is not None:
         query = query.gte("google_stars", min_stars)
         count_query = count_query.gte("google_stars", min_stars)
