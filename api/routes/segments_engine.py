@@ -255,7 +255,7 @@ def _paginated_leads(
     # Count total matching for pagination metadata
     count_query = (
         db.table("leads")
-        .select("id", count="exact")
+        .select("id", count="estimated", head=True)
         .eq("is_active", True)
         .eq("segment_label", label)
     )
@@ -264,7 +264,10 @@ def _paginated_leads(
     if state:
         count_query = count_query.eq("state", state.upper())
 
-    total = (count_query.execute().count or 0)
+    try:
+        total = (count_query.execute().count or 0)
+    except Exception:
+        total = 0
 
     leads = (
         query

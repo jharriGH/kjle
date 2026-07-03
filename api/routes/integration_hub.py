@@ -276,8 +276,8 @@ async def webhooks_summary(x_api_key: str = Header(...)):
     supabase = get_supabase()
 
     try:
-        total_res = supabase.table("webhooks").select("id", count="exact").execute()
-        active_res = supabase.table("webhooks").select("id", count="exact").eq("is_active", True).execute()
+        total_res = supabase.table("webhooks").select("id", count="estimated", head=True).execute()
+        active_res = supabase.table("webhooks").select("id", count="estimated", head=True).eq("is_active", True).execute()
 
         recent_res = supabase.table("export_log").select(
             "id, created_at, export_type, lead_count"
@@ -303,10 +303,10 @@ async def push_summary(x_api_key: str = Header(...)):
     supabase = get_supabase()
 
     try:
-        de_res      = supabase.table("leads").select("id", count="exact").eq("fit_demoenginez", True).eq("is_active", True).execute()
-        vd_res      = supabase.table("leads").select("id", count="exact").eq("fit_voicedrop", True).eq("is_active", True).execute()
-        hot_de_res  = supabase.table("leads").select("id", count="exact").eq("fit_demoenginez", True).eq("segment_label", "hot").eq("is_active", True).execute()
-        hot_vd_res  = supabase.table("leads").select("id", count="exact").eq("fit_voicedrop", True).eq("segment_label", "hot").eq("is_active", True).execute()
+        de_res      = supabase.table("leads").select("id", count="estimated", head=True).eq("fit_demoenginez", True).eq("is_active", True).execute()
+        vd_res      = supabase.table("leads").select("id", count="estimated", head=True).eq("fit_voicedrop", True).eq("is_active", True).execute()
+        hot_de_res  = supabase.table("leads").select("id", count="estimated", head=True).eq("fit_demoenginez", True).eq("segment_label", "hot").eq("is_active", True).execute()
+        hot_vd_res  = supabase.table("leads").select("id", count="estimated", head=True).eq("fit_voicedrop", True).eq("segment_label", "hot").eq("is_active", True).execute()
 
         return {
             "demoenginez": {

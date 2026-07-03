@@ -403,30 +403,36 @@ async def get_enrichment_status():
     stage_counts = {}
 
     for stage in range(5):  # stages 0–4
-        result = (
-            db.table("leads")
-            .select("id", count="exact")
-            .eq("enrichment_stage", stage)
-            .eq("is_active", True)
-            .execute()
-        )
-        stage_counts[stage] = result.count if result.count is not None else 0
+        try:
+            result = (
+                db.table("leads")
+                .select("id", count="estimated", head=True)
+                .eq("enrichment_stage", stage)
+                .eq("is_active", True)
+                .execute()
+            )
+            stage_counts[stage] = result.count or 0
+        except Exception:
+            stage_counts[stage] = 0
 
     total_leads = sum(stage_counts.values())
     total_unenriched = stage_counts.get(0, 0)
     total_enriched = total_leads - total_unenriched
 
     # Count leads with website (eligible for Stage 1)
-    eligible_result = (
-        db.table("leads")
-        .select("id", count="exact")
-        .eq("enrichment_stage", 0)
-        .eq("is_active", True)
-        .not_.is_("website", "null")
-        .neq("website", "")
-        .execute()
-    )
-    eligible_for_stage1 = eligible_result.count if eligible_result.count is not None else 0
+    try:
+        eligible_result = (
+            db.table("leads")
+            .select("id", count="estimated", head=True)
+            .eq("enrichment_stage", 0)
+            .eq("is_active", True)
+            .not_.is_("website", "null")
+            .neq("website", "")
+            .execute()
+        )
+        eligible_for_stage1 = eligible_result.count or 0
+    except Exception:
+        eligible_for_stage1 = 0
 
     return {
         "status": "success",

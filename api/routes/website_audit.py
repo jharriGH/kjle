@@ -237,13 +237,16 @@ async def audit_cost_estimate(
     db   = get_db()
     body = AuditBatchRequest(niche_slug=niche_slug, min_pain=min_pain, limit=limit)
 
-    count_res = (
-        _lead_query(db, body)
-        .select("id", count="exact")
-        .limit(limit)
-        .execute()
-    )
-    count          = min(count_res.count or 0, limit)
+    try:
+        count_res = (
+            _lead_query(db, body)
+            .select("id", count="estimated", head=True)
+            .limit(limit)
+            .execute()
+        )
+        count = min(count_res.count or 0, limit)
+    except Exception:
+        count = 0
     estimated_cost = round(count * COST_PER_SCRAPE, 4)
 
     return {

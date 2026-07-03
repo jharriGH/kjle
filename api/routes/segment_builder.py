@@ -134,7 +134,7 @@ async def preview_segment(payload: SegmentPreviewRequest, x_api_key: str = Heade
 
     try:
         # Count query
-        count_query = supabase.table("leads").select("id", count="exact")
+        count_query = supabase.table("leads").select("id", count="estimated", head=True)
         count_query = apply_filters(count_query, payload.filters)
         count_result = count_query.execute()
         total = count_result.count or 0
@@ -288,7 +288,7 @@ async def execute_saved_segment(segment_id: str, x_api_key: str = Header(...)):
         filters = SegmentFilters(**raw_filters)
 
         # Count
-        count_query = supabase.table("leads").select("id", count="exact")
+        count_query = supabase.table("leads").select("id", count="estimated", head=True)
         count_query = apply_filters(count_query, filters)
         count_result = count_query.execute()
         total = count_result.count or 0

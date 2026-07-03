@@ -148,7 +148,7 @@ async def fed_dnc_status(x_api_key: str = Header(...)) -> dict:
     oldest_imported = None
 
     try:
-        r = (db.table("fed_dnc_list").select("phone", count="exact")
+        r = (db.table("fed_dnc_list").select("phone", count="estimated", head=True)
              .limit(1).execute())
         total = r.count or 0
     except Exception as e:
@@ -237,7 +237,7 @@ async def nanpa_status(x_api_key: str = Header(...)) -> dict:
     last_updated = None
 
     try:
-        r = (db.table("nanpa_carrier_prefixes").select("npa_nxx_x", count="exact")
+        r = (db.table("nanpa_carrier_prefixes").select("npa_nxx_x", count="estimated", head=True)
              .limit(1).execute())
         total = r.count or 0
     except Exception as e:
@@ -253,7 +253,7 @@ async def nanpa_status(x_api_key: str = Header(...)) -> dict:
         for lt in ("mobile", "landline", "voip", "unknown"):
             try:
                 rr = (db.table("nanpa_carrier_prefixes")
-                      .select("npa_nxx_x", count="exact")
+                      .select("npa_nxx_x", count="estimated", head=True)
                       .eq("line_type", lt).limit(1).execute())
                 by_line_type[lt] = rr.count or 0
             except Exception as e:

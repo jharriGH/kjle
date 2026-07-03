@@ -515,7 +515,7 @@ async def get_stage4_cost_estimate(
     # Eligible leads (stage 3, pain gated)
     query = (
         db.table("leads")
-        .select("id", count="exact")
+        .select("id", count="estimated", head=True)
         .eq("enrichment_stage", 3)
         .eq("is_active", True)
         .gte("pain_score", effective_min)
@@ -525,14 +525,17 @@ async def get_stage4_cost_estimate(
     if state:
         query = query.eq("state", state.upper())
 
-    result = query.execute()
-    eligible_count = result.count if result.count is not None else 0
+    try:
+        result = query.execute()
+        eligible_count = result.count or 0
+    except Exception:
+        eligible_count = 0
     estimated_cost = round(eligible_count * FIRECRAWL_COST_PER_RECORD, 4)
 
     # Total Stage 3 leads (before pain gate) for context
     total_query = (
         db.table("leads")
-        .select("id", count="exact")
+        .select("id", count="estimated", head=True)
         .eq("enrichment_stage", 3)
         .eq("is_active", True)
     )
@@ -541,8 +544,11 @@ async def get_stage4_cost_estimate(
     if state:
         total_query = total_query.eq("state", state.upper())
 
-    total_result = total_query.execute()
-    total_stage3 = total_result.count if total_result.count is not None else 0
+    try:
+        total_result = total_query.execute()
+        total_stage3 = total_result.count or 0
+    except Exception:
+        total_stage3 = 0
     gated_out = total_stage3 - eligible_count
 
     return {

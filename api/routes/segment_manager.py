@@ -117,7 +117,7 @@ def _build_leads_query(db, filters: dict, niche_slug: Optional[str], state: Opti
 
 def _count_matching_leads(db, filters: dict, niche_slug: Optional[str], state: Optional[str], segment_label: Optional[str]) -> int:
     """Returns the count of leads matching the segment's stored filters."""
-    query = db.table("leads").select("id", count="exact").eq("is_active", True)
+    query = db.table("leads").select("id", count="estimated", head=True).eq("is_active", True)
 
     effective_niche = niche_slug or filters.get("niche_slug")
     if effective_niche:
@@ -159,8 +159,11 @@ def _count_matching_leads(db, filters: dict, niche_slug: Optional[str], state: O
     if schema is not None:
         query = query.eq("has_schema_markup", bool(schema))
 
-    result = query.execute()
-    return result.count if result.count is not None else 0
+    try:
+        result = query.execute()
+        return result.count or 0
+    except Exception:
+        return 0
 
 
 def _get_segment_or_404(db, segment_id: str) -> dict:

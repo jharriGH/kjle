@@ -292,7 +292,16 @@ async def push_single_lead(lead_id: str):
 async def get_push_status():
     db = get_db()
 
-    total = db.table("leads").select("id", count="exact").eq("is_active", True).execute().count or 0
+    try:
+        total = (
+            db.table("leads")
+            .select("id", count="estimated", head=True)
+            .eq("is_active", True)
+            .execute()
+            .count or 0
+        )
+    except Exception:
+        total = 0
     today = _today_iso()
     today_logs = db.table("export_log").select("lead_count").eq("export_type", "demoenginez_push").gte("created_at", today).execute().data or []
     pushed_today = sum(r.get("lead_count") or 0 for r in today_logs)

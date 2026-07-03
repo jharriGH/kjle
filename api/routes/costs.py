@@ -283,8 +283,17 @@ async def get_enrichment_funnel():
     # Lead counts per stage
     stage_counts = {}
     for stage in range(5):
-        result = db.table("leads").select("id", count="exact").eq("enrichment_stage", stage).eq("is_active", True).execute()
-        stage_counts[stage] = result.count if result.count is not None else 0
+        try:
+            result = (
+                db.table("leads")
+                .select("id", count="estimated", head=True)
+                .eq("enrichment_stage", stage)
+                .eq("is_active", True)
+                .execute()
+            )
+            stage_counts[stage] = result.count or 0
+        except Exception:
+            stage_counts[stage] = 0
 
     # Spend per service (to map to stages)
     service_to_stage = {

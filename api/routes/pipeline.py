@@ -18,7 +18,7 @@ async def pipeline_status(db=Depends(get_db)):
         # ── Total active leads ─────────────────────────────────────────────
         total_res = (
             db.table("leads")
-            .select("id", count="exact")
+            .select("id", count="estimated", head=True)
             .eq("is_active", True)
             .execute()
         )
@@ -39,7 +39,7 @@ async def pipeline_status(db=Depends(get_db)):
         # ── Phone coverage ─────────────────────────────────────────────────
         phone_res = (
             db.table("leads")
-            .select("id", count="exact")
+            .select("id", count="estimated", head=True)
             .eq("is_active", True)
             .not_.is_("phone", "null")
             .neq("phone", "")
@@ -50,7 +50,7 @@ async def pipeline_status(db=Depends(get_db)):
         # ── Email coverage ─────────────────────────────────────────────────
         email_res = (
             db.table("leads")
-            .select("id", count="exact")
+            .select("id", count="estimated", head=True)
             .eq("is_active", True)
             .not_.is_("email", "null")
             .neq("email", "")
@@ -61,7 +61,7 @@ async def pipeline_status(db=Depends(get_db)):
         # ── Website coverage ───────────────────────────────────────────────
         website_res = (
             db.table("leads")
-            .select("id", count="exact")
+            .select("id", count="estimated", head=True)
             .eq("is_active", True)
             .not_.is_("website", "null")
             .neq("website", "")
@@ -74,7 +74,7 @@ async def pipeline_status(db=Depends(get_db)):
         for stage in range(5):
             stage_res = (
                 db.table("leads")
-                .select("id", count="exact")
+                .select("id", count="estimated", head=True)
                 .eq("is_active", True)
                 .eq("enrichment_stage", stage)
                 .execute()
@@ -86,7 +86,7 @@ async def pipeline_status(db=Depends(get_db)):
         for label in ("hot", "warm", "cold"):
             seg_res = (
                 db.table("leads")
-                .select("id", count="exact")
+                .select("id", count="estimated", head=True)
                 .eq("is_active", True)
                 .eq("segment_label", label)
                 .execute()

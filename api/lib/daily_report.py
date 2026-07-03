@@ -244,7 +244,7 @@ def _tcpa_litigator_block(since: datetime) -> str:
     try:
         size_res = (
             db.table("tcpa_litigators")
-            .select("phone", count="exact")
+            .select("phone", count="estimated", head=True)
             .limit(1)
             .execute()
         )
@@ -257,7 +257,7 @@ def _tcpa_litigator_block(since: datetime) -> str:
     try:
         harvest_res = (
             db.table("tcpa_litigators")
-            .select("phone", count="exact")
+            .select("phone", count="estimated", head=True)
             .like("source", "searchbug_harvest%")
             .limit(1)
             .execute()
@@ -436,7 +436,7 @@ def _dnc_section(since: datetime) -> str:
 
     try:
         cache_size = (
-            db.table("dnc_cache").select("phone", count="exact").limit(1).execute().count or 0
+            db.table("dnc_cache").select("phone", count="estimated", head=True).limit(1).execute().count or 0
         )
     except Exception:
         cache_size = 0
@@ -606,7 +606,7 @@ def _suppressions_section(since: datetime) -> str:
 
     try:
         phone_total = (
-            db.table("dnc_suppressions").select("phone", count="exact").limit(1).execute().count or 0
+            db.table("dnc_suppressions").select("phone", count="estimated", head=True).limit(1).execute().count or 0
         )
     except Exception:
         phone_total = 0
@@ -633,7 +633,7 @@ def _suppressions_section(since: datetime) -> str:
     else:
         try:
             email_total = (
-                db.table("email_suppressions").select("email", count="exact").limit(1).execute().count or 0
+                db.table("email_suppressions").select("email", count="estimated", head=True).limit(1).execute().count or 0
             )
         except Exception:
             email_total = 0
