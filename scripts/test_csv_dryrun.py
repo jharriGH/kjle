@@ -12,8 +12,10 @@ the database.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
+import re
 import sys
 from datetime import date
 from typing import Any, Optional
@@ -48,7 +50,35 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 from api.lib import csv_field_map  # noqa: E402 — must come after sys.path + dotenv
-from scripts.ingest import normalize_phone, make_fingerprint  # noqa: E402
+
+import phonenumbers  # noqa: E402
+
+
+def normalize_phone(raw):
+    if not raw:
+        return None
+    try:
+        parsed = phonenumbers.parse(str(raw), "US")
+        if phonenumbers.is_valid_number(parsed):
+            return str(parsed.national_number)  # 10 digits
+    except Exception:
+        pass
+    # Fallback: strip non-digits
+    digits = re.sub(r'\D', '', str(raw))
+    if len(digits) == 11 and digits[0] == '1':
+        digits = digits[1:]
+    if len(digits) == 10:
+        return digits
+    return None
+
+
+def make_fingerprint(phone, name):
+    norm_name = re.sub(r'[^a-z0-9]', '', name.lower()) if name else ''
+    if phone:
+        raw = f"{phone}:{norm_name}"
+    else:
+        raw = f"nophone:{norm_name}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
 # ── CSV helpers ──────────────────────────────────────────────────────────────
