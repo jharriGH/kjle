@@ -12,10 +12,8 @@ the database.
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
 import os
-import re
 import sys
 from datetime import date
 from typing import Any, Optional
@@ -50,17 +48,7 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 from api.lib import csv_field_map  # noqa: E402 — must come after sys.path + dotenv
-
-
-# ── make_fingerprint — copied verbatim from scripts/ingest.py; do not diverge
-def make_fingerprint(phone: Optional[str], name: str) -> str:
-    """Canonical dedup key: phone (preferred) + normalized name."""
-    norm_name = re.sub(r"[^a-z0-9]", "", name.lower()) if name else ""
-    if phone:
-        raw = f"{phone}:{norm_name}"
-    else:
-        raw = f"nophone:{norm_name}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+from scripts.ingest import normalize_phone, make_fingerprint  # noqa: E402
 
 
 # ── CSV helpers ──────────────────────────────────────────────────────────────
@@ -232,12 +220,11 @@ def main() -> None:
     for rec in coerced:
         raw_phone = rec.get("phone")
         name = rec.get("business_name") or ""
-        if raw_phone:
-            clean = re.sub(r"\D", "", str(raw_phone))
-            if clean:
-                phones.append(clean)
-                fingerprints.append(make_fingerprint(clean, name))
-                continue
+        norm_phone = normalize_phone(raw_phone)
+        if norm_phone:
+            phones.append(norm_phone)
+            fingerprints.append(make_fingerprint(norm_phone, name))
+            continue
         fingerprints.append(make_fingerprint(None, name))
 
     # fingerprint match
