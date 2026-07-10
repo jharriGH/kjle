@@ -12,6 +12,86 @@ from ..database import get_db
 
 router = APIRouter()
 
+# Dynamic-filter whitelist: only these columns may be filtered via the `filters` param.
+# Curated ~70 targeting columns; excludes internal keys, PII, raw dupes, free-text blobs.
+DYNAMIC_FILTER_COLUMNS = {
+    "state","city","zip","country","niche_slug","category",
+    "pain_score","pain_score_website","pain_score_reputation","pain_score_seo","pain_score_social","pain_score_bizintel",
+    "fit_demoenginez","fit_reputation","fit_schema_ranker","fit_voicedrop",
+    "google_rank","google_stars","google_review_count","g_maps_claimed_bool",
+    "yelp_stars","yelp_review_count",
+    "facebook_stars","facebook_review_count","facebook_pixel","facebook_url",
+    "instagram_verified","instagram_is_business","instagram_followers","instagram_following","instagram_media_count","instagram_avg_likes","instagram_avg_comments","instagram_url",
+    "twitter_url","linkedin_url","linkedin_analytics",
+    "google_pixel","criteo_pixel","google_analytics","ads_facebook","ads_instagram","ads_messenger","ads_yelp","ads_adwords",
+    "domain_expires","domain_age_days","domain_expired","domain_expiring_soon",
+    "uses_wordpress","uses_shopify","mobile_friendly","seo_schema_present","website_platform",
+    "website_reachable","website_has_ssl","website_has_cta","website_has_contact_form","website_has_chat_widget","website_has_booking","website_has_testimonials","website_has_video","website_has_blog","website_blog_stale","website_copyright_stale","website_is_parked","website_is_franchise","has_chatbot","is_parked",
+    "schema_has_local_biz","schema_has_review","schema_has_faq","schema_has_service","has_schema_markup",
+    "pagespeed_mobile","pagespeed_desktop","pagespeed_lcp","pagespeed_cls",
+    "email_status","email_state","email_sub_state","email_valid",
+    "contactable","do_not_contact","dnc_status",
+    "segment_label","enrichment_stage","data_quality_score",
+}
+
+DYNAMIC_FILTER_OPS = {"eq","neq","gt","gte","lt","lte","isnull","notnull","like","ilike"}
+
+
+def _coerce_filter_value(v: str):
+    """Coerce a string filter value to bool/int/float where sensible."""
+    lv = v.strip().lower()
+    if lv in ("true", "false"):
+        return lv == "true"
+    if lv in ("null", "none", ""):
+        return None
+    try:
+        if "." in v:
+            return float(v)
+        return int(v)
+    except (ValueError, TypeError):
+        return v
+
+
+def _apply_dynamic_filters(q, filters_str: str):
+    """Parse `col:op:value,col:op:value` and apply to a supabase query builder.
+    Silently skips any clause whose column is not whitelisted or op is invalid.
+    Returns the (possibly modified) query builder."""
+    if not filters_str:
+        return q
+    for clause in filters_str.split(","):
+        clause = clause.strip()
+        if not clause:
+            continue
+        parts = clause.split(":", 2)
+        if len(parts) < 2:
+            continue
+        col = parts[0].strip()
+        op = parts[1].strip().lower()
+        val = parts[2] if len(parts) == 3 else ""
+        if col not in DYNAMIC_FILTER_COLUMNS or op not in DYNAMIC_FILTER_OPS:
+            continue
+        if op == "isnull":
+            q = q.is_(col, "null")
+        elif op == "notnull":
+            q = q.not_.is_(col, "null")
+        elif op == "eq":
+            q = q.eq(col, _coerce_filter_value(val))
+        elif op == "neq":
+            q = q.neq(col, _coerce_filter_value(val))
+        elif op == "gt":
+            q = q.gt(col, _coerce_filter_value(val))
+        elif op == "gte":
+            q = q.gte(col, _coerce_filter_value(val))
+        elif op == "lt":
+            q = q.lt(col, _coerce_filter_value(val))
+        elif op == "lte":
+            q = q.lte(col, _coerce_filter_value(val))
+        elif op == "like":
+            q = q.like(col, f"%{val}%")
+        elif op == "ilike":
+            q = q.ilike(col, f"%{val}%")
+    return q
+
 
 @router.get("/leads")
 async def list_leads(
@@ -28,6 +108,7 @@ async def list_leads(
     email_state:        Optional[str]  = Query(None, description="ok|risky"),
     email_sub_state:    Optional[str]  = Query(None, description="Truelist sub-state (e.g. is_role, accept_all, failed_mx_check)"),
     email_status:       Optional[str]  = Query(None, description="Truelist validity: valid|invalid|unknown|error|pending_batch"),
+    filters:            Optional[str]  = Query(None, description="Dynamic filters: comma-separated column:operator:value (e.g. yelp_stars:lt:3,facebook_pixel:eq:false). Whitelisted columns only."),
     min_stars:      Optional[float] = Query(None, description="Minimum Google rating (e.g. 0)"),
     max_stars:      Optional[float] = Query(None, description="Maximum Google rating (e.g. 3.5 for reputation targets)"),
     min_reviews:    Optional[int]   = Query(None, description="Minimum Google review count"),
@@ -174,6 +255,11 @@ async def list_leads(
         cond = "g_maps_claimed.is.null,g_maps_claimed.eq.unclaimed,g_maps_claimed.eq.false"
         query = query.or_(cond)
         count_query = count_query.or_(cond)
+
+    # Dynamic whitelisted filters (additive; applied to both queries)
+    if filters:
+        query = _apply_dynamic_filters(query, filters)
+        count_query = _apply_dynamic_filters(count_query, filters)
 
     # Get total count (estimated — avoids full-table scan timeout on 1.5M-row table)
     try:

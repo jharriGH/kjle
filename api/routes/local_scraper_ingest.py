@@ -527,11 +527,17 @@ async def ingest_localscraper(request: Request):
             "error":           f"ingest_log_write_failed: {str(e)[:200]}",
         }
 
+    # Extract email_required from webhook body or settings if present
+    email_required = bool(
+        body.get("email_required") or settings.get("email_required", False)
+    )
+
     # Process the results
     t_start = time.monotonic()
     try:
         stats = _process_results(db, results, run_id, worker_id,
-                                  scraper_id, settings)
+                                  scraper_id, settings,
+                                  email_required=email_required)
     except Exception as e:
         logger.error(
             "local_scraper_ingest: batch processing aborted: %s", e
