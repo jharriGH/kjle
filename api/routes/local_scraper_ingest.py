@@ -96,12 +96,30 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_FILLER_EMAIL_SUBSTRINGS = (
+    "filler@",
+    "@godaddy.com",
+    "@domainsbyproxy.com",
+    "@wixpress.com",
+    "@sentry.io",
+    "@sentry-next.wixpress.com",
+    "abuse@",
+    "postmaster@",
+    "hostmaster@",
+    "webmaster@",
+    "noreply@",
+    "no-reply@",
+)
+
 def _normalize_email(raw: Optional[str]) -> Optional[str]:
     if not raw:
         return None
     s = str(raw).strip().lower()
     if not s or "@" not in s or s.startswith("@") or s.endswith("@"):
         return None
+    for bad in _FILLER_EMAIL_SUBSTRINGS:
+        if bad in s:
+            return None
     return s
 
 
@@ -159,7 +177,8 @@ def _hours(raw: dict) -> Optional[dict]:
 
 
 def _process_results(db, results: list, run_id: str, worker_id: str,
-                     scraper_id: str, settings: dict) -> dict:
+                     scraper_id: str, settings: dict,
+                     email_required: bool = False) -> dict:
     """
     Iterate results[], normalize, dedup, upsert to leads.
 
@@ -206,6 +225,15 @@ def _process_results(db, results: list, run_id: str, worker_id: str,
             if not phone and not email and not website:
                 filtered += 1
                 continue
+
+            # Email gate (caller-controlled). When on, a real (non-filler)
+            # email is REQUIRED — no email means skip this lead entirely.
+            if email_required and not email:
+                filtered += 1
+                continue
+
+            # contactable = has a real email (campaign-ready).
+            contactable = email is not None
 
             # Dedup: phone first, then email. Website does not dedup
             # (landing pages would suppress legitimately distinct leads).
@@ -269,14 +297,14 @@ def _process_results(db, results: list, run_id: str, worker_id: str,
                 # NULL on scraped leads.
                 "google_stars":        _to_float(raw_lead.get("rating")),
                 "google_review_count": _to_int(raw_lead.get("reviews")),
-                "g_maps_claimed":      _to_bool(raw_lead.get("business verified")),
+                "g_maps_claimed_bool": _to_bool(raw_lead.get("business verified")),
                 # Phase B — rich fields promoted to their own columns.
                 # Keys are the scraper's actual (lowercased) field names,
                 # confirmed from a live Quick-mode lead.
-                "facebook":         _s(raw_lead.get("facebook")),
-                "instagram":        _s(raw_lead.get("instagram")),
-                "twitter":          _s(raw_lead.get("twitter")),
-                "linkedin":         _s(raw_lead.get("linkedin")),
+                "facebook_url":     _s(raw_lead.get("facebook")),
+                "instagram_url":    _s(raw_lead.get("instagram")),
+                "twitter_url":      _s(raw_lead.get("twitter")),
+                "linkedin_url":     _s(raw_lead.get("linkedin")),
                 "description":      _s(raw_lead.get("description")),
                 "timezone":         _s(raw_lead.get("timezone")),
                 "lat":              _to_float(raw_lead.get("lat")),
@@ -287,6 +315,7 @@ def _process_results(db, results: list, run_id: str, worker_id: str,
                 "image_url":        _s(raw_lead.get("image url")),
                 "price_text":       _s(raw_lead.get("price text")),
                 "source":        "local_scraper",
+                "contactable":   contactable,
                 # Preserve the ENTIRE scraped lead (socials, hours, geo,
                 # description, etc.) in jsonb so no field is ever dropped.
                 # Phase B can promote specific keys to their own columns later.

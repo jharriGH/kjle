@@ -98,6 +98,7 @@ ALLOWED_LIST_FILTER_STATUSES = {
 
 class ScrapeStartRequest(BaseModel):
     target: str
+    email_required: bool = False
     keyword: Optional[str] = None
     location: Optional[str] = None
     keyword_list: Optional[str] = None
@@ -185,6 +186,7 @@ async def scrape_start(
     now = _now_iso()
     row = {
         "target":           body.target,
+        "email_required":   body.email_required,
         "keyword":          body.keyword,
         "location":         body.location,
         "keyword_list":     body.keyword_list,
