@@ -4,6 +4,7 @@ Route prefix handled in main.py: /kjle/v1
 """
 
 import csv
+import hashlib
 import io
 import logging
 import re
@@ -135,6 +136,19 @@ def _valid_email(raw: str) -> bool:
     return "@" in (raw or "") and "." in (raw or "").split("@")[-1]
 
 
+def _compute_fingerprint(phone: str, business_name: str) -> Optional[str]:
+    """Canonical fingerprint: sha256(phone10:normname)[:32]. Returns None if no valid 10-digit phone."""
+    digits = re.sub(r"\D", "", phone or "")
+    if len(digits) == 11 and digits.startswith("1"):
+        phone10 = digits[-10:]
+    elif len(digits) == 10:
+        phone10 = digits
+    else:
+        return None
+    normname = re.sub(r"[^a-z0-9]", "", (business_name or "").lower())
+    return hashlib.sha256(f"{phone10}:{normname}".encode()).hexdigest()[:32]
+
+
 def _parse_csv_bytes(content: bytes) -> tuple[List[str], List[dict]]:
     """Return (headers, rows_as_dicts)."""
     text = content.decode("utf-8-sig", errors="replace")
@@ -219,6 +233,7 @@ async def import_csv(upload_id: str, opts: ImportOptions, db=Depends(get_db)):
     # made each chunk take minutes. Here we clean the chunk's phones first (same
     # logic as the per-row pass below) and fetch matches with a single IN query.
     existing_phones: set = set()
+    existing_fingerprints: set = set()
     if opts.skip_duplicates:
         phone_cols = [c for c, f in mapping.items() if f == "phone"]
         chunk_phones: set = set()
@@ -245,6 +260,32 @@ async def import_csv(upload_id: str, opts: ImportOptions, db=Depends(get_db)):
             except Exception as e:
                 logger.warning(f"[csv-import] Could not fetch existing phones for dedup: {e}")
 
+        # Fingerprint prefetch — mirrors the phone prefetch above.
+        bname_cols = [c for c, f in mapping.items() if f == "business_name"]
+        chunk_fps: set = set()
+        for row in rows:
+            raw_ph = next((row.get(c, "") or "" for c in phone_cols), "")
+            raw_bn = next((row.get(c, "") or "" for c in bname_cols), "")
+            fp = _compute_fingerprint(raw_ph, raw_bn)
+            if fp:
+                chunk_fps.add(fp)
+        if chunk_fps:
+            try:
+                fp_list = list(chunk_fps)
+                for i in range(0, len(fp_list), 500):
+                    sub = fp_list[i:i + 500]
+                    res = (
+                        db.table("leads")
+                        .select("fingerprint")
+                        .in_("fingerprint", sub)
+                        .execute()
+                    )
+                    for r in (res.data or []):
+                        if r.get("fingerprint"):
+                            existing_fingerprints.add(r["fingerprint"])
+            except Exception as e:
+                logger.warning(f"[csv-import] Could not fetch existing fingerprints for dedup: {e}")
+
     to_insert: List[tuple] = []  # (row_num, lead) queued for bulk insert
     for idx, row in enumerate(rows):
         row_num = idx + 1
@@ -266,9 +307,12 @@ async def import_csv(upload_id: str, opts: ImportOptions, db=Depends(get_db)):
                 continue
             lead["phone"] = clean_phone
 
-            # ── duplicate check ───────────────────────────────────────────
+            # ── fingerprint ───────────────────────────────────────────────
+            fp = _compute_fingerprint(clean_phone, lead.get("business_name", ""))
+
+            # ── duplicate check (fingerprint primary, phone secondary) ─────
             if opts.skip_duplicates:
-                if clean_phone in existing_phones:
+                if (fp is not None and fp in existing_fingerprints) or clean_phone in existing_phones:
                     skipped_duplicate += 1
                     continue
 
@@ -322,9 +366,16 @@ async def import_csv(upload_id: str, opts: ImportOptions, db=Depends(get_db)):
             # ── strip empty strings ───────────────────────────────────────
             lead = {k: v for k, v in lead.items() if v != "" and v is not None}
 
+            # ── pipeline-consistent fields ────────────────────────────────
+            lead["fingerprint"] = fp  # may be None for un-parseable phones
+            lead["source_file"] = filename
+            lead["contactable"] = bool(lead.get("email"))
+
             # ── queue for bulk insert (actual insert happens after loop) ───
             to_insert.append((row_num, lead))
             existing_phones.add(clean_phone)  # update local set (intra-batch dedup)
+            if fp:
+                existing_fingerprints.add(fp)  # intra-batch fingerprint dedup
 
         except Exception as e:
             failed += 1
