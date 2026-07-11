@@ -42,6 +42,11 @@ from .enrichment_email_clean import (
     ingest_batch_result as ec_ingest_batch_result,
     _get_truelist_api_key as ec_get_truelist_api_key,
 )
+from .website_audit import (
+    _fetch_html_free as wa_fetch_html_free,
+    _parse_signals_full as wa_parse_signals_full,
+    _FULL_AUDIT_COLUMNS as WA_FULL_AUDIT_COLUMNS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +79,12 @@ EMAIL_CLEAN_NIGHTLY_SLEEP  = 1.5    # seconds between each Truelist request
 EMAIL_CLEAN_TRUELIST_URL   = "https://api.truelist.io/api/v1/verify_inline"
 EMAIL_CLEAN_MAX_RETRIES    = 3
 EMAIL_CLEAN_RETRY_BACKOFF  = 3.0    # seconds to wait on 429
+
+# Website audit nightly — free httpx path, no Firecrawl cost
+WEBSITE_AUDIT_NIGHTLY_LIMIT       = 15_000  # leads per run, overridable via admin_settings
+WEBSITE_AUDIT_NIGHTLY_SUB_BATCH   = 500     # sub-batch page size for DB queries
+WEBSITE_AUDIT_NIGHTLY_SLEEP       = 0.5     # seconds between sub-batches
+WEBSITE_AUDIT_NIGHTLY_MAX_SECONDS = 21_600  # hard time ceiling: 6 hours
 
 # ── Campaign sync targets (config-driven) ──
 # Each entry describes one (project, server) pair to sync hourly from ReachInbox.
@@ -153,6 +164,11 @@ JOB_DEFINITIONS = {
     "tcpa_refresh_weekly": {
         "description": "Refresh tcpa_litigators table from active TCPA list provider — dormant-safe if env vars empty; emails weekly delta digest",
         "schedule":    "Weekly on Sunday at 04:00 UTC",
+        "trigger":     "cron",
+    },
+    "website_audit_nightly": {
+        "description": "Nightly free-path website audit — bulk-fills WebSignalz signals (~22) for leads where last_audited_at IS NULL, pain_score DESC; no Firecrawl cost",
+        "schedule":    "Daily at 01:30 UTC",
         "trigger":     "cron",
     },
 }
@@ -2174,6 +2190,148 @@ async def _send_tcpa_empty_investigation_email(*, existing_count: int) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Job 13 — Nightly Website Audit / WebSignalz bulk-fill (01:30 UTC)
+# Free httpx path — $0.00, no Firecrawl. Fills ~22 signals for leads where
+# last_audited_at IS NULL, ordered by pain_score DESC (highest-value first).
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def job_website_audit_nightly() -> dict:
+    """
+    Nightly bulk-fill of WebSignalz signals via the free httpx fetch path.
+
+    - Fires at 01:30 UTC (clear of email_clean at 00:00, stage3 at 01:00, stale_cleanup at 02:00)
+    - Up to WEBSITE_AUDIT_NIGHTLY_LIMIT leads per run (default 15000), overridable via
+      admin_settings key 'website_audit_nightly_limit'
+    - Targets: website IS NOT NULL AND last_audited_at IS NULL, pain_score DESC
+    - Queries in sub-batches of WEBSITE_AUDIT_NIGHTLY_SUB_BATCH (default 500); sleeps
+      WEBSITE_AUDIT_NIGHTLY_SLEEP seconds between sub-batches
+    - Reuses _fetch_html_free + _parse_signals_full from website_audit.py (single source)
+    - Unreachable sites: is_parked=True, website_has_ssl=False, last_audited_at=now()
+    - Reachable sites: full ~22 signals + last_audited_at written (mirrors batch-free endpoint)
+    - Each lead wrapped in try/except — one failure never kills the run
+    - Hard time ceiling: stops cleanly after WEBSITE_AUDIT_NIGHTLY_MAX_SECONDS (default 6h)
+    - Writes scheduler_log row on completion
+    """
+    job_name = "website_audit_nightly"
+    logger.info(f"[{job_name}] Starting...")
+    t_start = time.monotonic()
+
+    nightly_limit = int(await _get_admin_setting("website_audit_nightly_limit", WEBSITE_AUDIT_NIGHTLY_LIMIT))
+    sub_batch     = WEBSITE_AUDIT_NIGHTLY_SUB_BATCH
+    sleep_secs    = float(await _get_admin_setting("website_audit_nightly_sleep", WEBSITE_AUDIT_NIGHTLY_SLEEP))
+    max_seconds   = float(await _get_admin_setting("website_audit_nightly_max_seconds", WEBSITE_AUDIT_NIGHTLY_MAX_SECONDS))
+
+    db = get_db()
+
+    audited     = 0
+    unreachable = 0
+    failed      = 0
+    total_seen  = 0
+    offset      = 0
+
+    while total_seen < nightly_limit:
+        # Time ceiling check before each sub-batch
+        if time.monotonic() - t_start >= max_seconds:
+            logger.info(f"[{job_name}] Time ceiling reached ({max_seconds}s) — stopping cleanly")
+            break
+
+        batch_size = min(sub_batch, nightly_limit - total_seen)
+
+        try:
+            leads = (
+                db.table("leads")
+                .select("id, website")
+                .eq("is_active", True)
+                .not_.is_("website", "null")
+                .is_("last_audited_at", "null")
+                .order("pain_score", desc=True)
+                .range(offset, offset + batch_size - 1)
+                .execute()
+                .data or []
+            )
+        except Exception as e:
+            logger.error(f"[{job_name}] Sub-batch query failed at offset={offset}: {e}")
+            break
+
+        if not leads:
+            logger.info(f"[{job_name}] No more eligible leads at offset={offset} — done")
+            break
+
+        for lead in leads:
+            if time.monotonic() - t_start >= max_seconds:
+                logger.info(f"[{job_name}] Time ceiling hit mid-sub-batch — stopping")
+                break
+
+            lead_id = lead["id"]
+            website = (lead.get("website") or "").strip()
+            if not website:
+                unreachable += 1
+                total_seen  += 1
+                continue
+
+            try:
+                html, final_url = await wa_fetch_html_free(website)
+
+                if html is None:
+                    db.table("leads").update({
+                        "is_parked":       True,
+                        "website_has_ssl": False,
+                        "last_audited_at": datetime.now(timezone.utc).isoformat(),
+                    }).eq("id", lead_id).execute()
+                    unreachable += 1
+                else:
+                    signals = wa_parse_signals_full(html, final_url)
+                    safe_signals = {k: v for k, v in signals.items() if k in WA_FULL_AUDIT_COLUMNS}
+                    safe_signals["last_audited_at"] = datetime.now(timezone.utc).isoformat()
+                    db.table("leads").update(safe_signals).eq("id", lead_id).execute()
+                    audited += 1
+
+            except Exception as e:
+                failed += 1
+                logger.error(f"[{job_name}] Lead {lead_id} failed: {type(e).__name__}: {e}")
+
+            total_seen += 1
+
+        offset += len(leads)
+
+        if len(leads) < batch_size:
+            break  # exhausted eligible leads
+
+        if sleep_secs > 0:
+            await asyncio.sleep(sleep_secs)
+
+    duration = time.monotonic() - t_start
+    status = (
+        "partial" if failed > 0 and (audited + unreachable) > 0
+        else ("failed" if failed > 0 and audited == 0 and unreachable == 0 else "success")
+    )
+    notes = (
+        f"audited={audited}, unreachable={unreachable}, failed={failed}, "
+        f"total_seen={total_seen}, limit={nightly_limit}, duration={duration:.1f}s"
+    )
+
+    await _log_job(
+        job_name,
+        leads_processed=audited,
+        duration_seconds=duration,
+        status=status,
+        notes=notes,
+    )
+
+    result = {
+        "job":              job_name,
+        "audited":          audited,
+        "unreachable":      unreachable,
+        "failed":           failed,
+        "total_seen":       total_seen,
+        "duration_seconds": round(duration, 3),
+        "status":           status,
+    }
+    logger.info(f"[{job_name}] Done. {result}")
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # JOB DISPATCH MAP — maps name → async callable
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2191,6 +2349,7 @@ JOB_FUNCTIONS = {
     "fed_dnc_refresh_monthly": job_fed_dnc_refresh_monthly,
     "nanpa_refresh_monthly":   job_nanpa_refresh_monthly,
     "tcpa_refresh_weekly":     job_tcpa_refresh_weekly,
+    "website_audit_nightly":   job_website_audit_nightly,
 }
 
 
@@ -2334,6 +2493,21 @@ def setup_scheduler() -> AsyncIOScheduler:
         trigger=CronTrigger(day_of_week="sun", hour=4, minute=0),
         id="tcpa_refresh_weekly",
         name="TCPA Litigator List Refresh (weekly)",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # Job 13: website_audit_nightly — daily at 01:30 UTC
+    # Free httpx bulk-fill of WebSignalz signals (~22) for leads where
+    # last_audited_at IS NULL. Slot chosen to avoid all registered crons:
+    # email_clean (00:00), stale_cleanup (02:00), fed_dnc/tcpa (04:00+).
+    # Stage3 is listed at 01:00 in JOB_DEFINITIONS but is NOT registered
+    # in the scheduler (manual-trigger only), so 01:30 is fully clear.
+    scheduler.add_job(
+        job_website_audit_nightly,
+        trigger=CronTrigger(hour=1, minute=30),
+        id="website_audit_nightly",
+        name="Nightly Website Audit (WebSignalz bulk-fill, free)",
         replace_existing=True,
         misfire_grace_time=3600,
     )
