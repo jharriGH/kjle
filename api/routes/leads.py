@@ -82,9 +82,9 @@ def _apply_dynamic_filters(q, filters_str: str):
         if col not in DYNAMIC_FILTER_COLUMNS or op not in DYNAMIC_FILTER_OPS:
             continue
         if op == "isnull":
-            q = q.is_(col, "null")
+            q = q.filter(col, "is", "null")
         elif op == "notnull":
-            q = q.not_.is_(col, "null")
+            q = q.filter(col, "not.is", "null")
         elif op == "eq":
             q = q.eq(col, _coerce_filter_value(val))
         elif op == "neq":
