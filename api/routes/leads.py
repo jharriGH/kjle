@@ -6,8 +6,11 @@ GET  /kjle/v1/leads/search       — full-text search
 PATCH /kjle/v1/leads/{id}        — update lead fields
 DELETE /kjle/v1/leads/{id}       — soft delete (sets is_active=false)
 """
-from fastapi import APIRouter, HTTPException, Query
-from typing import Optional
+import os
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from pydantic import BaseModel
+from typing import List, Optional
 from ..database import get_db
 
 router = APIRouter()
@@ -35,6 +38,14 @@ DYNAMIC_FILTER_COLUMNS = {
 }
 
 DYNAMIC_FILTER_OPS = {"eq","neq","gt","gte","lt","lte","isnull","notnull","like","ilike"}
+
+# ── Auth (mirrors api/routes/dnc.py exactly) ─────────────────────────────────
+API_SECRET_KEY = os.environ.get("API_SECRET_KEY", "kjle-prod-2026-secret")
+
+
+def verify_api_key(x_api_key: str = Header(...)):
+    if x_api_key != API_SECRET_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 def _coerce_filter_value(v: str):
@@ -339,3 +350,42 @@ async def soft_delete_lead(lead_id: str):
     if not result.data:
         raise HTTPException(status_code=404, detail="Lead not found")
     return {"status": "deleted", "id": lead_id}
+
+
+# ── Mailable batch endpoint (MailSenderz — least-privilege, mailable col only) ──
+MAILABLE_BATCH_MAX = 500
+
+
+class MailableUpdate(BaseModel):
+    lead_id: str
+    mailable: bool
+
+
+class MailableBatchRequest(BaseModel):
+    source: str
+    updates: List[MailableUpdate]
+
+
+@router.post("/leads/mailable")
+async def set_mailable(body: MailableBatchRequest, _auth=Depends(verify_api_key)):
+    if not body.updates:
+        raise HTTPException(status_code=400, detail="updates list is empty")
+    if len(body.updates) > MAILABLE_BATCH_MAX:
+        raise HTTPException(status_code=400, detail=f"batch too large, max {MAILABLE_BATCH_MAX}")
+
+    db = get_db()
+    updated = 0
+    not_found: List[str] = []
+
+    for u in body.updates:
+        result = db.table("leads").update({"mailable": u.mailable}).eq("id", u.lead_id).execute()
+        if result.data:
+            updated += 1
+        else:
+            not_found.append(u.lead_id)
+
+    return {
+        "updated":   updated,
+        "not_found": not_found,
+        "source":    body.source,
+    }
