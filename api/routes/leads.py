@@ -30,6 +30,9 @@ DYNAMIC_FILTER_COLUMNS = {
     "domain_expires","domain_age_days","domain_expired","domain_expiring_soon",
     "uses_wordpress","uses_shopify","mobile_friendly","seo_schema_present","website_platform",
     "website_reachable","website_has_ssl","website_has_cta","website_has_contact_form","website_has_chat_widget","website_has_booking","website_has_testimonials","website_has_video","website_has_blog","website_blog_stale","website_copyright_stale","website_is_parked","website_is_franchise","has_chatbot","is_parked",
+    "website_has_privacy_policy","website_has_terms","website_has_cookie_consent","website_outdated_tech","website_missing_lang","website_has_skip_link",
+    "website_img_alt_missing","website_h1_count","website_word_count","website_meta_desc","website_has_sitemap","website_noindex",
+    "has_phone_on_page","has_address_on_page","schema_types","last_audited_at",
     "schema_has_local_biz","schema_has_review","schema_has_faq","schema_has_service","has_schema_markup",
     "pagespeed_mobile","pagespeed_desktop","pagespeed_lcp","pagespeed_cls",
     "email_status","email_state","email_sub_state","email_valid",
@@ -84,7 +87,7 @@ def _apply_dynamic_filters(q, filters_str: str):
         if op == "isnull":
             q = q.filter(col, "is", "null")
         elif op == "notnull":
-            q = q.filter(col, "not.is", "null")
+            q = q.not_.is_(col, "null")
         elif op == "eq":
             q = q.eq(col, _coerce_filter_value(val))
         elif op == "neq":
