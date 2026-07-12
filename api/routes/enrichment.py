@@ -158,6 +158,46 @@ async def _fetch_and_parse(url: str) -> dict:
     return result
 
 
+def _extract_schema_types(html: str) -> Optional[str]:
+    """
+    Extract JSON-LD @type values from raw HTML.
+    Returns comma-joined unique types (e.g. "LocalBusiness,WebSite") or None.
+    Pure function — no I/O.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    schema_tags = soup.find_all("script", type="application/ld+json")
+    detected_types = []
+    for tag in schema_tags:
+        try:
+            data = json.loads(tag.string or "")
+            if isinstance(data, list):
+                for item in data:
+                    t = item.get("@type")
+                    if t:
+                        detected_types.extend(t if isinstance(t, list) else [t])
+            elif isinstance(data, dict):
+                if "@graph" in data:
+                    for item in data["@graph"]:
+                        t = item.get("@type")
+                        if t:
+                            detected_types.extend(t if isinstance(t, list) else [t])
+                else:
+                    t = data.get("@type")
+                    if t:
+                        detected_types.extend(t if isinstance(t, list) else [t])
+        except (json.JSONDecodeError, AttributeError):
+            continue
+    if not detected_types:
+        return None
+    seen: set = set()
+    unique_types = []
+    for t in detected_types:
+        if t not in seen:
+            seen.add(t)
+            unique_types.append(t)
+    return ",".join(unique_types)
+
+
 async def _enrich_lead(lead: dict) -> tuple[bool, dict]:
     """
     Runs Stage 1 enrichment on a single lead dict.

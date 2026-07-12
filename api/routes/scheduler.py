@@ -33,7 +33,7 @@ from fastapi import APIRouter, HTTPException, Query
 from ..database import get_db
 from ..lib import cost_guard
 from .segments_engine import _classify_lead
-from .enrichment import _fetch_and_parse
+from .enrichment import _extract_schema_types
 from .webhooks import fire_event
 from .enrichment_email_clean import (
     select_uncleaned_leads as ec_select_uncleaned_leads,
@@ -410,8 +410,11 @@ async def job_classify_segments() -> dict:
 
 async def job_enrich_stage1() -> dict:
     """
-    Fetches up to 50 unenriched leads (stage=0, pain>=50, website not null),
-    runs Stage 1 free enrichment on each (website scrape, JSON-LD, phone/address).
+    Single-fetch full-signal enrichment for stage-0 leads (pain>=ENRICH_MIN_PAIN).
+    Fetches HTML once via wa_fetch_html_free, then:
+      - reachable  → wa_parse_signals_full (~22 signals) + website_reachable=True + schema_types
+      - unreachable → is_parked=True, website_has_ssl=False, website_reachable=False
+    Sets last_audited_at so website_audit_nightly skips already-processed leads.
     """
     job_name = "enrich_stage1"
     logger.info(f"[{job_name}] Starting...")
@@ -443,12 +446,32 @@ async def job_enrich_stage1() -> dict:
         website = (lead.get("website") or "").strip()
 
         try:
-            signals = await _fetch_and_parse(website)
-            update_payload = {
-                **signals,
-                "enrichment_stage": 1,
-                "enriched_at":      _now_iso(),
-            }
+            html, final_url = await wa_fetch_html_free(website)
+
+            if html is None:
+                # Unreachable — mirror website_audit_nightly's unreachable handling
+                update_payload = {
+                    "is_parked":         True,
+                    "website_has_ssl":   False,
+                    "website_reachable": False,
+                    "last_audited_at":   datetime.now(timezone.utc).isoformat(),
+                    "enrichment_stage":  1,
+                    "enriched_at":       _now_iso(),
+                }
+            else:
+                # Single fetch → full signal set (22 signals) + the two fields
+                # wa_parse_signals_full does not produce: website_reachable + schema_types
+                signals = wa_parse_signals_full(html, final_url)
+                safe_signals = {k: v for k, v in signals.items() if k in WA_FULL_AUDIT_COLUMNS}
+                update_payload = {
+                    **safe_signals,
+                    "website_reachable": True,
+                    "schema_types":      _extract_schema_types(html),
+                    "last_audited_at":   datetime.now(timezone.utc).isoformat(),
+                    "enrichment_stage":  1,
+                    "enriched_at":       _now_iso(),
+                }
+
             db.table("leads").update(update_payload).eq("id", lead_id).execute()
 
             # Log cost ($0)
