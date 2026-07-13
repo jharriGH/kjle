@@ -86,6 +86,17 @@ WEBSITE_AUDIT_NIGHTLY_SUB_BATCH   = 500     # sub-batch page size for DB queries
 WEBSITE_AUDIT_NIGHTLY_SLEEP       = 0.5     # seconds between sub-batches
 WEBSITE_AUDIT_NIGHTLY_MAX_SECONDS = 21_600  # hard time ceiling: 6 hours
 
+# PageSpeed nightly — keyed API, 25k/day free with key (2 calls/lead)
+PAGESPEED_NIGHTLY_LIMIT       = 10_000  # leads per run (~20k API calls)
+PAGESPEED_NIGHTLY_SLEEP       = 0.4     # seconds between leads (~1 req/sec sustained)
+PAGESPEED_NIGHTLY_MAX_SECONDS = 21_600  # 6h ceiling, same as website_audit
+PAGESPEED_DAILY_CAP           = 24_000  # stop before hitting 25k/day free limit
+PAGESPEED_HTTP_TIMEOUT        = 30.0    # seconds per request
+PAGESPEED_BACKOFF_INITIAL     = 30.0    # seconds for first 500 backoff
+PAGESPEED_BACKOFF_MAX         = 180.0   # cap at 3 minutes
+PAGESPEED_SPIKE_THRESHOLD     = 20      # consecutive all-500 calls before spike sleep
+PAGESPEED_SPIKE_SLEEP         = 300.0   # 5-min recovery sleep on 500 spike
+
 # ── Campaign sync targets (config-driven) ──
 # Each entry describes one (project, server) pair to sync hourly from ReachInbox.
 # Adding a new project or server = append one dict. No logic changes required.
@@ -169,6 +180,11 @@ JOB_DEFINITIONS = {
     "website_audit_nightly": {
         "description": "Nightly free-path website audit — bulk-fills WebSignalz signals (~22) for leads where last_audited_at IS NULL, pain_score DESC; no Firecrawl cost",
         "schedule":    "Daily at 01:30 UTC",
+        "trigger":     "cron",
+    },
+    "pagespeed_nightly": {
+        "description": "Nightly PageSpeed Insights bulk-fill (WebSignalz Phase 2) — mobile+desktop scores + LCP/CLS/TBT + mobile_friendly for leads where pagespeed_checked_at IS NULL; paced w/ 500-backoff + daily cap",
+        "schedule":    "Daily at 02:30 UTC",
         "trigger":     "cron",
     },
 }
@@ -2355,6 +2371,312 @@ async def job_website_audit_nightly() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PageSpeed helpers — used only by job_pagespeed_nightly
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PAGESPEED_ENDPOINT = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+
+
+async def _pagespeed_call(url: str, strategy: str, api_key: str):
+    """
+    One PageSpeed API call for the given strategy ('mobile' or 'desktop').
+    Retries up to 3x on HTTP 500 with exponential backoff (30s → 60s → 120s, cap 180s).
+    Returns (data_or_None, http_requests_made, all_retries_were_500).
+    """
+    backoff       = PAGESPEED_BACKOFF_INITIAL
+    requests_made = 0
+    last_was_500  = False
+
+    for attempt in range(3):
+        requests_made += 1
+        try:
+            async with httpx.AsyncClient(timeout=PAGESPEED_HTTP_TIMEOUT) as client:
+                resp = await client.get(
+                    _PAGESPEED_ENDPOINT,
+                    params={
+                        "url":      url,
+                        "key":      api_key,
+                        "strategy": strategy,
+                        "category": "performance",
+                    },
+                )
+            if resp.status_code == 500:
+                last_was_500 = True
+                logger.warning(
+                    f"[pagespeed_nightly] 500 for {url}/{strategy} attempt {attempt + 1}"
+                )
+                if attempt < 2:
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, PAGESPEED_BACKOFF_MAX)
+                continue
+
+            last_was_500 = False
+            resp.raise_for_status()
+            return resp.json(), requests_made, False
+
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 500:
+                last_was_500 = True
+                if attempt < 2:
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, PAGESPEED_BACKOFF_MAX)
+                continue
+            logger.warning(
+                f"[pagespeed_nightly] HTTP {e.response.status_code} for {url}/{strategy}"
+            )
+            return None, requests_made, False
+
+        except Exception as e:
+            logger.warning(
+                f"[pagespeed_nightly] error for {url}/{strategy}: {type(e).__name__}: {e}"
+            )
+            return None, requests_made, False
+
+    return None, requests_made, last_was_500
+
+
+def _pagespeed_parse_mobile(data: dict) -> dict:
+    """Extract mobile pagespeed columns from Lighthouse JSON.
+    FID proxy: total-blocking-time (TBT) — FID is deprecated in Lighthouse v10+.
+    mobile_friendly: pagespeed_mobile >= 50 (Google 'Good' threshold heuristic).
+    """
+    lighthouse = data.get("lighthouseResult", {})
+    audits     = lighthouse.get("audits", {})
+    score      = lighthouse.get("categories", {}).get("performance", {}).get("score")
+
+    mobile_score = round(float(score) * 100) if score is not None else None
+    lcp_ms       = audits.get("largest-contentful-paint", {}).get("numericValue")
+    cls_v        = audits.get("cumulative-layout-shift", {}).get("numericValue")
+    tbt_ms       = audits.get("total-blocking-time", {}).get("numericValue")
+
+    return {
+        "pagespeed_mobile": mobile_score,
+        "pagespeed_lcp":    round(float(lcp_ms) / 1000, 2) if lcp_ms is not None else None,
+        "pagespeed_cls":    round(float(cls_v), 4)          if cls_v  is not None else None,
+        "pagespeed_fid":    round(float(tbt_ms), 1)         if tbt_ms is not None else None,
+        "mobile_friendly":  (mobile_score is not None and mobile_score >= 50),
+    }
+
+
+def _pagespeed_parse_desktop(data: dict) -> dict:
+    """Extract desktop performance score from Lighthouse JSON."""
+    score = (
+        data.get("lighthouseResult", {})
+            .get("categories", {})
+            .get("performance", {})
+            .get("score")
+    )
+    return {
+        "pagespeed_desktop": round(float(score) * 100) if score is not None else None,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 14 — Nightly PageSpeed Enrichment / WebSignalz Phase 2 (02:30 UTC)
+# Populates: pagespeed_mobile, pagespeed_desktop, pagespeed_lcp, pagespeed_cls,
+#            pagespeed_fid, mobile_friendly, pagespeed_checked_at
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def job_pagespeed_nightly() -> dict:
+    """
+    Nightly bulk-fill of PageSpeed Insights columns (WebSignalz Phase 2).
+
+    - Fires at 02:30 UTC (clear: email_clean 00:00, stage3 01:00,
+      website_audit 01:30, stale_cleanup 02:00, stage4 03:00)
+    - Targets: website IS NOT NULL AND pagespeed_checked_at IS NULL, pain_score DESC
+    - 'pagespeed_nightly_limit' leads/run (default 10000, ~20k API calls)
+    - Two calls/lead (strategy=mobile + strategy=desktop); paced ~0.4s between leads
+    - Daily cap: PAGESPEED_DAILY_CAP (24000) API requests to stay under 25k/day
+    - 500 backoff: 30s → 60s → 120s, cap 180s; up to 3 retries per call;
+      on exhaustion marks pagespeed_checked_at=now() with null scores and continues
+    - 500-spike guard: >=20 consecutive all-500 outcomes → 5-min recovery sleep
+    - Time ceiling: 'pagespeed_nightly_max_seconds' default 21600 (6h)
+    - FID proxy: total-blocking-time (TBT) — FID deprecated in Lighthouse v10+
+    - mobile_friendly: pagespeed_mobile >= 50
+    - Skips cleanly when PAGESPEED_API_KEY not set
+    - Writes scheduler_log row on completion
+    """
+    from ..config import settings
+
+    job_name = "pagespeed_nightly"
+    logger.info(f"[{job_name}] Starting...")
+    t_start = time.monotonic()
+
+    api_key = settings.PAGESPEED_API_KEY
+    if not api_key:
+        notes = "SKIPPED — PAGESPEED_API_KEY not set in environment"
+        logger.warning(f"[{job_name}] {notes}")
+        await _log_job(job_name, status="skipped", notes=notes)
+        return {"job": job_name, "status": "skipped", "reason": notes}
+
+    nightly_limit = int(await _get_admin_setting("pagespeed_nightly_limit", PAGESPEED_NIGHTLY_LIMIT))
+    max_seconds   = float(await _get_admin_setting("pagespeed_nightly_max_seconds", PAGESPEED_NIGHTLY_MAX_SECONDS))
+    sub_batch     = 200
+
+    db = get_db()
+
+    enriched    = 0  # both strategies returned data
+    partial     = 0  # only one strategy returned data, or both null (site failed all retries)
+    skipped     = 0  # empty/missing website
+    failed      = 0  # unexpected exception; lead still marked checked
+    total_seen  = 0
+    total_calls = 0
+    consec_500s = 0
+    offset      = 0
+
+    while total_seen < nightly_limit:
+        if time.monotonic() - t_start >= max_seconds:
+            logger.info(f"[{job_name}] Time ceiling reached ({max_seconds}s) — stopping cleanly")
+            break
+
+        if total_calls >= PAGESPEED_DAILY_CAP:
+            logger.info(f"[{job_name}] Daily API cap reached ({PAGESPEED_DAILY_CAP}) — stopping cleanly")
+            break
+
+        batch_size = min(sub_batch, nightly_limit - total_seen)
+
+        try:
+            leads = (
+                db.table("leads")
+                .select("id, website")
+                .eq("is_active", True)
+                .not_.is_("website", "null")
+                .is_("pagespeed_checked_at", "null")
+                .order("pain_score", desc=True)
+                .range(offset, offset + batch_size - 1)
+                .execute()
+                .data or []
+            )
+        except Exception as e:
+            logger.error(f"[{job_name}] Sub-batch query failed at offset={offset}: {e}")
+            break
+
+        if not leads:
+            logger.info(f"[{job_name}] No more eligible leads at offset={offset} — done")
+            break
+
+        for lead in leads:
+            if time.monotonic() - t_start >= max_seconds:
+                logger.info(f"[{job_name}] Time ceiling hit mid-sub-batch — stopping")
+                break
+
+            if total_calls >= PAGESPEED_DAILY_CAP:
+                logger.info(f"[{job_name}] Daily cap reached mid-sub-batch — stopping")
+                break
+
+            lead_id = lead["id"]
+            website = (lead.get("website") or "").strip()
+
+            if not website:
+                skipped    += 1
+                total_seen += 1
+                continue
+
+            url = website if website.startswith(("http://", "https://")) else f"https://{website}"
+
+            try:
+                # ── Mobile call ──────────────────────────────────────────────
+                mob_data, mob_calls, mob_all500 = await _pagespeed_call(url, "mobile", api_key)
+                total_calls += mob_calls
+
+                if mob_all500:
+                    consec_500s += 1
+                    if consec_500s >= PAGESPEED_SPIKE_THRESHOLD:
+                        logger.warning(
+                            f"[{job_name}] 500-spike ({consec_500s} consecutive calls) — "
+                            f"sleeping {PAGESPEED_SPIKE_SLEEP}s then resuming"
+                        )
+                        await asyncio.sleep(PAGESPEED_SPIKE_SLEEP)
+                        consec_500s = 0
+                else:
+                    consec_500s = 0
+
+                # ── Desktop call ─────────────────────────────────────────────
+                desk_data, desk_calls, desk_all500 = await _pagespeed_call(url, "desktop", api_key)
+                total_calls += desk_calls
+
+                if desk_all500:
+                    consec_500s += 1
+                    if consec_500s >= PAGESPEED_SPIKE_THRESHOLD:
+                        logger.warning(
+                            f"[{job_name}] 500-spike ({consec_500s} consecutive calls) — "
+                            f"sleeping {PAGESPEED_SPIKE_SLEEP}s then resuming"
+                        )
+                        await asyncio.sleep(PAGESPEED_SPIKE_SLEEP)
+                        consec_500s = 0
+                else:
+                    consec_500s = 0
+
+                # ── Build DB update (always write pagespeed_checked_at) ──────
+                update: dict = {
+                    "pagespeed_checked_at": datetime.now(timezone.utc).isoformat(),
+                }
+                if mob_data:
+                    update.update(_pagespeed_parse_mobile(mob_data))
+                if desk_data:
+                    update.update(_pagespeed_parse_desktop(desk_data))
+
+                db.table("leads").update(update).eq("id", lead_id).execute()
+
+                if mob_data and desk_data:
+                    enriched += 1
+                else:
+                    partial += 1
+
+            except Exception as e:
+                failed += 1
+                logger.error(f"[{job_name}] Lead {lead_id} failed: {type(e).__name__}: {e}")
+                try:
+                    db.table("leads").update({
+                        "pagespeed_checked_at": datetime.now(timezone.utc).isoformat(),
+                    }).eq("id", lead_id).execute()
+                except Exception:
+                    pass
+
+            total_seen += 1
+            await asyncio.sleep(PAGESPEED_NIGHTLY_SLEEP)
+
+        offset += len(leads)
+
+        if len(leads) < batch_size:
+            break
+
+    duration = time.monotonic() - t_start
+    cap_note  = " [daily cap reached]" if total_calls >= PAGESPEED_DAILY_CAP else ""
+    status    = (
+        "partial" if failed > 0 and (enriched + partial + skipped) > 0
+        else ("failed" if failed > 0 and enriched == 0 and partial == 0 else "success")
+    )
+    notes = (
+        f"enriched={enriched}, partial={partial}, skipped={skipped}, failed={failed}, "
+        f"total_seen={total_seen}, api_calls={total_calls}{cap_note}, "
+        f"limit={nightly_limit}, duration={duration:.1f}s"
+    )
+
+    await _log_job(
+        job_name,
+        leads_processed=enriched + partial,
+        duration_seconds=duration,
+        status=status,
+        notes=notes,
+    )
+
+    result = {
+        "job":              job_name,
+        "enriched":         enriched,
+        "partial":          partial,
+        "skipped":          skipped,
+        "failed":           failed,
+        "total_seen":       total_seen,
+        "api_calls":        total_calls,
+        "duration_seconds": round(duration, 3),
+        "status":           status,
+    }
+    logger.info(f"[{job_name}] Done. {result}")
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # JOB DISPATCH MAP — maps name → async callable
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2373,6 +2695,7 @@ JOB_FUNCTIONS = {
     "nanpa_refresh_monthly":   job_nanpa_refresh_monthly,
     "tcpa_refresh_weekly":     job_tcpa_refresh_weekly,
     "website_audit_nightly":   job_website_audit_nightly,
+    "pagespeed_nightly":       job_pagespeed_nightly,
 }
 
 
@@ -2531,6 +2854,20 @@ def setup_scheduler() -> AsyncIOScheduler:
         trigger=CronTrigger(hour=1, minute=30),
         id="website_audit_nightly",
         name="Nightly Website Audit (WebSignalz bulk-fill, free)",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # Job 14: pagespeed_nightly — daily at 02:30 UTC (WebSignalz Phase 2)
+    # Keyed PageSpeed Insights bulk-fill: mobile+desktop scores + LCP/CLS/TBT.
+    # Slot confirmed clear: email_clean (00:00), stage3 (01:00, manual only),
+    # website_audit (01:30), stale_cleanup (02:00), stage4 (03:00, manual only).
+    # 02:30 has no registered daily cron — confirmed by reading setup_scheduler.
+    scheduler.add_job(
+        job_pagespeed_nightly,
+        trigger=CronTrigger(hour=2, minute=30),
+        id="pagespeed_nightly",
+        name="Nightly PageSpeed Enrichment (WebSignalz Phase 2)",
         replace_existing=True,
         misfire_grace_time=3600,
     )
