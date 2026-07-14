@@ -110,21 +110,28 @@ def _load_axe() -> str:
 
 # ── Accessibility score formula ──────────────────────────────────────────────
 _IMPACT_WEIGHTS = {"critical": 25.0, "serious": 10.0, "moderate": 3.0, "minor": 1.0}
+# K is a PROVISIONAL calibration constant. Recalibrate once a real score distribution
+# exists from thousands of lead scans -- do not treat this value as empirically derived.
+SCORE_DECAY_K = 60.0
+# Version stamp: any formula change invalidates trend history; stamp makes it explainable.
+SCORE_FORMULA_VERSION = "2.0-expdecay-k60"
 
 
 def _compute_score(violations: list[dict]) -> float:
-    # Automated RISK score (0-100). NOT a compliance determination.
-    # Formula: for each violation type, deduct weight(impact) * (1 + log10(max(1, affected_nodes))).
-    # Diminishing returns via log10 mean prevalence matters but one noisy rule can't dominate.
-    # Weights: critical=25, serious=10, moderate=3, minor=1.
+    # Automated RISK index (0-100, approaches but never reaches 0).
+    # This is a relative, tool-specific score -- NEVER a compliance determination.
+    # Raw violation counts are the authoritative fact; 'incomplete' items never affect
+    # this score because they are unconfirmed.
+    # Formula: W = sum(weight(impact) * (1 + log10(max(1, affected_nodes))))
+    #          score = 100 * exp(-W / SCORE_DECAY_K)
     # The 4 *_count columns remain counts of violation TYPES (unchanged semantics).
-    deduction = 0.0
+    W = 0.0
     for v in violations:
         impact = (v.get("impact") or "minor").lower()
         weight = _IMPACT_WEIGHTS.get(impact, 1.0)
         nodes = max(1, v.get("affected_nodes", 1))
-        deduction += weight * (1.0 + math.log10(nodes))
-    return max(0.0, 100.0 - deduction)
+        W += weight * (1.0 + math.log10(nodes))
+    return 100.0 * math.exp(-W / SCORE_DECAY_K)
 
 
 # ── Per-job scan (runs inside thread pool) ───────────────────────────────────
@@ -214,6 +221,7 @@ def _scan_url(url: str, axe_js: str) -> dict:
             "incomplete_count": incomplete_count,
             "incomplete": incomplete,
             "accessibility_score": round(score, 2),
+            "score_formula_version": SCORE_FORMULA_VERSION,
             "error": None,
         }
 
@@ -282,6 +290,7 @@ def _insert_result(db: Client, job: dict, scan: dict) -> int | None:
         "violations": scan.get("violations", []),
         "incomplete_count": scan.get("incomplete_count", 0),
         "incomplete": scan.get("incomplete", []),
+        "score_formula_version": scan.get("score_formula_version"),
         "metadata": {"worker_id": WORKER_ID},
     }
     try:

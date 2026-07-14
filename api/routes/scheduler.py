@@ -16,6 +16,7 @@ Call setup_scheduler() inside FastAPI lifespan (main.py).
 
 import asyncio
 import csv
+from collections import deque
 import io
 import logging
 import os
@@ -87,7 +88,7 @@ WEBSITE_AUDIT_NIGHTLY_SLEEP       = 0.5     # seconds between sub-batches
 WEBSITE_AUDIT_NIGHTLY_MAX_SECONDS = 21_600  # hard time ceiling: 6 hours
 
 # PageSpeed nightly — keyed API, 25k/day free with key (2 calls/lead)
-PAGESPEED_NIGHTLY_LIMIT       = 10_000  # leads per run (~20k API calls)
+PAGESPEED_NIGHTLY_LIMIT       = 12_000  # leads per run (12k x 2 calls = 24k = real daily cap)
 PAGESPEED_NIGHTLY_SLEEP       = 0.4     # seconds between leads (~1 req/sec sustained)
 PAGESPEED_NIGHTLY_MAX_SECONDS = 21_600  # 6h ceiling, same as website_audit
 PAGESPEED_DAILY_CAP           = 24_000  # stop before hitting 25k/day free limit
@@ -96,6 +97,7 @@ PAGESPEED_BACKOFF_INITIAL     = 30.0    # seconds for first 500 backoff
 PAGESPEED_BACKOFF_MAX         = 180.0   # cap at 3 minutes
 PAGESPEED_SPIKE_THRESHOLD     = 20      # consecutive all-500 calls before spike sleep
 PAGESPEED_SPIKE_SLEEP         = 300.0   # 5-min recovery sleep on 500 spike
+PAGESPEED_CONCURRENCY         = 12      # concurrent leads; overridable via admin_settings
 
 # ── Campaign sync targets (config-driven) ──
 # Each entry describes one (project, server) pair to sync hourly from ReachInbox.
@@ -2484,14 +2486,15 @@ async def job_pagespeed_nightly() -> dict:
     - Fires at 02:30 UTC (clear: email_clean 00:00, stage3 01:00,
       website_audit 01:30, stale_cleanup 02:00, stage4 03:00)
     - Targets: website IS NOT NULL AND pagespeed_checked_at IS NULL, pain_score DESC
-    - 'pagespeed_nightly_limit' leads/run (default 10000, ~20k API calls)
-    - Two calls/lead (strategy=mobile + strategy=desktop); paced ~0.4s between leads
-    - Daily cap: PAGESPEED_DAILY_CAP (24000) API requests to stay under 25k/day
-    - 500 backoff: 30s → 60s → 120s, cap 180s; up to 3 retries per call;
+    - 'pagespeed_nightly_limit' leads/run (default 12000, 12k x 2 calls = 24k = daily cap)
+    - Concurrent: asyncio.Semaphore(pagespeed_concurrency, default 12) per sub-batch
+    - Rate ceiling: 240 API calls/minute (sliding window; conservative throttle)
+    - Daily cap: PAGESPEED_DAILY_CAP (24000) shared across all concurrent tasks
+    - 500 backoff: 30s -> 60s -> 120s, cap 180s; up to 3 retries per call;
       on exhaustion marks pagespeed_checked_at=now() with null scores and continues
-    - 500-spike guard: >=20 consecutive all-500 outcomes → 5-min recovery sleep
+    - 500-spike guard: >=20 consecutive all-500 outcomes -> 5-min recovery sleep (all tasks)
     - Time ceiling: 'pagespeed_nightly_max_seconds' default 21600 (6h)
-    - FID proxy: total-blocking-time (TBT) — FID deprecated in Lighthouse v10+
+    - FID proxy: total-blocking-time (TBT) -- FID deprecated in Lighthouse v10+
     - mobile_friendly: pagespeed_mobile >= 50
     - Skips cleanly when PAGESPEED_API_KEY not set
     - Writes scheduler_log row on completion
@@ -2511,29 +2514,197 @@ async def job_pagespeed_nightly() -> dict:
 
     nightly_limit = int(await _get_admin_setting("pagespeed_nightly_limit", PAGESPEED_NIGHTLY_LIMIT))
     max_seconds   = float(await _get_admin_setting("pagespeed_nightly_max_seconds", PAGESPEED_NIGHTLY_MAX_SECONDS))
+    concurrency   = int(await _get_admin_setting("pagespeed_concurrency", PAGESPEED_CONCURRENCY))
     sub_batch     = 200
 
     db = get_db()
 
-    enriched    = 0  # both strategies returned data
-    partial     = 0  # only one strategy returned data, or both null (site failed all retries)
-    skipped     = 0  # empty/missing website
-    failed      = 0  # unexpected exception; lead still marked checked
-    total_seen  = 0
-    total_calls = 0
-    consec_500s = 0
-    offset      = 0
+    # ── Shared mutable counters (all mutations guarded by lock) ──────────────
+    enriched     = 0  # both strategies returned data
+    partial      = 0  # only one strategy returned data, or both null (site failed all retries)
+    skipped      = 0  # empty/missing website
+    failed       = 0  # unexpected exception; lead still marked checked
+    total_seen   = 0
+    total_calls  = 0
+    consec_500s  = 0
+    spike_active = False
 
-    while total_seen < nightly_limit:
+    lock = asyncio.Lock()
+    sem  = asyncio.Semaphore(concurrency)
+
+    # spike gate: normally set (green); cleared during recovery sleep (red for all tasks)
+    spike_clear = asyncio.Event()
+    spike_clear.set()
+
+    # sliding-window rate limiter: max 240 calls per 60-second window
+    call_ts      = deque()
+    call_ts_lock = asyncio.Lock()
+
+    async def _rate_gate() -> None:
+        """Block until a rate-limit token is available (ceiling: 240 calls/60 s)."""
+        while True:
+            async with call_ts_lock:
+                now = time.monotonic()
+                while call_ts and now - call_ts[0] > 60.0:
+                    call_ts.popleft()
+                if len(call_ts) < 240:
+                    call_ts.append(now)
+                    return
+                sleep_secs = 60.0 - (now - call_ts[0]) + 0.05
+            await asyncio.sleep(sleep_secs)
+
+    async def _do_one_lead(lead: dict) -> None:
+        nonlocal enriched, partial, skipped, failed, total_seen, total_calls, consec_500s, spike_active
+
+        # bail immediately if we are already past the time ceiling
+        if time.monotonic() - t_start >= max_seconds:
+            return
+
+        lead_id = lead["id"]
+        website = (lead.get("website") or "").strip()
+
+        if not website:
+            async with lock:
+                skipped    += 1
+                total_seen += 1
+            return
+
+        url = website if website.startswith(("http://", "https://")) else f"https://{website}"
+
+        try:
+            # ── Mobile call ──────────────────────────────────────────────────
+            await spike_clear.wait()
+            async with lock:
+                cap_hit = total_calls >= PAGESPEED_DAILY_CAP
+            if cap_hit:
+                return  # leave lead unchecked; re-eligible tomorrow
+
+            await _rate_gate()
+            mob_data, mob_calls, mob_all500 = await _pagespeed_call(url, "mobile", api_key)
+
+            do_spike = False
+            async with lock:
+                total_calls += mob_calls
+                if mob_all500:
+                    consec_500s += 1
+                    local_consec = consec_500s
+                else:
+                    consec_500s = 0
+                    local_consec = 0
+                if local_consec >= PAGESPEED_SPIKE_THRESHOLD and not spike_active:
+                    spike_active = True
+                    do_spike = True
+
+            if do_spike:
+                spike_clear.clear()
+                logger.warning(
+                    f"[{job_name}] 500-spike ({local_consec} consecutive calls) — "
+                    f"sleeping {PAGESPEED_SPIKE_SLEEP}s then resuming"
+                )
+                await asyncio.sleep(PAGESPEED_SPIKE_SLEEP)
+                async with lock:
+                    consec_500s  = 0
+                    spike_active = False
+                spike_clear.set()
+
+            # ── Desktop call ─────────────────────────────────────────────────
+            await spike_clear.wait()
+            async with lock:
+                cap_hit = total_calls >= PAGESPEED_DAILY_CAP
+
+            if cap_hit:
+                # mobile already done; commit what we have and count as partial
+                try:
+                    upd: dict = {"pagespeed_checked_at": datetime.now(timezone.utc).isoformat()}
+                    if mob_data:
+                        upd.update(_pagespeed_parse_mobile(mob_data))
+                    db.table("leads").update(upd).eq("id", lead_id).execute()
+                except Exception:
+                    pass
+                async with lock:
+                    partial    += 1
+                    total_seen += 1
+                return
+
+            await _rate_gate()
+            desk_data, desk_calls, desk_all500 = await _pagespeed_call(url, "desktop", api_key)
+
+            do_spike = False
+            async with lock:
+                total_calls += desk_calls
+                if desk_all500:
+                    consec_500s += 1
+                    local_consec = consec_500s
+                else:
+                    consec_500s = 0
+                    local_consec = 0
+                if local_consec >= PAGESPEED_SPIKE_THRESHOLD and not spike_active:
+                    spike_active = True
+                    do_spike = True
+
+            if do_spike:
+                spike_clear.clear()
+                logger.warning(
+                    f"[{job_name}] 500-spike ({local_consec} consecutive calls) — "
+                    f"sleeping {PAGESPEED_SPIKE_SLEEP}s then resuming"
+                )
+                await asyncio.sleep(PAGESPEED_SPIKE_SLEEP)
+                async with lock:
+                    consec_500s  = 0
+                    spike_active = False
+                spike_clear.set()
+
+            # ── DB write (always sets pagespeed_checked_at) ──────────────────
+            update: dict = {"pagespeed_checked_at": datetime.now(timezone.utc).isoformat()}
+            if mob_data:
+                update.update(_pagespeed_parse_mobile(mob_data))
+            if desk_data:
+                update.update(_pagespeed_parse_desktop(desk_data))
+            db.table("leads").update(update).eq("id", lead_id).execute()
+
+            async with lock:
+                if mob_data and desk_data:
+                    enriched += 1
+                else:
+                    partial  += 1
+                total_seen += 1
+
+        except Exception as e:
+            logger.error(f"[{job_name}] Lead {lead_id} failed: {type(e).__name__}: {e}")
+            try:
+                db.table("leads").update({
+                    "pagespeed_checked_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("id", lead_id).execute()
+            except Exception:
+                pass
+            async with lock:
+                failed     += 1
+                total_seen += 1
+
+    async def _process_lead_gated(lead: dict) -> None:
+        async with sem:
+            await _do_one_lead(lead)
+
+    # ── Main pagination loop ─────────────────────────────────────────────────
+    offset = 0
+
+    while True:
         if time.monotonic() - t_start >= max_seconds:
             logger.info(f"[{job_name}] Time ceiling reached ({max_seconds}s) — stopping cleanly")
             break
 
-        if total_calls >= PAGESPEED_DAILY_CAP:
+        async with lock:
+            seen_snap  = total_seen
+            calls_snap = total_calls
+
+        if calls_snap >= PAGESPEED_DAILY_CAP:
             logger.info(f"[{job_name}] Daily API cap reached ({PAGESPEED_DAILY_CAP}) — stopping cleanly")
             break
 
-        batch_size = min(sub_batch, nightly_limit - total_seen)
+        if seen_snap >= nightly_limit:
+            break
+
+        batch_size = min(sub_batch, nightly_limit - seen_snap)
 
         try:
             leads = (
@@ -2555,92 +2726,15 @@ async def job_pagespeed_nightly() -> dict:
             logger.info(f"[{job_name}] No more eligible leads at offset={offset} — done")
             break
 
-        for lead in leads:
-            if time.monotonic() - t_start >= max_seconds:
-                logger.info(f"[{job_name}] Time ceiling hit mid-sub-batch — stopping")
-                break
-
-            if total_calls >= PAGESPEED_DAILY_CAP:
-                logger.info(f"[{job_name}] Daily cap reached mid-sub-batch — stopping")
-                break
-
-            lead_id = lead["id"]
-            website = (lead.get("website") or "").strip()
-
-            if not website:
-                skipped    += 1
-                total_seen += 1
-                continue
-
-            url = website if website.startswith(("http://", "https://")) else f"https://{website}"
-
-            try:
-                # ── Mobile call ──────────────────────────────────────────────
-                mob_data, mob_calls, mob_all500 = await _pagespeed_call(url, "mobile", api_key)
-                total_calls += mob_calls
-
-                if mob_all500:
-                    consec_500s += 1
-                    if consec_500s >= PAGESPEED_SPIKE_THRESHOLD:
-                        logger.warning(
-                            f"[{job_name}] 500-spike ({consec_500s} consecutive calls) — "
-                            f"sleeping {PAGESPEED_SPIKE_SLEEP}s then resuming"
-                        )
-                        await asyncio.sleep(PAGESPEED_SPIKE_SLEEP)
-                        consec_500s = 0
-                else:
-                    consec_500s = 0
-
-                # ── Desktop call ─────────────────────────────────────────────
-                desk_data, desk_calls, desk_all500 = await _pagespeed_call(url, "desktop", api_key)
-                total_calls += desk_calls
-
-                if desk_all500:
-                    consec_500s += 1
-                    if consec_500s >= PAGESPEED_SPIKE_THRESHOLD:
-                        logger.warning(
-                            f"[{job_name}] 500-spike ({consec_500s} consecutive calls) — "
-                            f"sleeping {PAGESPEED_SPIKE_SLEEP}s then resuming"
-                        )
-                        await asyncio.sleep(PAGESPEED_SPIKE_SLEEP)
-                        consec_500s = 0
-                else:
-                    consec_500s = 0
-
-                # ── Build DB update (always write pagespeed_checked_at) ──────
-                update: dict = {
-                    "pagespeed_checked_at": datetime.now(timezone.utc).isoformat(),
-                }
-                if mob_data:
-                    update.update(_pagespeed_parse_mobile(mob_data))
-                if desk_data:
-                    update.update(_pagespeed_parse_desktop(desk_data))
-
-                db.table("leads").update(update).eq("id", lead_id).execute()
-
-                if mob_data and desk_data:
-                    enriched += 1
-                else:
-                    partial += 1
-
-            except Exception as e:
-                failed += 1
-                logger.error(f"[{job_name}] Lead {lead_id} failed: {type(e).__name__}: {e}")
-                try:
-                    db.table("leads").update({
-                        "pagespeed_checked_at": datetime.now(timezone.utc).isoformat(),
-                    }).eq("id", lead_id).execute()
-                except Exception:
-                    pass
-
-            total_seen += 1
-            await asyncio.sleep(PAGESPEED_NIGHTLY_SLEEP)
+        # Dispatch sub-batch concurrently; gather completes before next batch is fetched
+        await asyncio.gather(*[_process_lead_gated(lead) for lead in leads])
 
         offset += len(leads)
 
         if len(leads) < batch_size:
             break
 
+    # ── Final stats ──────────────────────────────────────────────────────────
     duration = time.monotonic() - t_start
     cap_note  = " [daily cap reached]" if total_calls >= PAGESPEED_DAILY_CAP else ""
     status    = (
@@ -2650,7 +2744,7 @@ async def job_pagespeed_nightly() -> dict:
     notes = (
         f"enriched={enriched}, partial={partial}, skipped={skipped}, failed={failed}, "
         f"total_seen={total_seen}, api_calls={total_calls}{cap_note}, "
-        f"limit={nightly_limit}, duration={duration:.1f}s"
+        f"limit={nightly_limit}, concurrency={concurrency}, duration={duration:.1f}s"
     )
 
     await _log_job(
