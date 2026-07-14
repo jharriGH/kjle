@@ -84,8 +84,9 @@ EMAIL_CLEAN_RETRY_BACKOFF  = 3.0    # seconds to wait on 429
 # Website audit nightly — free httpx path, no Firecrawl cost
 WEBSITE_AUDIT_NIGHTLY_LIMIT       = 15_000  # leads per run, overridable via admin_settings
 WEBSITE_AUDIT_NIGHTLY_SUB_BATCH   = 500     # sub-batch page size for DB queries
-WEBSITE_AUDIT_NIGHTLY_SLEEP       = 0.5     # seconds between sub-batches
+WEBSITE_AUDIT_NIGHTLY_SLEEP       = 0.5     # seconds between sub-batches (legacy; unused in concurrent path)
 WEBSITE_AUDIT_NIGHTLY_MAX_SECONDS = 21_600  # hard time ceiling: 6 hours
+WEBSITE_AUDIT_CONCURRENCY         = 25      # concurrent leads; overridable via admin_settings
 
 # PageSpeed nightly — keyed API, 25k/day free with key (2 calls/lead)
 PAGESPEED_NIGHTLY_LIMIT       = 12_000  # leads per run (12k x 2 calls = 24k = real daily cap)
@@ -2244,14 +2245,14 @@ async def job_website_audit_nightly() -> dict:
     - Up to WEBSITE_AUDIT_NIGHTLY_LIMIT leads per run (default 15000), overridable via
       admin_settings key 'website_audit_nightly_limit'
     - Targets: website IS NOT NULL AND last_audited_at IS NULL, pain_score DESC
-    - Queries in sub-batches of WEBSITE_AUDIT_NIGHTLY_SUB_BATCH (default 500); sleeps
-      WEBSITE_AUDIT_NIGHTLY_SLEEP seconds between sub-batches
+    - Queries in sub-batches of WEBSITE_AUDIT_NIGHTLY_SUB_BATCH (default 500)
+    - Concurrent: asyncio.Semaphore(website_audit_concurrency, default 25) per sub-batch
     - Reuses _fetch_html_free + _parse_signals_full from website_audit.py (single source)
     - Unreachable sites: is_parked=True, website_has_ssl=False, last_audited_at=now()
+    - Failures: last_audited_at=now() written so the lead is not retried forever
     - Reachable sites: full ~22 signals + last_audited_at written (mirrors batch-free endpoint)
-    - Each lead wrapped in try/except — one failure never kills the run
     - Hard time ceiling: stops cleanly after WEBSITE_AUDIT_NIGHTLY_MAX_SECONDS (default 6h)
-    - Writes scheduler_log row on completion
+    - _log_job() fires on EVERY exit path via try/finally — including CancelledError/SIGTERM
     """
     job_name = "website_audit_nightly"
     logger.info(f"[{job_name}] Starting...")
@@ -2259,8 +2260,8 @@ async def job_website_audit_nightly() -> dict:
 
     nightly_limit = int(await _get_admin_setting("website_audit_nightly_limit", WEBSITE_AUDIT_NIGHTLY_LIMIT))
     sub_batch     = WEBSITE_AUDIT_NIGHTLY_SUB_BATCH
-    sleep_secs    = float(await _get_admin_setting("website_audit_nightly_sleep", WEBSITE_AUDIT_NIGHTLY_SLEEP))
     max_seconds   = float(await _get_admin_setting("website_audit_nightly_max_seconds", WEBSITE_AUDIT_NIGHTLY_MAX_SECONDS))
+    concurrency   = int(await _get_admin_setting("website_audit_concurrency", WEBSITE_AUDIT_CONCURRENCY))
 
     db = get_db()
 
@@ -2270,94 +2271,120 @@ async def job_website_audit_nightly() -> dict:
     total_seen  = 0
     offset      = 0
 
-    while total_seen < nightly_limit:
-        # Time ceiling check before each sub-batch
+    lock = asyncio.Lock()
+    sem  = asyncio.Semaphore(concurrency)
+
+    async def _do_one_lead(lead: dict) -> None:
+        nonlocal audited, unreachable, failed, total_seen
+
         if time.monotonic() - t_start >= max_seconds:
-            logger.info(f"[{job_name}] Time ceiling reached ({max_seconds}s) — stopping cleanly")
-            break
+            return
 
-        batch_size = min(sub_batch, nightly_limit - total_seen)
+        lead_id = lead["id"]
+        website = (lead.get("website") or "").strip()
 
-        try:
-            leads = (
-                db.table("leads")
-                .select("id, website")
-                .eq("is_active", True)
-                .not_.is_("website", "null")
-                .is_("last_audited_at", "null")
-                .order("pain_score", desc=True)
-                .range(offset, offset + batch_size - 1)
-                .execute()
-                .data or []
-            )
-        except Exception as e:
-            logger.error(f"[{job_name}] Sub-batch query failed at offset={offset}: {e}")
-            break
-
-        if not leads:
-            logger.info(f"[{job_name}] No more eligible leads at offset={offset} — done")
-            break
-
-        for lead in leads:
-            if time.monotonic() - t_start >= max_seconds:
-                logger.info(f"[{job_name}] Time ceiling hit mid-sub-batch — stopping")
-                break
-
-            lead_id = lead["id"]
-            website = (lead.get("website") or "").strip()
-            if not website:
+        if not website:
+            async with lock:
                 unreachable += 1
                 total_seen  += 1
-                continue
+            return
 
-            try:
-                html, final_url = await wa_fetch_html_free(website)
+        try:
+            html, final_url = await wa_fetch_html_free(website)
 
-                if html is None:
-                    db.table("leads").update({
-                        "is_parked":       True,
-                        "website_has_ssl": False,
-                        "last_audited_at": datetime.now(timezone.utc).isoformat(),
-                    }).eq("id", lead_id).execute()
+            if html is None:
+                db.table("leads").update({
+                    "is_parked":       True,
+                    "website_has_ssl": False,
+                    "last_audited_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("id", lead_id).execute()
+                async with lock:
                     unreachable += 1
-                else:
-                    signals = wa_parse_signals_full(html, final_url)
-                    safe_signals = {k: v for k, v in signals.items() if k in WA_FULL_AUDIT_COLUMNS}
-                    safe_signals["last_audited_at"] = datetime.now(timezone.utc).isoformat()
-                    db.table("leads").update(safe_signals).eq("id", lead_id).execute()
+            else:
+                signals = wa_parse_signals_full(html, final_url)
+                safe_signals = {k: v for k, v in signals.items() if k in WA_FULL_AUDIT_COLUMNS}
+                safe_signals["last_audited_at"] = datetime.now(timezone.utc).isoformat()
+                db.table("leads").update(safe_signals).eq("id", lead_id).execute()
+                async with lock:
                     audited += 1
 
-            except Exception as e:
+        except Exception as e:
+            logger.error(f"[{job_name}] Lead {lead_id} failed: {type(e).__name__}: {e}")
+            try:
+                db.table("leads").update({
+                    "last_audited_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("id", lead_id).execute()
+            except Exception:
+                pass
+            async with lock:
                 failed += 1
-                logger.error(f"[{job_name}] Lead {lead_id} failed: {type(e).__name__}: {e}")
 
+        async with lock:
             total_seen += 1
 
-        offset += len(leads)
+    async def _process_lead_gated(lead: dict) -> None:
+        async with sem:
+            await _do_one_lead(lead)
 
-        if len(leads) < batch_size:
-            break  # exhausted eligible leads
+    try:
+        while True:
+            if time.monotonic() - t_start >= max_seconds:
+                logger.info(f"[{job_name}] Time ceiling reached ({max_seconds}s) — stopping cleanly")
+                break
 
-        if sleep_secs > 0:
-            await asyncio.sleep(sleep_secs)
+            async with lock:
+                seen_snap = total_seen
 
-    duration = time.monotonic() - t_start
-    status = (
-        "partial" if failed > 0 and (audited + unreachable) > 0
-        else ("failed" if failed > 0 and audited == 0 and unreachable == 0 else "success")
-    )
-    notes = (
-        f"audited={audited}, unreachable={unreachable}, failed={failed}, "
-        f"total_seen={total_seen}, limit={nightly_limit}, duration={duration:.1f}s"
-    )
+            if seen_snap >= nightly_limit:
+                break
 
-    await _log_job(
-        job_name,
-        leads_processed=audited,
-        duration_seconds=duration,
-        status=status,
-        notes=notes,
-    )
+            batch_size = min(sub_batch, nightly_limit - seen_snap)
+
+            try:
+                leads = (
+                    db.table("leads")
+                    .select("id, website")
+                    .eq("is_active", True)
+                    .not_.is_("website", "null")
+                    .is_("last_audited_at", "null")
+                    .order("pain_score", desc=True)
+                    .range(offset, offset + batch_size - 1)
+                    .execute()
+                    .data or []
+                )
+            except Exception as e:
+                logger.error(f"[{job_name}] Sub-batch query failed at offset={offset}: {e}")
+                break
+
+            if not leads:
+                logger.info(f"[{job_name}] No more eligible leads at offset={offset} — done")
+                break
+
+            await asyncio.gather(*[_process_lead_gated(lead) for lead in leads])
+
+            offset += len(leads)
+
+            if len(leads) < batch_size:
+                break
+
+    finally:
+        duration = time.monotonic() - t_start
+        status = (
+            "partial" if failed > 0 and (audited + unreachable) > 0
+            else ("failed" if failed > 0 and audited == 0 and unreachable == 0 else "success")
+        )
+        notes = (
+            f"audited={audited}, unreachable={unreachable}, failed={failed}, "
+            f"total_seen={total_seen}, limit={nightly_limit}, "
+            f"concurrency={concurrency}, duration={duration:.1f}s"
+        )
+        await _log_job(
+            job_name,
+            leads_processed=audited,
+            duration_seconds=duration,
+            status=status,
+            notes=notes,
+        )
 
     result = {
         "job":              job_name,
