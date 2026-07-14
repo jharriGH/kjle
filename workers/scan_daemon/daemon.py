@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import signal
 import sys
@@ -108,16 +109,22 @@ def _load_axe() -> str:
 
 
 # ── Accessibility score formula ──────────────────────────────────────────────
-def _compute_score(critical: int, serious: int, moderate: int, minor: int) -> float:
-    # Accessibility score (0-100) using impact-weighted deductions.
-    # Weights reflect WCAG violation severity:
-    #   critical = 25 pts  (keyboard trap, missing alt on meaningful img, etc.)
-    #   serious  = 10 pts  (color contrast, label association)
-    #   moderate =  3 pts  (landmark regions, redundant links)
-    #   minor    =  1 pt   (tabindex order hints, advisory notices)
-    # Score floors at 0. A single critical violation costs 25 points;
-    # 4+ criticals drive the score to zero regardless of other counts.
-    return max(0.0, 100.0 - critical * 25.0 - serious * 10.0 - moderate * 3.0 - minor * 1.0)
+_IMPACT_WEIGHTS = {"critical": 25.0, "serious": 10.0, "moderate": 3.0, "minor": 1.0}
+
+
+def _compute_score(violations: list[dict]) -> float:
+    # Automated RISK score (0-100). NOT a compliance determination.
+    # Formula: for each violation type, deduct weight(impact) * (1 + log10(max(1, affected_nodes))).
+    # Diminishing returns via log10 mean prevalence matters but one noisy rule can't dominate.
+    # Weights: critical=25, serious=10, moderate=3, minor=1.
+    # The 4 *_count columns remain counts of violation TYPES (unchanged semantics).
+    deduction = 0.0
+    for v in violations:
+        impact = (v.get("impact") or "minor").lower()
+        weight = _IMPACT_WEIGHTS.get(impact, 1.0)
+        nodes = max(1, v.get("affected_nodes", 1))
+        deduction += weight * (1.0 + math.log10(nodes))
+    return max(0.0, 100.0 - deduction)
 
 
 # ── Per-job scan (runs inside thread pool) ───────────────────────────────────
@@ -165,7 +172,7 @@ def _scan_url(url: str, axe_js: str) -> dict:
         for v in raw.get("violations", []):
             impact = (v.get("impact") or "minor").lower()
             if impact in counts:
-                counts[impact] += 1  # count violation types, not affected nodes
+                counts[impact] += 1  # count violation TYPES, not affected nodes
             violations.append({
                 "id": v["id"],
                 "impact": v.get("impact"),
@@ -174,13 +181,27 @@ def _scan_url(url: str, axe_js: str) -> dict:
                 "affected_nodes": len(v.get("nodes", [])),
             })
 
-        score = _compute_score(
-            counts["critical"], counts["serious"], counts["moderate"], counts["minor"]
-        )
+        # axe 'incomplete' = checks axe could NOT automatically determine (e.g. color-contrast
+        # on image/gradient backgrounds). Valuable to surface for client review; never affects
+        # the automated score because these are unconfirmed violations.
+        incomplete = []
+        for item in raw.get("incomplete", []):
+            incomplete.append({
+                "id": item["id"],
+                "impact": item.get("impact"),
+                "tags": item.get("tags", []),
+                "description": item.get("description", ""),
+                "affected_nodes": len(item.get("nodes", [])),
+            })
+        incomplete_count = len(incomplete)
+
+        # Score uses violations list (with per-violation affected_nodes) for prevalence weighting.
+        score = _compute_score(violations)
         elapsed = time.perf_counter() - start
         _log(
             "scan_ok", url=url,
             critical=counts["critical"], serious=counts["serious"],
+            incomplete_count=incomplete_count,
             score=round(score, 2), elapsed_s=round(elapsed, 3),
         )
         return {
@@ -190,6 +211,8 @@ def _scan_url(url: str, axe_js: str) -> dict:
             "serious_count": counts["serious"],
             "moderate_count": counts["moderate"],
             "minor_count": counts["minor"],
+            "incomplete_count": incomplete_count,
+            "incomplete": incomplete,
             "accessibility_score": round(score, 2),
             "error": None,
         }
@@ -255,8 +278,11 @@ def _insert_result(db: Client, job: dict, scan: dict) -> int | None:
         "serious_count": scan.get("serious_count", 0),
         "moderate_count": scan.get("moderate_count", 0),
         "minor_count": scan.get("minor_count", 0),
-        "violations": json.dumps(scan.get("violations", [])),
-        "metadata": json.dumps({"worker_id": WORKER_ID}),
+        # Pass native list/dict — postgrest serializes these as real jsonb (not string).
+        "violations": scan.get("violations", []),
+        "incomplete_count": scan.get("incomplete_count", 0),
+        "incomplete": scan.get("incomplete", []),
+        "metadata": {"worker_id": WORKER_ID},
     }
     try:
         resp = db.table("scan_results").insert(row).execute()
