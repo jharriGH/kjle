@@ -1,0 +1,20 @@
+[Unit]
+Description=KJLE WebSignalz Scan Daemon (Phase 3)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=REPLACE_ME
+WorkingDirectory=/opt/kjle/workers/scan_daemon
+EnvironmentFile=/etc/kjle-scan-daemon.env
+ExecStart=/usr/bin/python3 /opt/kjle/workers/scan_daemon/daemon.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+TimeoutStopSec=60
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
