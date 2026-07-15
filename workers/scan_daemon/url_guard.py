@@ -32,6 +32,12 @@ _CLOUD_METADATA_HOSTS: frozenset[str] = frozenset({
 # Suffixes that always indicate internal/local names.
 _BLOCKED_SUFFIXES: tuple[str, ...] = (".localhost", ".local", ".internal")
 
+# Reason strings that mean the target is unreachable (dead domain / DNS failure),
+# as opposed to a genuine security rejection. Callers use this set to write
+# scan_status='unreachable' instead of 'blocked'.
+# dns_resolves_to_private is intentionally absent — that IS an SSRF attack vector.
+UNREACHABLE_REASONS: frozenset[str] = frozenset({"dns_resolution_failed"})
+
 
 def _ip_block_reason(addr_str: str) -> str | None:
     """

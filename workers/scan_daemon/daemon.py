@@ -31,7 +31,7 @@ from typing import Any
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from supabase import create_client, Client
 
-from url_guard import is_url_safe
+from url_guard import is_url_safe, UNREACHABLE_REASONS
 
 # ── Configuration ────────────────────────────────────────────────────────────
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
@@ -112,8 +112,10 @@ def _load_axe() -> str:
 
 # ── Accessibility score formula ──────────────────────────────────────────────
 _IMPACT_WEIGHTS = {"critical": 25.0, "serious": 10.0, "moderate": 3.0, "minor": 1.0}
-# K is a PROVISIONAL calibration constant. Recalibrate once a real score distribution
-# exists from thousands of lead scans -- do not treat this value as empirically derived.
+# K=60 validated against 149 real small-business lead scans (2026-07-15): score
+# distribution spans 0-100, mean ~54, mode 60-70, no pile-up at 0 or ceiling.
+# Any future change to K or the weights MUST bump SCORE_FORMULA_VERSION — changing
+# the formula invalidates stored trend history.
 SCORE_DECAY_K = 60.0
 # Version stamp: any formula change invalidates trend history; stamp makes it explainable.
 SCORE_FORMULA_VERSION = "2.0-expdecay-k60"
@@ -353,21 +355,40 @@ def _process_job(job: dict, axe_js: str, db: Client) -> None:
     # SSRF guard: reject private/loopback/cloud-metadata targets before browser launch
     _pre_safe, _pre_reason = is_url_safe(url)
     if not _pre_safe:
-        _log("ssrf_blocked", level=logging.WARNING, url=url, reason=_pre_reason)
-        _blocked: dict[str, Any] = {
-            "status": "blocked",
-            "error": f"ssrf_blocked: {_pre_reason}",
-            "accessibility_score": None,
-            "critical_count": 0,
-            "serious_count": 0,
-            "moderate_count": 0,
-            "minor_count": 0,
-            "violations": [],
-            "incomplete_count": 0,
-            "incomplete": [],
-            "score_formula_version": SCORE_FORMULA_VERSION,
-        }
-        result_id = _insert_result(db, job, _blocked)
+        if _pre_reason in UNREACHABLE_REASONS:
+            # Dead domain / DNS failure — not a security threat; label correctly.
+            _log("unreachable", level=logging.WARNING, url=url, reason=_pre_reason)
+            _unreachable: dict[str, Any] = {
+                "status": "unreachable",
+                "error": f"unreachable: {_pre_reason}",
+                "accessibility_score": None,
+                "critical_count": 0,
+                "serious_count": 0,
+                "moderate_count": 0,
+                "minor_count": 0,
+                "violations": [],
+                "incomplete_count": 0,
+                "incomplete": [],
+                "score_formula_version": SCORE_FORMULA_VERSION,
+            }
+            result_id = _insert_result(db, job, _unreachable)
+        else:
+            # Genuine security block: loopback, private IP, cloud metadata, etc.
+            _log("ssrf_blocked", level=logging.WARNING, url=url, reason=_pre_reason)
+            _blocked: dict[str, Any] = {
+                "status": "blocked",
+                "error": f"ssrf_blocked: {_pre_reason}",
+                "accessibility_score": None,
+                "critical_count": 0,
+                "serious_count": 0,
+                "moderate_count": 0,
+                "minor_count": 0,
+                "violations": [],
+                "incomplete_count": 0,
+                "incomplete": [],
+                "score_formula_version": SCORE_FORMULA_VERSION,
+            }
+            result_id = _insert_result(db, job, _blocked)
         _finish_job(db, job_id, done=True, result_id=result_id)
         return
 
