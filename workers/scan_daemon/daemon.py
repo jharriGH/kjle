@@ -31,6 +31,8 @@ from typing import Any
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from supabase import create_client, Client
 
+from url_guard import is_url_safe
+
 # ── Configuration ────────────────────────────────────────────────────────────
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
@@ -161,6 +163,27 @@ def _scan_url(url: str, axe_js: str) -> dict:
                     page.wait_for_load_state("networkidle", timeout=8_000)
                 except Exception:
                     pass
+                # Redirect SSRF re-check: Playwright follows redirects transparently;
+                # a safe-looking URL can 302 to an internal address.
+                _final_url = page.url
+                _redir_safe, _redir_reason = is_url_safe(_final_url)
+                if not _redir_safe:
+                    _log("ssrf_blocked", level=logging.WARNING,
+                         url=url, final_url=_final_url,
+                         reason=f"redirect_to_{_redir_reason}")
+                    return {
+                        "status": "blocked",
+                        "error": f"ssrf_blocked: redirect_to_{_redir_reason}",
+                        "accessibility_score": None,
+                        "critical_count": 0,
+                        "serious_count": 0,
+                        "moderate_count": 0,
+                        "minor_count": 0,
+                        "violations": [],
+                        "incomplete_count": 0,
+                        "incomplete": [],
+                        "score_formula_version": SCORE_FORMULA_VERSION,
+                    }
                 # Inject vendored axe — never CDN-load.
                 page.evaluate(axe_js)
                 raw = page.evaluate(
@@ -327,7 +350,34 @@ def _process_job(job: dict, axe_js: str, db: Client) -> None:
     url = job["url"]
     _log("job_start", job_id=job_id, url=url)
 
+    # SSRF guard: reject private/loopback/cloud-metadata targets before browser launch
+    _pre_safe, _pre_reason = is_url_safe(url)
+    if not _pre_safe:
+        _log("ssrf_blocked", level=logging.WARNING, url=url, reason=_pre_reason)
+        _blocked: dict[str, Any] = {
+            "status": "blocked",
+            "error": f"ssrf_blocked: {_pre_reason}",
+            "accessibility_score": None,
+            "critical_count": 0,
+            "serious_count": 0,
+            "moderate_count": 0,
+            "minor_count": 0,
+            "violations": [],
+            "incomplete_count": 0,
+            "incomplete": [],
+            "score_formula_version": SCORE_FORMULA_VERSION,
+        }
+        result_id = _insert_result(db, job, _blocked)
+        _finish_job(db, job_id, done=True, result_id=result_id)
+        return
+
     scan = _scan_url(url, axe_js)
+
+    if scan["status"] == "blocked":
+        # Redirect-to-internal SSRF block; already logged inside _scan_url.
+        result_id = _insert_result(db, job, scan)
+        _finish_job(db, job_id, done=True, result_id=result_id)
+        return
 
     if scan["status"] == "error":
         # Never store a fake passing result — error path only.
