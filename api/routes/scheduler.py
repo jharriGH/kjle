@@ -22,6 +22,7 @@ import logging
 import os
 import resource
 import time
+import urllib.parse
 import zipfile
 from datetime import datetime, timezone, timedelta, date
 from typing import Optional
@@ -48,6 +49,8 @@ from .website_audit import (
     _fetch_html_free as wa_fetch_html_free,
     _parse_signals_full as wa_parse_signals_full,
     _FULL_AUDIT_COLUMNS as WA_FULL_AUDIT_COLUMNS,
+    WEBSITE_AUDIT_RESPECT_ROBOTS,
+    _check_robots_allowed as wa_check_robots_allowed,
 )
 
 logger = logging.getLogger(__name__)
@@ -2276,16 +2279,19 @@ async def job_website_audit_nightly() -> dict:
     t_start      = time.monotonic()
     rss_start_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 
-    nightly_limit = int(await _get_admin_setting("website_audit_nightly_limit", WEBSITE_AUDIT_NIGHTLY_LIMIT))
-    fetch_chunk   = int(await _get_admin_setting("website_audit_fetch_chunk", WEBSITE_AUDIT_FETCH_CHUNK))
-    max_seconds   = float(await _get_admin_setting("website_audit_nightly_max_seconds", WEBSITE_AUDIT_NIGHTLY_MAX_SECONDS))
-    concurrency   = int(await _get_admin_setting("website_audit_concurrency", WEBSITE_AUDIT_CONCURRENCY))
+    nightly_limit  = int(await _get_admin_setting("website_audit_nightly_limit", WEBSITE_AUDIT_NIGHTLY_LIMIT))
+    fetch_chunk    = int(await _get_admin_setting("website_audit_fetch_chunk", WEBSITE_AUDIT_FETCH_CHUNK))
+    max_seconds    = float(await _get_admin_setting("website_audit_nightly_max_seconds", WEBSITE_AUDIT_NIGHTLY_MAX_SECONDS))
+    concurrency    = int(await _get_admin_setting("website_audit_concurrency", WEBSITE_AUDIT_CONCURRENCY))
+    respect_robots = str(await _get_admin_setting("website_audit_respect_robots", WEBSITE_AUDIT_RESPECT_ROBOTS)).strip().lower() in ("true", "1", "yes", "on")
+    robots_cache: dict = {}
 
     db = get_db()
 
     audited          = 0
     unreachable      = 0
     failed           = 0
+    robots_skipped   = 0
     total_seen       = 0
     db_writes        = 0
     chunks_processed = 0
@@ -2295,7 +2301,7 @@ async def job_website_audit_nightly() -> dict:
     sem  = asyncio.Semaphore(concurrency)
 
     async def _do_one_lead(lead: dict) -> None:
-        nonlocal audited, unreachable, failed, total_seen, db_writes
+        nonlocal audited, unreachable, failed, robots_skipped, total_seen, db_writes
 
         if time.monotonic() - t_start >= max_seconds:
             return
@@ -2308,6 +2314,23 @@ async def job_website_audit_nightly() -> dict:
                 unreachable += 1
                 total_seen  += 1
             return
+
+        if respect_robots:
+            _rurl   = website if website.startswith(("http://", "https://")) else f"https://{website}"
+            _parsed = urllib.parse.urlparse(_rurl)
+            _host   = _parsed.netloc or _parsed.path.split("/")[0]
+            if not await wa_check_robots_allowed(_host, _rurl, robots_cache):
+                try:
+                    db.table("leads").update({
+                        "last_audited_at": datetime.now(timezone.utc).isoformat(),
+                    }).eq("id", lead_id).execute()
+                except Exception:
+                    pass
+                async with lock:
+                    robots_skipped += 1
+                    db_writes      += 1
+                    total_seen     += 1
+                return
 
         try:
             html, final_url = await wa_fetch_html_free(website)
@@ -2417,7 +2440,7 @@ async def job_website_audit_nightly() -> dict:
         )
         notes = (
             f"audited={audited}, unreachable={unreachable}, failed={failed}, "
-            f"total_seen={total_seen}, limit={nightly_limit}, "
+            f"robots_skipped={robots_skipped}, total_seen={total_seen}, limit={nightly_limit}, "
             f"concurrency={concurrency}, duration={duration:.1f}s, "
             f"chunks_processed={chunks_processed}, peak_rss_mb={peak_rss_mb:.1f}"
         )
@@ -2434,6 +2457,7 @@ async def job_website_audit_nightly() -> dict:
         "audited":          audited,
         "unreachable":      unreachable,
         "failed":           failed,
+        "robots_skipped":   robots_skipped,
         "total_seen":       total_seen,
         "duration_seconds": round(duration, 3),
         "status":           status,

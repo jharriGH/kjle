@@ -20,6 +20,8 @@ Free path: $0.00 -- no cost_guard, no confirm required.
 
 import logging
 import re
+import urllib.parse
+import urllib.robotparser
 from datetime import datetime, timezone
 from typing import Optional, List, Tuple
 
@@ -39,6 +41,8 @@ COST_PER_SCRAPE    = 0.005
 HTTP_TIMEOUT       = 30.0
 MAX_BATCH          = 500
 FREE_FETCH_TIMEOUT = 15.0
+WEBSITE_AUDIT_RESPECT_ROBOTS = True  # overridable via admin_settings key "website_audit_respect_robots"
+ROBOTS_CACHE_MAX              = 5000  # max hosts cached per job run to bound memory
 
 _FREE_FETCH_HEADERS = {
     "User-Agent": (
@@ -47,6 +51,39 @@ _FREE_FETCH_HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
+
+# ── robots.txt politeness helper (bulk path only — NOT used in /reverify) ─────
+
+async def _check_robots_allowed(host: str, url: str, cache: dict) -> bool:
+    """
+    True = fetch is allowed; False = explicitly disallowed by robots.txt.
+    Fail-open: any fetch/parse failure (404, timeout, connection error) returns True.
+    Cache is keyed by host and shared for the life of a job run — never re-fetches
+    per lead. Capped at ROBOTS_CACHE_MAX entries to prevent unbounded growth.
+    UA tested is the same browser UA used for audit fetches (_FREE_FETCH_HEADERS).
+    """
+    if host in cache:
+        rp = cache[host]
+        return True if rp is None else rp.can_fetch(_FREE_FETCH_HEADERS["User-Agent"], url)
+
+    if len(cache) >= ROBOTS_CACHE_MAX:
+        return True  # cache full — fail-open rather than expanding unboundedly
+
+    robots_url = f"https://{host}/robots.txt"
+    rp = None
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+            resp = await client.get(robots_url, headers=_FREE_FETCH_HEADERS)
+            if resp.status_code == 200:
+                parser = urllib.robotparser.RobotFileParser()
+                parser.parse(resp.text.splitlines())  # parse() not read() — avoids sync fetch
+                rp = parser
+    except Exception:
+        pass  # timeout / connection error / parse error — fail-open
+
+    cache[host] = rp
+    return True if rp is None else rp.can_fetch(_FREE_FETCH_HEADERS["User-Agent"], url)
+
 
 # ── Chatbot widget signatures ─────────────────────────────────────────────────
 # Matched case-insensitively against raw page HTML.
