@@ -102,6 +102,11 @@ PAGESPEED_SPIKE_THRESHOLD     = 20      # consecutive all-500 calls before spike
 PAGESPEED_SPIKE_SLEEP         = 300.0   # 5-min recovery sleep on 500 spike
 PAGESPEED_CONCURRENCY         = 12      # concurrent leads; overridable via admin_settings
 
+# Axe scan nightly — cheap DB inserts only (VPS daemon does the actual scanning)
+AXE_QUEUE_TARGET          = 5_000   # top-up ceiling; overridable via admin_settings key "axe_queue_target"
+AXE_SCAN_NIGHTLY_MAX_SECONDS = 1_800   # 30-minute ceiling (inserts are fast)
+AXE_SCAN_FETCH_CHUNK      = 2_000   # leads fetched per chunk
+
 # ── Campaign sync targets (config-driven) ──
 # Each entry describes one (project, server) pair to sync hourly from ReachInbox.
 # Adding a new project or server = append one dict. No logic changes required.
@@ -190,6 +195,11 @@ JOB_DEFINITIONS = {
     "pagespeed_nightly": {
         "description": "Nightly PageSpeed Insights bulk-fill (WebSignalz Phase 2) — mobile+desktop scores + LCP/CLS/TBT + mobile_friendly for leads where pagespeed_checked_at IS NULL; paced w/ 500-backoff + daily cap",
         "schedule":    "Daily at 02:30 UTC",
+        "trigger":     "cron",
+    },
+    "axe_scan_nightly": {
+        "description": "Nightly axe accessibility scan enqueue (WebSignalz Phase 3) — top-up scan_jobs to AXE_QUEUE_TARGET; inserts at priority=1 (low); VPS daemon does the actual scanning",
+        "schedule":    "Daily at 04:00 UTC",
         "trigger":     "cron",
     },
 }
@@ -2831,6 +2841,202 @@ async def job_pagespeed_nightly() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Job 15 — Nightly Axe Scan Enqueue / WebSignalz Phase 3 (04:00 UTC)
+# Top-up scan_jobs queue with leads where accessibility_scanned_at IS NULL.
+# Only does cheap DB inserts; the VPS daemon (kjle-scan-daemon) handles scanning.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def job_axe_scan_nightly() -> dict:
+    """
+    Nightly top-up enqueue for the axe accessibility scanner (WebSignalz Phase 3).
+
+    - Fires at 04:00 UTC. Overlaps pagespeed window but only does cheap DB inserts;
+      the VPS daemon (kjle-scan-daemon, concurrency 4) does the actual scanning.
+    - TOP-UP SEMANTICS: counts scan_jobs WHERE status='queued'. If queued >=
+      AXE_QUEUE_TARGET, logs and exits — prevents unbounded queue growth.
+      Otherwise enqueues (target - queued) leads.
+    - Lead selection: accessibility_scanned_at IS NULL, ORDER BY pain_score DESC.
+      Fetched in chunks of AXE_SCAN_FETCH_CHUNK (default 2000) — never loads all at once.
+    - URL normalization: prefixes https:// if website does not start with http.
+    - Priority 1 (LOW) — below on-demand client/PURL scans (priority 3-9).
+    - Idempotency: skips leads that already have a queued or running scan_jobs row.
+    - Hard time ceiling: AXE_SCAN_NIGHTLY_MAX_SECONDS (default 30 min).
+    - _log_job fires on EVERY exit path via try/finally.
+    """
+    job_name = "axe_scan_nightly"
+    logger.info(f"[{job_name}] Starting...")
+    t_start = time.monotonic()
+
+    target      = int(await _get_admin_setting("axe_queue_target", AXE_QUEUE_TARGET))
+    max_seconds = float(await _get_admin_setting("axe_scan_nightly_max_seconds", AXE_SCAN_NIGHTLY_MAX_SECONDS))
+    fetch_chunk = int(await _get_admin_setting("axe_scan_fetch_chunk", AXE_SCAN_FETCH_CHUNK))
+
+    db = get_db()
+
+    enqueued         = 0
+    skipped          = 0
+    chunks_processed = 0
+    queue_before     = 0
+    queue_after      = 0
+    status           = "success"
+    _queue_full      = False
+
+    try:
+        # Count currently queued jobs
+        try:
+            count_resp = (
+                db.table("scan_jobs")
+                .select("id", count="exact")
+                .eq("status", "queued")
+                .execute()
+            )
+            queue_before = count_resp.count or 0
+        except Exception as e:
+            logger.error(f"[{job_name}] Queue count failed: {e}")
+            status = "failed"
+            queue_before = 0
+
+        if queue_before >= target:
+            logger.info(f"[{job_name}] Queue already full ({queue_before} >= {target}) — exiting")
+            _queue_full = True
+            status = "skipped_queue_full"
+        else:
+            slots = target - queue_before
+            logger.info(f"[{job_name}] queue_before={queue_before}, target={target}, slots_to_fill={slots}")
+
+            while enqueued < slots:
+                if time.monotonic() - t_start >= max_seconds:
+                    logger.info(f"[{job_name}] Time ceiling reached ({max_seconds}s) — stopping cleanly")
+                    break
+
+                chunk_size = min(fetch_chunk, slots - enqueued)
+
+                try:
+                    leads = (
+                        db.table("leads")
+                        .select("id, website")
+                        .eq("is_active", True)
+                        .not_.is_("website", "null")
+                        .neq("website", "")
+                        .is_("accessibility_scanned_at", "null")
+                        .order("pain_score", desc=True)
+                        .limit(chunk_size)
+                        .execute()
+                        .data or []
+                    )
+                except Exception as e:
+                    logger.error(f"[{job_name}] Chunk query failed (chunk {chunks_processed + 1}): {e}")
+                    status = "partial"
+                    break
+
+                if not leads:
+                    logger.info(f"[{job_name}] No more eligible leads — done")
+                    break
+
+                chunks_processed += 1
+
+                # Idempotency: skip leads that already have a queued or running scan_jobs row
+                chunk_lead_ids = [str(lead["id"]) for lead in leads]
+                try:
+                    existing_resp = (
+                        db.table("scan_jobs")
+                        .select("lead_id")
+                        .in_("lead_id", chunk_lead_ids)
+                        .in_("status", ["queued", "running"])
+                        .execute()
+                    )
+                    already_active = {str(r["lead_id"]) for r in (existing_resp.data or [])}
+                except Exception as e:
+                    logger.warning(
+                        f"[{job_name}] Idempotency check failed (chunk {chunks_processed}): {e} "
+                        f"— skipping chunk to avoid duplicates"
+                    )
+                    continue
+
+                rows_to_insert = []
+                for lead in leads:
+                    if str(lead["id"]) in already_active:
+                        skipped += 1
+                        continue
+                    website = (lead.get("website") or "").strip()
+                    if not website:
+                        skipped += 1
+                        continue
+                    if not website.startswith("http"):
+                        website = f"https://{website}"
+                    rows_to_insert.append({
+                        "url":     website,
+                        "lead_id": lead["id"],
+                        "priority": 1,
+                    })
+
+                inserted_this_chunk = 0
+                if rows_to_insert:
+                    try:
+                        db.table("scan_jobs").insert(rows_to_insert).execute()
+                        inserted_this_chunk = len(rows_to_insert)
+                        enqueued += inserted_this_chunk
+                    except Exception as e:
+                        logger.error(f"[{job_name}] Insert failed (chunk {chunks_processed}): {e}")
+                        if status == "success":
+                            status = "partial"
+
+                logger.info(
+                    f"[{job_name}] chunk {chunks_processed}: "
+                    f"leads={len(leads)}, inserted={inserted_this_chunk}, "
+                    f"skipped_chunk={len(leads) - inserted_this_chunk}, enqueued_total={enqueued}"
+                )
+
+                # If no new insertions and leads were returned, predicate won't advance — avoid spin
+                if inserted_this_chunk == 0 and leads:
+                    logger.warning(
+                        f"[{job_name}] Chunk {chunks_processed} returned {len(leads)} leads "
+                        f"but 0 new insertions (all already queued?) — stopping to avoid spin"
+                    )
+                    break
+
+            # Count queue after enqueue
+            try:
+                after_resp = (
+                    db.table("scan_jobs")
+                    .select("id", count="exact")
+                    .eq("status", "queued")
+                    .execute()
+                )
+                queue_after = after_resp.count or 0
+            except Exception:
+                queue_after = queue_before + enqueued
+
+    finally:
+        duration = time.monotonic() - t_start
+        notes = (
+            f"enqueued={enqueued}, queue_before={queue_before}, queue_after={queue_after}, "
+            f"target={target}, chunks_processed={chunks_processed}, duration={duration:.1f}s"
+        )
+        await _log_job(
+            job_name,
+            leads_processed=enqueued,
+            duration_seconds=duration,
+            status=status,
+            notes=notes,
+        )
+
+    result = {
+        "job":              job_name,
+        "enqueued":         enqueued,
+        "skipped":          skipped,
+        "queue_before":     queue_before,
+        "queue_after":      queue_after,
+        "target":           target,
+        "chunks_processed": chunks_processed,
+        "duration_seconds": round(duration, 3),
+        "status":           status,
+    }
+    logger.info(f"[{job_name}] Done. {result}")
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # JOB DISPATCH MAP — maps name → async callable
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2850,6 +3056,7 @@ JOB_FUNCTIONS = {
     "tcpa_refresh_weekly":     job_tcpa_refresh_weekly,
     "website_audit_nightly":   job_website_audit_nightly,
     "pagespeed_nightly":       job_pagespeed_nightly,
+    "axe_scan_nightly":        job_axe_scan_nightly,
 }
 
 
@@ -3022,6 +3229,19 @@ def setup_scheduler() -> AsyncIOScheduler:
         trigger=CronTrigger(hour=2, minute=30),
         id="pagespeed_nightly",
         name="Nightly PageSpeed Enrichment (WebSignalz Phase 2)",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # Job 15: axe_scan_nightly — daily at 04:00 UTC (WebSignalz Phase 3)
+    # Cheap DB inserts only — top-up scan_jobs queue with unscanned leads.
+    # The VPS daemon (kjle-scan-daemon) does the actual axe scanning.
+    # 04:00 overlaps pagespeed window but adds negligible CPU/memory load.
+    scheduler.add_job(
+        job_axe_scan_nightly,
+        trigger=CronTrigger(hour=4, minute=0),
+        id="axe_scan_nightly",
+        name="Nightly Axe Scan Enqueue (WebSignalz Phase 3)",
         replace_existing=True,
         misfire_grace_time=3600,
     )

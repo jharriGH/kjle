@@ -38,6 +38,7 @@ DYNAMIC_FILTER_COLUMNS = {
     "email_status","email_state","email_sub_state","email_valid",
     "contactable","do_not_contact","dnc_status",
     "segment_label","enrichment_stage","data_quality_score",
+    "accessibility_score","accessibility_violations","accessibility_critical","accessibility_scanned_at",
 }
 
 DYNAMIC_FILTER_OPS = {"eq","neq","gt","gte","lt","lte","isnull","notnull","like","ilike"}

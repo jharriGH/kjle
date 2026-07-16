@@ -346,6 +346,23 @@ def _finish_job(
         _log("finish_job_error", level=logging.ERROR, job_id=job_id, error=str(e))
 
 
+def _update_lead_summary(db: Client, job: dict, scan: dict) -> None:
+    """Write accessibility summary back to leads. Isolated — never fails the scan job."""
+    lead_id = job.get("lead_id")
+    if not lead_id:
+        return
+    update: dict[str, Any] = {"accessibility_scanned_at": _now_iso()}
+    if scan.get("status") == "ok":
+        update["accessibility_score"] = scan.get("accessibility_score")
+        update["accessibility_violations"] = len(scan.get("violations", []))
+        update["accessibility_critical"] = scan.get("critical_count", 0)
+    try:
+        db.table("leads").update(update).eq("id", lead_id).execute()
+    except Exception as e:
+        _log("lead_summary_update_error", level=logging.WARNING,
+             lead_id=lead_id, error=str(e))
+
+
 # ── Process one claimed job ───────────────────────────────────────────────────
 def _process_job(job: dict, axe_js: str, db: Client) -> None:
     job_id = job["id"]
@@ -355,10 +372,11 @@ def _process_job(job: dict, axe_js: str, db: Client) -> None:
     # SSRF guard: reject private/loopback/cloud-metadata targets before browser launch
     _pre_safe, _pre_reason = is_url_safe(url)
     if not _pre_safe:
+        _pre_scan: dict[str, Any]
         if _pre_reason in UNREACHABLE_REASONS:
             # Dead domain / DNS failure — not a security threat; label correctly.
             _log("unreachable", level=logging.WARNING, url=url, reason=_pre_reason)
-            _unreachable: dict[str, Any] = {
+            _pre_scan = {
                 "status": "unreachable",
                 "error": f"unreachable: {_pre_reason}",
                 "accessibility_score": None,
@@ -371,11 +389,10 @@ def _process_job(job: dict, axe_js: str, db: Client) -> None:
                 "incomplete": [],
                 "score_formula_version": SCORE_FORMULA_VERSION,
             }
-            result_id = _insert_result(db, job, _unreachable)
         else:
             # Genuine security block: loopback, private IP, cloud metadata, etc.
             _log("ssrf_blocked", level=logging.WARNING, url=url, reason=_pre_reason)
-            _blocked: dict[str, Any] = {
+            _pre_scan = {
                 "status": "blocked",
                 "error": f"ssrf_blocked: {_pre_reason}",
                 "accessibility_score": None,
@@ -388,8 +405,9 @@ def _process_job(job: dict, axe_js: str, db: Client) -> None:
                 "incomplete": [],
                 "score_formula_version": SCORE_FORMULA_VERSION,
             }
-            result_id = _insert_result(db, job, _blocked)
+        result_id = _insert_result(db, job, _pre_scan)
         _finish_job(db, job_id, done=True, result_id=result_id)
+        _update_lead_summary(db, job, _pre_scan)
         return
 
     scan = _scan_url(url, axe_js)
@@ -398,12 +416,14 @@ def _process_job(job: dict, axe_js: str, db: Client) -> None:
         # Redirect-to-internal SSRF block; already logged inside _scan_url.
         result_id = _insert_result(db, job, scan)
         _finish_job(db, job_id, done=True, result_id=result_id)
+        _update_lead_summary(db, job, scan)
         return
 
     if scan["status"] == "error":
         # Never store a fake passing result — error path only.
         _finish_job(db, job_id, done=False, error=scan.get("error"))
         _log("job_error", job_id=job_id, url=url, error=(scan.get("error") or "")[:200])
+        _update_lead_summary(db, job, scan)
         return
 
     result_id = _insert_result(db, job, scan)
@@ -419,6 +439,7 @@ def _process_job(job: dict, axe_js: str, db: Client) -> None:
         critical=scan.get("critical_count"),
         result_id=result_id,
     )
+    _update_lead_summary(db, job, scan)
 
 
 # ── Main poll loop ────────────────────────────────────────────────────────────
