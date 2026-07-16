@@ -20,6 +20,7 @@ from collections import deque
 import io
 import logging
 import os
+import resource
 import time
 import zipfile
 from datetime import datetime, timezone, timedelta, date
@@ -87,6 +88,7 @@ WEBSITE_AUDIT_NIGHTLY_SUB_BATCH   = 500     # sub-batch page size for DB queries
 WEBSITE_AUDIT_NIGHTLY_SLEEP       = 0.5     # seconds between sub-batches (legacy; unused in concurrent path)
 WEBSITE_AUDIT_NIGHTLY_MAX_SECONDS = 21_600  # hard time ceiling: 6 hours
 WEBSITE_AUDIT_CONCURRENCY         = 25      # concurrent leads; overridable via admin_settings
+WEBSITE_AUDIT_FETCH_CHUNK         = 2_000   # leads fetched per chunk; overridable via admin_settings key "website_audit_fetch_chunk"
 
 # PageSpeed nightly — keyed API, 25k/day free with key (2 calls/lead)
 PAGESPEED_NIGHTLY_LIMIT       = 12_000  # leads per run (12k x 2 calls = 24k = real daily cap)
@@ -182,7 +184,7 @@ JOB_DEFINITIONS = {
     },
     "website_audit_nightly": {
         "description": "Nightly free-path website audit — bulk-fills WebSignalz signals (~22) for leads where last_audited_at IS NULL, pain_score DESC; no Firecrawl cost",
-        "schedule":    "Daily at 01:30 UTC",
+        "schedule":    "Daily at 00:30 UTC",
         "trigger":     "cron",
     },
     "pagespeed_nightly": {
@@ -2232,50 +2234,58 @@ async def _send_tcpa_empty_investigation_email(*, existing_count: int) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Job 13 — Nightly Website Audit / WebSignalz bulk-fill (01:30 UTC)
+# Job 13 — Nightly Website Audit / WebSignalz bulk-fill (00:30 UTC)
 # Free httpx path — $0.00, no Firecrawl. Fills ~22 signals for leads where
 # last_audited_at IS NULL, ordered by pain_score DESC (highest-value first).
+# Fetches and processes in CHUNKS; no OFFSET — last_audited_at IS NULL predicate
+# advances the cursor naturally after each chunk to avoid loading all rows at once.
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def job_website_audit_nightly() -> dict:
     """
     Nightly bulk-fill of WebSignalz signals via the free httpx fetch path.
 
-    - Fires at 01:30 UTC (clear of email_clean at 00:00, stage3 at 01:00, stale_cleanup at 02:00)
+    - Fires at 00:30 UTC (~2h buffer before pagespeed at 02:30; email_clean at 00:00 takes ~5s)
     - Up to WEBSITE_AUDIT_NIGHTLY_LIMIT leads per run (default 15000), overridable via
       admin_settings key 'website_audit_nightly_limit'
     - Targets: website IS NOT NULL AND last_audited_at IS NULL, pain_score DESC
-    - Queries in sub-batches of WEBSITE_AUDIT_NIGHTLY_SUB_BATCH (default 500)
-    - Concurrent: asyncio.Semaphore(website_audit_concurrency, default 25) per sub-batch
+    - Fetches in chunks of WEBSITE_AUDIT_FETCH_CHUNK (default 2000), overridable via
+      admin_settings key 'website_audit_fetch_chunk'; no OFFSET pagination — the
+      last_audited_at IS NULL predicate advances the cursor after each chunk
+    - Concurrent: asyncio.Semaphore(website_audit_concurrency, default 25) per chunk
     - Reuses _fetch_html_free + _parse_signals_full from website_audit.py (single source)
     - Unreachable sites: is_parked=True, website_has_ssl=False, last_audited_at=now()
     - Failures: last_audited_at=now() written so the lead is not retried forever
     - Reachable sites: full ~22 signals + last_audited_at written (mirrors batch-free endpoint)
     - Hard time ceiling: stops cleanly after WEBSITE_AUDIT_NIGHTLY_MAX_SECONDS (default 6h)
     - _log_job() fires on EVERY exit path via try/finally — including CancelledError/SIGTERM
+    - Memory: peak RSS sampled after each chunk; logged in notes (peak_rss_mb, chunks_processed)
     """
     job_name = "website_audit_nightly"
     logger.info(f"[{job_name}] Starting...")
-    t_start = time.monotonic()
+    t_start      = time.monotonic()
+    rss_start_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 
     nightly_limit = int(await _get_admin_setting("website_audit_nightly_limit", WEBSITE_AUDIT_NIGHTLY_LIMIT))
-    sub_batch     = WEBSITE_AUDIT_NIGHTLY_SUB_BATCH
+    fetch_chunk   = int(await _get_admin_setting("website_audit_fetch_chunk", WEBSITE_AUDIT_FETCH_CHUNK))
     max_seconds   = float(await _get_admin_setting("website_audit_nightly_max_seconds", WEBSITE_AUDIT_NIGHTLY_MAX_SECONDS))
     concurrency   = int(await _get_admin_setting("website_audit_concurrency", WEBSITE_AUDIT_CONCURRENCY))
 
     db = get_db()
 
-    audited     = 0
-    unreachable = 0
-    failed      = 0
-    total_seen  = 0
-    offset      = 0
+    audited          = 0
+    unreachable      = 0
+    failed           = 0
+    total_seen       = 0
+    db_writes        = 0
+    chunks_processed = 0
+    peak_rss_mb      = rss_start_kb / 1024
 
     lock = asyncio.Lock()
     sem  = asyncio.Semaphore(concurrency)
 
     async def _do_one_lead(lead: dict) -> None:
-        nonlocal audited, unreachable, failed, total_seen
+        nonlocal audited, unreachable, failed, total_seen, db_writes
 
         if time.monotonic() - t_start >= max_seconds:
             return
@@ -2300,13 +2310,15 @@ async def job_website_audit_nightly() -> dict:
                 }).eq("id", lead_id).execute()
                 async with lock:
                     unreachable += 1
+                    db_writes   += 1
             else:
                 signals = wa_parse_signals_full(html, final_url)
                 safe_signals = {k: v for k, v in signals.items() if k in WA_FULL_AUDIT_COLUMNS}
                 safe_signals["last_audited_at"] = datetime.now(timezone.utc).isoformat()
                 db.table("leads").update(safe_signals).eq("id", lead_id).execute()
                 async with lock:
-                    audited += 1
+                    audited   += 1
+                    db_writes += 1
 
         except Exception as e:
             logger.error(f"[{job_name}] Lead {lead_id} failed: {type(e).__name__}: {e}")
@@ -2317,7 +2329,8 @@ async def job_website_audit_nightly() -> dict:
             except Exception:
                 pass
             async with lock:
-                failed += 1
+                failed    += 1
+                db_writes += 1
 
         async with lock:
             total_seen += 1
@@ -2332,13 +2345,10 @@ async def job_website_audit_nightly() -> dict:
                 logger.info(f"[{job_name}] Time ceiling reached ({max_seconds}s) — stopping cleanly")
                 break
 
-            async with lock:
-                seen_snap = total_seen
-
-            if seen_snap >= nightly_limit:
+            if total_seen >= nightly_limit:
                 break
 
-            batch_size = min(sub_batch, nightly_limit - seen_snap)
+            chunk_size = min(fetch_chunk, nightly_limit - total_seen)
 
             try:
                 leads = (
@@ -2348,23 +2358,45 @@ async def job_website_audit_nightly() -> dict:
                     .not_.is_("website", "null")
                     .is_("last_audited_at", "null")
                     .order("pain_score", desc=True)
-                    .range(offset, offset + batch_size - 1)
+                    .limit(chunk_size)
                     .execute()
                     .data or []
                 )
             except Exception as e:
-                logger.error(f"[{job_name}] Sub-batch query failed at offset={offset}: {e}")
+                logger.error(f"[{job_name}] Chunk query failed (chunk {chunks_processed + 1}): {e}")
                 break
 
             if not leads:
-                logger.info(f"[{job_name}] No more eligible leads at offset={offset} — done")
+                logger.info(f"[{job_name}] No more eligible leads — done")
                 break
 
+            db_writes_before = db_writes
             await asyncio.gather(*[_process_lead_gated(lead) for lead in leads])
+            chunks_processed += 1
 
-            offset += len(leads)
+            # Sample RSS after each chunk on Linux (ru_maxrss is kilobytes); track peak
+            rss_kb     = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            rss_mb_now = rss_kb / 1024
+            if rss_mb_now > peak_rss_mb:
+                peak_rss_mb = rss_mb_now
+            if peak_rss_mb > 400:
+                logger.warning(
+                    f"[{job_name}] peak_rss_mb={peak_rss_mb:.1f} exceeds 400 MB — "
+                    f"approaching memory ceiling"
+                )
 
-            if len(leads) < batch_size:
+            logger.info(
+                f"[{job_name}] chunk {chunks_processed} done: "
+                f"leads={len(leads)}, audited={audited}, unreachable={unreachable}, "
+                f"failed={failed}, total_seen={total_seen}, rss_mb={rss_mb_now:.1f}"
+            )
+
+            if db_writes == db_writes_before:
+                # All leads in chunk had blank websites — predicate won't advance; break to avoid spin
+                logger.warning(
+                    f"[{job_name}] Chunk {chunks_processed} returned {len(leads)} leads "
+                    f"but 0 DB writes (blank-website leads?) — breaking to avoid infinite loop"
+                )
                 break
 
     finally:
@@ -2376,7 +2408,8 @@ async def job_website_audit_nightly() -> dict:
         notes = (
             f"audited={audited}, unreachable={unreachable}, failed={failed}, "
             f"total_seen={total_seen}, limit={nightly_limit}, "
-            f"concurrency={concurrency}, duration={duration:.1f}s"
+            f"concurrency={concurrency}, duration={duration:.1f}s, "
+            f"chunks_processed={chunks_processed}, peak_rss_mb={peak_rss_mb:.1f}"
         )
         await _log_job(
             job_name,
@@ -2964,15 +2997,15 @@ def setup_scheduler() -> AsyncIOScheduler:
         misfire_grace_time=3600,
     )
 
-    # Job 13: website_audit_nightly — daily at 01:30 UTC
+    # Job 13: website_audit_nightly — daily at 00:30 UTC
     # Free httpx bulk-fill of WebSignalz signals (~22) for leads where
     # last_audited_at IS NULL. Slot chosen to avoid all registered crons:
-    # email_clean (00:00), stale_cleanup (02:00), fed_dnc/tcpa (04:00+).
-    # Stage3 is listed at 01:00 in JOB_DEFINITIONS but is NOT registered
-    # in the scheduler (manual-trigger only), so 01:30 is fully clear.
+    # email_clean (00:00, ~5s), stale_cleanup (02:00), fed_dnc/tcpa (04:00+).
+    # Moved from 01:30 to 00:30 (Slice 6) to give a ~2h buffer before
+    # pagespeed_nightly at 02:30 as the nightly limit grows.
     scheduler.add_job(
         job_website_audit_nightly,
-        trigger=CronTrigger(hour=1, minute=30),
+        trigger=CronTrigger(hour=0, minute=30),
         id="website_audit_nightly",
         name="Nightly Website Audit (WebSignalz bulk-fill, free)",
         replace_existing=True,
