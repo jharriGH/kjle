@@ -107,7 +107,7 @@ PAGESPEED_CONCURRENCY         = 12      # concurrent leads; overridable via admi
 
 # Axe scan nightly — cheap DB inserts only (VPS daemon does the actual scanning)
 AXE_QUEUE_TARGET          = 5_000   # top-up ceiling; overridable via admin_settings key "axe_queue_target"
-AXE_SCAN_NIGHTLY_MAX_SECONDS = 1_800   # 30-minute ceiling (inserts are fast)
+AXE_SCAN_NIGHTLY_MAX_SECONDS = 300     # 5-minute ceiling (OFFSET makes this fast; long run = bug signal)
 AXE_SCAN_FETCH_CHUNK      = 2_000   # leads fetched per chunk
 
 # ── Campaign sync targets (config-driven) ──
@@ -2928,9 +2928,47 @@ async def job_axe_scan_nightly() -> dict:
             slots = target - queue_before
             logger.info(f"[{job_name}] queue_before={queue_before}, target={target}, slots_to_fill={slots}")
 
-            while enqueued < slots:
+            # Load active scan set ONCE before the loop. Bounded by queue target (~5000 rows)
+            # so no URL-length problem. NULL lead_ids (on-demand/PURL scans) are filtered out.
+            already_active: set = set()
+            do_loop = True
+            try:
+                active_resp = (
+                    db.table("scan_jobs")
+                    .select("lead_id")
+                    .in_("status", ["queued", "running"])
+                    .execute()
+                )
+                already_active = {
+                    str(r["lead_id"])
+                    for r in (active_resp.data or [])
+                    if r.get("lead_id") is not None
+                }
+            except Exception as e:
+                logger.error(
+                    f"[{job_name}] Startup active-set query failed: {e} "
+                    f"— aborting to avoid duplicates"
+                )
+                status = "failed"
+                do_loop = False
+
+            offset = 0
+            max_iterations = 100
+            iteration = 0
+
+            while do_loop and enqueued < slots:
                 if time.monotonic() - t_start >= max_seconds:
                     logger.info(f"[{job_name}] Time ceiling reached ({max_seconds}s) — stopping cleanly")
+                    break
+
+                iteration += 1
+                if iteration > max_iterations:
+                    logger.warning(
+                        f"[{job_name}] Max-iterations guard triggered ({max_iterations}) "
+                        f"— stopping to prevent runaway DB reads (regression signal)"
+                    )
+                    if status == "success":
+                        status = "partial"
                     break
 
                 chunk_size = min(fetch_chunk, slots - enqueued)
@@ -2944,7 +2982,7 @@ async def job_axe_scan_nightly() -> dict:
                         .neq("website", "")
                         .is_("accessibility_scanned_at", "null")
                         .order("pain_score", desc=True)
-                        .limit(chunk_size)
+                        .range(offset, offset + chunk_size - 1)
                         .execute()
                         .data or []
                     )
@@ -2958,24 +2996,7 @@ async def job_axe_scan_nightly() -> dict:
                     break
 
                 chunks_processed += 1
-
-                # Idempotency: skip leads that already have a queued or running scan_jobs row
-                chunk_lead_ids = [str(lead["id"]) for lead in leads]
-                try:
-                    existing_resp = (
-                        db.table("scan_jobs")
-                        .select("lead_id")
-                        .in_("lead_id", chunk_lead_ids)
-                        .in_("status", ["queued", "running"])
-                        .execute()
-                    )
-                    already_active = {str(r["lead_id"]) for r in (existing_resp.data or [])}
-                except Exception as e:
-                    logger.warning(
-                        f"[{job_name}] Idempotency check failed (chunk {chunks_processed}): {e} "
-                        f"— skipping chunk to avoid duplicates"
-                    )
-                    continue
+                offset += len(leads)
 
                 rows_to_insert = []
                 for lead in leads:
@@ -2989,8 +3010,8 @@ async def job_axe_scan_nightly() -> dict:
                     if not website.startswith("http"):
                         website = f"https://{website}"
                     rows_to_insert.append({
-                        "url":     website,
-                        "lead_id": lead["id"],
+                        "url":      website,
+                        "lead_id":  lead["id"],
                         "priority": 1,
                     })
 
@@ -3000,24 +3021,20 @@ async def job_axe_scan_nightly() -> dict:
                         db.table("scan_jobs").insert(rows_to_insert).execute()
                         inserted_this_chunk = len(rows_to_insert)
                         enqueued += inserted_this_chunk
+                        # Belt-and-braces: track newly enqueued leads to prevent double-enqueue
+                        for row in rows_to_insert:
+                            already_active.add(str(row["lead_id"]))
                     except Exception as e:
                         logger.error(f"[{job_name}] Insert failed (chunk {chunks_processed}): {e}")
                         if status == "success":
                             status = "partial"
+                        break
 
                 logger.info(
                     f"[{job_name}] chunk {chunks_processed}: "
                     f"leads={len(leads)}, inserted={inserted_this_chunk}, "
                     f"skipped_chunk={len(leads) - inserted_this_chunk}, enqueued_total={enqueued}"
                 )
-
-                # If no new insertions and leads were returned, predicate won't advance — avoid spin
-                if inserted_this_chunk == 0 and leads:
-                    logger.warning(
-                        f"[{job_name}] Chunk {chunks_processed} returned {len(leads)} leads "
-                        f"but 0 new insertions (all already queued?) — stopping to avoid spin"
-                    )
-                    break
 
             # Count queue after enqueue
             try:
