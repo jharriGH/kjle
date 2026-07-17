@@ -166,7 +166,7 @@ async def list_leads(
         "has_chatbot, mobile_friendly, is_parked, has_schema_markup"
     ).eq("is_active", is_active)
 
-    count_query = db.table("leads").select("id", count="estimated", head=True).eq("is_active", is_active)
+    count_query = db.table("leads").select("id", count="exact", head=True).eq("is_active", is_active)
 
     # Apply filters to both queries
     if niche_slug:
