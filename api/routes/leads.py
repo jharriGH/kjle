@@ -67,6 +67,14 @@ def _coerce_filter_value(v: str):
         return v
 
 
+def _b(v: bool) -> str:
+    """Serialize Python bool to lowercase string for PostgREST .eq() calls.
+    supabase-py passes the value via str(), yielding 'True'/'False' (capital).
+    PostgREST mishandles 'False' (treats it as NOT true, returning NULL+false rows).
+    Passing the lowercase literal 'true'/'false' fixes the serialization."""
+    return "true" if v else "false"
+
+
 def _apply_dynamic_filters(q, filters_str: str):
     """Parse `col:op:value,col:op:value` and apply to a supabase query builder.
     Silently skips any clause whose column is not whitelisted or op is invalid.
@@ -177,17 +185,17 @@ async def list_leads(
         query = query.lte("pain_score", max_pain)
         count_query = count_query.lte("pain_score", max_pain)
     if fit_demoenginez is not None:
-        query = query.eq("fit_demoenginez", fit_demoenginez)
-        count_query = count_query.eq("fit_demoenginez", fit_demoenginez)
+        query = query.eq("fit_demoenginez", _b(fit_demoenginez))
+        count_query = count_query.eq("fit_demoenginez", _b(fit_demoenginez))
     if fit_reputation is not None:
-        query = query.eq("fit_reputation", fit_reputation)
-        count_query = count_query.eq("fit_reputation", fit_reputation)
+        query = query.eq("fit_reputation", _b(fit_reputation))
+        count_query = count_query.eq("fit_reputation", _b(fit_reputation))
     if fit_schema_ranker is not None:
-        query = query.eq("fit_schema_ranker", fit_schema_ranker)
-        count_query = count_query.eq("fit_schema_ranker", fit_schema_ranker)
+        query = query.eq("fit_schema_ranker", _b(fit_schema_ranker))
+        count_query = count_query.eq("fit_schema_ranker", _b(fit_schema_ranker))
     if fit_voicedrop is not None:
-        query = query.eq("fit_voicedrop", fit_voicedrop)
-        count_query = count_query.eq("fit_voicedrop", fit_voicedrop)
+        query = query.eq("fit_voicedrop", _b(fit_voicedrop))
+        count_query = count_query.eq("fit_voicedrop", _b(fit_voicedrop))
     if enrichment_stage is not None:
         query = query.eq("enrichment_stage", enrichment_stage)
         count_query = count_query.eq("enrichment_stage", enrichment_stage)
@@ -251,17 +259,17 @@ async def list_leads(
             query = query.like("website", "http://%")
             count_query = count_query.like("website", "http://%")
     if has_chatbot is not None:
-        query = query.eq("has_chatbot", has_chatbot)
-        count_query = count_query.eq("has_chatbot", has_chatbot)
+        query = query.eq("has_chatbot", _b(has_chatbot))
+        count_query = count_query.eq("has_chatbot", _b(has_chatbot))
     if mobile_friendly is not None:
-        query = query.eq("mobile_friendly", mobile_friendly)
-        count_query = count_query.eq("mobile_friendly", mobile_friendly)
+        query = query.eq("mobile_friendly", _b(mobile_friendly))
+        count_query = count_query.eq("mobile_friendly", _b(mobile_friendly))
     if parked is not None:
-        query = query.eq("is_parked", parked)
-        count_query = count_query.eq("is_parked", parked)
+        query = query.eq("is_parked", _b(parked))
+        count_query = count_query.eq("is_parked", _b(parked))
     if has_schema_markup is not None:
-        query = query.eq("has_schema_markup", has_schema_markup)
-        count_query = count_query.eq("has_schema_markup", has_schema_markup)
+        query = query.eq("has_schema_markup", _b(has_schema_markup))
+        count_query = count_query.eq("has_schema_markup", _b(has_schema_markup))
     if g_maps_claimed == "claimed":
         cond = "g_maps_claimed.eq.claimed,g_maps_claimed.like.http%"
         query = query.or_(cond)
