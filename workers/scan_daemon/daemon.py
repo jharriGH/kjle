@@ -23,6 +23,7 @@ import os
 import signal
 import sys
 import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -146,6 +147,32 @@ def _scan_url(url: str, axe_js: str) -> dict:
     NEVER returns a fake passing result on any exception — status='error' always.
     """
     start = time.perf_counter()
+    # Per-scan SSRF intercept cache: (scheme, host, port) -> (safe, reason).
+    # Avoids re-resolving the same external host on every subresource within a scan.
+    _ssrf_cache: dict[tuple, tuple] = {}
+    _blocked: list[str] = [""]  # mutable slot: route closure writes abort reason here
+
+    def _route_handler(route: Any) -> None:
+        # Fail CLOSED: any exception MUST abort; never let it become an open door.
+        try:
+            req_url = route.request.url
+            parsed = urllib.parse.urlparse(req_url)
+            # Only enforce on http/https. data:, blob:, etc. cannot reach internal services.
+            if parsed.scheme not in ("http", "https"):
+                route.continue_()
+                return
+            key = (parsed.scheme, parsed.hostname or "", parsed.port or 0)
+            if key not in _ssrf_cache:
+                _ssrf_cache[key] = is_url_safe(req_url)
+            safe, reason = _ssrf_cache[key]
+            if safe:
+                route.continue_()
+            else:
+                _blocked[0] = reason
+                route.abort("blockedbyclient")
+        except Exception:
+            route.abort("blockedbyclient")
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -158,34 +185,39 @@ def _scan_url(url: str, axe_js: str) -> dict:
                     ),
                     java_script_enabled=True,
                 )
+                # Register SSRF intercept on the CONTEXT before creating the page so
+                # every request — initial nav, redirect hops, subframes, subresources —
+                # is checked BEFORE it leaves the browser. This is the Slice 11 fix:
+                # a 302 to an internal IP is aborted at the redirect hop, never reaching
+                # the internal service. Replaces the blind post-nav page.url re-check.
+                ctx.route("**/*", _route_handler)
                 page = ctx.new_page()
-                # domcontentloaded is the hard requirement; networkidle is best-effort.
-                page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+                try:
+                    # domcontentloaded is the hard requirement; networkidle is best-effort.
+                    page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+                except Exception as _nav_err:
+                    if "ERR_BLOCKED_BY_CLIENT" in str(_nav_err):
+                        _reason = _blocked[0] or "ssrf_intercepted"
+                        _log("ssrf_blocked", level=logging.WARNING,
+                             url=url, reason=f"redirect_to_{_reason}")
+                        return {
+                            "status": "blocked",
+                            "error": f"ssrf_blocked: redirect_to_{_reason}",
+                            "accessibility_score": None,
+                            "critical_count": 0,
+                            "serious_count": 0,
+                            "moderate_count": 0,
+                            "minor_count": 0,
+                            "violations": [],
+                            "incomplete_count": 0,
+                            "incomplete": [],
+                            "score_formula_version": SCORE_FORMULA_VERSION,
+                        }
+                    raise
                 try:
                     page.wait_for_load_state("networkidle", timeout=8_000)
                 except Exception:
                     pass
-                # Redirect SSRF re-check: Playwright follows redirects transparently;
-                # a safe-looking URL can 302 to an internal address.
-                _final_url = page.url
-                _redir_safe, _redir_reason = is_url_safe(_final_url)
-                if not _redir_safe:
-                    _log("ssrf_blocked", level=logging.WARNING,
-                         url=url, final_url=_final_url,
-                         reason=f"redirect_to_{_redir_reason}")
-                    return {
-                        "status": "blocked",
-                        "error": f"ssrf_blocked: redirect_to_{_redir_reason}",
-                        "accessibility_score": None,
-                        "critical_count": 0,
-                        "serious_count": 0,
-                        "moderate_count": 0,
-                        "minor_count": 0,
-                        "violations": [],
-                        "incomplete_count": 0,
-                        "incomplete": [],
-                        "score_formula_version": SCORE_FORMULA_VERSION,
-                    }
                 # Inject vendored axe — never CDN-load.
                 page.evaluate(axe_js)
                 raw = page.evaluate(
