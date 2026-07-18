@@ -8,7 +8,7 @@ and writes append-only rows to scan_results. Direct Supabase access via service_
 Required env vars:
   SUPABASE_URL           Supabase project URL
   SUPABASE_SERVICE_KEY   service_role key (never anon key)
-  SCAN_CONCURRENCY       max parallel browser contexts (default: 4, hard cap: 4)
+  SCAN_CONCURRENCY       max parallel browser contexts (default: 4, hard cap: 16)
   POLL_INTERVAL_SEC      seconds between polls when queue is empty (default: 15)
   SCAN_BATCH_SIZE        jobs claimed per poll cycle (default: SCAN_CONCURRENCY)
   WORKER_ID              label in metadata.worker_id (default: scan-daemon)
@@ -37,7 +37,7 @@ from url_guard import is_url_safe, UNREACHABLE_REASONS
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
 # Hard cap at 4 — each Chromium instance uses ~350-500 MB system RAM.
-SCAN_CONCURRENCY = min(int(os.environ.get("SCAN_CONCURRENCY", "4")), 4)
+SCAN_CONCURRENCY = min(int(os.environ.get("SCAN_CONCURRENCY", "4")), 16)
 POLL_INTERVAL_SEC = int(os.environ.get("POLL_INTERVAL_SEC", "15"))
 SCAN_BATCH_SIZE = int(os.environ.get("SCAN_BATCH_SIZE", str(SCAN_CONCURRENCY)))
 WORKER_ID = os.environ.get("WORKER_ID", "scan-daemon").strip()
