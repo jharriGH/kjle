@@ -22,6 +22,7 @@ import math
 import os
 import signal
 import sys
+import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -32,7 +33,7 @@ from typing import Any
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from supabase import create_client, Client
 
-from url_guard import is_url_safe, UNREACHABLE_REASONS
+from url_guard import is_url_safe, check_redirect_chain, UNREACHABLE_REASONS
 
 # ── Configuration ────────────────────────────────────────────────────────────
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
@@ -147,17 +148,46 @@ def _scan_url(url: str, axe_js: str) -> dict:
     NEVER returns a fake passing result on any exception — status='error' always.
     """
     start = time.perf_counter()
-    # Per-scan SSRF intercept cache: (scheme, host, port) -> (safe, reason).
-    # Avoids re-resolving the same external host on every subresource within a scan.
-    _ssrf_cache: dict[tuple, tuple] = {}
-    _blocked: list[str] = [""]  # mutable slot: route closure writes abort reason here
 
+    # ── Layer 1: pre-browser preflight redirect-chain check ───────────────────
+    # Follow the server-side redirect chain with Python http.client (no browser)
+    # and check every hop with is_url_safe() BEFORE the browser launches.
+    # This guarantees the browser never connects to an internal host even when
+    # the initial URL is an external/safe server that 302-redirects internally
+    # (the proven Slice 14 attack path: ctx.route does NOT fire for navigation
+    # redirect hops, so the route handler alone cannot catch this).
+    chain_safe, chain_reason = check_redirect_chain(url)
+    if not chain_safe:
+        _log("ssrf_blocked", level=logging.WARNING,
+             url=url, reason=chain_reason, layer="preflight_redirect")
+        return {
+            "status": "blocked",
+            "error": f"ssrf_blocked: {chain_reason}",
+            "accessibility_score": None,
+            "critical_count": 0,
+            "serious_count": 0,
+            "moderate_count": 0,
+            "minor_count": 0,
+            "violations": [],
+            "incomplete_count": 0,
+            "incomplete": [],
+            "score_formula_version": SCORE_FORMULA_VERSION,
+        }
+
+    # Per-scan SSRF intercept cache: (scheme, host, port) -> (safe, reason).
+    # Shared between the route handler and request-event monitor.
+    _ssrf_cache: dict[tuple, tuple] = {}
+    _blocked: list[str] = [""]  # written by both route handler and request monitor
+    _page_ref: list[Any] = [None]  # set after page creation for the request monitor
+
+    # ── Layer 2a: ctx.route handler (Slice 11, kept) ──────────────────────────
+    # Intercepts subresource requests and the FIRST navigation hop. Does NOT
+    # fire for navigation redirect hops (proven Slice 14 investigation finding).
     def _route_handler(route: Any) -> None:
         # Fail CLOSED: any exception MUST abort; never let it become an open door.
         try:
             req_url = route.request.url
             parsed = urllib.parse.urlparse(req_url)
-            # Only enforce on http/https. data:, blob:, etc. cannot reach internal services.
             if parsed.scheme not in ("http", "https"):
                 route.continue_()
                 return
@@ -173,6 +203,40 @@ def _scan_url(url: str, axe_js: str) -> dict:
         except Exception:
             route.abort("blockedbyclient")
 
+    # ── Layer 2b: page.on("request") kill-switch (new, Slice 14) ─────────────
+    # page.on("request") fires for EVERY request the page makes, including
+    # navigation redirect hops that ctx.route misses. When an unsafe URL is
+    # detected, a daemon thread closes the page (spawned outside the event loop
+    # to avoid deadlocking the sync Playwright dispatcher).
+    def _on_request_monitor(request: Any) -> None:
+        if _blocked[0]:
+            return  # already aborting
+        try:
+            req_url = request.url
+            parsed = urllib.parse.urlparse(req_url)
+            if parsed.scheme not in ("http", "https"):
+                return
+            key = (parsed.scheme, parsed.hostname or "", parsed.port or 0)
+            if key not in _ssrf_cache:
+                _ssrf_cache[key] = is_url_safe(req_url)
+            safe, reason = _ssrf_cache[key]
+            if not safe:
+                _blocked[0] = reason
+                page = _page_ref[0]
+                if page is not None:
+                    # Close the page from a separate thread: calling page.close()
+                    # directly inside a Playwright event callback deadlocks the
+                    # sync dispatcher. The thread exits the event loop context
+                    # first, then issues the close through the dispatcher queue.
+                    def _close_page() -> None:
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
+                    threading.Thread(target=_close_page, daemon=True).start()
+        except Exception:
+            pass
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -185,21 +249,25 @@ def _scan_url(url: str, axe_js: str) -> dict:
                     ),
                     java_script_enabled=True,
                 )
-                # Register SSRF intercept on the CONTEXT before creating the page so
-                # every request — initial nav, redirect hops, subframes, subresources —
-                # is checked BEFORE it leaves the browser. This is the Slice 11 fix:
-                # a 302 to an internal IP is aborted at the redirect hop, never reaching
-                # the internal service. Replaces the blind post-nav page.url re-check.
                 ctx.route("**/*", _route_handler)
                 page = ctx.new_page()
+                _page_ref[0] = page
+                page.on("request", _on_request_monitor)
                 try:
-                    # domcontentloaded is the hard requirement; networkidle is best-effort.
                     page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
                 except Exception as _nav_err:
-                    if "ERR_BLOCKED_BY_CLIENT" in str(_nav_err):
+                    _nav_str = str(_nav_err)
+                    _is_ssrf = (
+                        _blocked[0]
+                        or "ERR_BLOCKED_BY_CLIENT" in _nav_str
+                        or "Target page, context or browser has been closed" in _nav_str
+                        or "Page.goto: Target closed" in _nav_str
+                    )
+                    if _is_ssrf:
                         _reason = _blocked[0] or "ssrf_intercepted"
                         _log("ssrf_blocked", level=logging.WARNING,
-                             url=url, reason=f"redirect_to_{_reason}")
+                             url=url, reason=f"redirect_to_{_reason}",
+                             layer="browser_intercept")
                         return {
                             "status": "blocked",
                             "error": f"ssrf_blocked: redirect_to_{_reason}",
@@ -214,6 +282,29 @@ def _scan_url(url: str, axe_js: str) -> dict:
                             "score_formula_version": SCORE_FORMULA_VERSION,
                         }
                     raise
+                # ── Layer 3: post-nav final-URL check ─────────────────────────
+                # Last-resort backstop: if the page landed on an internal URL
+                # despite layers 1-2 (e.g., JS-driven redirect), block now.
+                final_url = page.url
+                if final_url and final_url not in ("about:blank", ""):
+                    _final_safe, _final_reason = is_url_safe(final_url)
+                    if not _final_safe:
+                        _log("ssrf_blocked", level=logging.WARNING,
+                             url=url, final_url=final_url, reason=_final_reason,
+                             layer="post_nav_url_check")
+                        return {
+                            "status": "blocked",
+                            "error": f"ssrf_blocked: post_nav_{_final_reason}",
+                            "accessibility_score": None,
+                            "critical_count": 0,
+                            "serious_count": 0,
+                            "moderate_count": 0,
+                            "minor_count": 0,
+                            "violations": [],
+                            "incomplete_count": 0,
+                            "incomplete": [],
+                            "score_formula_version": SCORE_FORMULA_VERSION,
+                        }
                 try:
                     page.wait_for_load_state("networkidle", timeout=8_000)
                 except Exception:

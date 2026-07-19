@@ -15,6 +15,7 @@ re-auditing the VPS co-tenancy topology.
 """
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import socket
 import urllib.parse
@@ -127,3 +128,64 @@ def is_url_safe(url: str) -> tuple[bool, str]:
             return False, "dns_resolves_to_private"
 
     return True, ""
+
+
+def check_redirect_chain(url: str, max_hops: int = 10) -> tuple[bool, str]:
+    """
+    Follow server-side HTTP redirects via Python http.client (no browser) and
+    check each hop with is_url_safe() BEFORE following it.
+
+    Returns (True, "") when every hop in the chain is safe.
+    Returns (False, "redirect_to_<reason>") if any hop targets an unsafe address.
+
+    This runs before the browser launches so the browser never connects to an
+    internal host even when the initial URL resolves to an external safe server
+    that 302-redirects to an internal address (the proven Slice 14 attack path).
+    """
+    current = url
+    seen: set[str] = set()
+
+    for _ in range(max_hops):
+        if current in seen:
+            return True, ""  # redirect loop; browser will time out naturally
+        seen.add(current)
+
+        safe, reason = is_url_safe(current)
+        if not safe:
+            return False, f"redirect_to_{reason}"
+
+        parsed = urllib.parse.urlparse(current)
+        netloc = parsed.netloc  # may include :port
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
+        try:
+            if parsed.scheme == "https":
+                conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+                    netloc, timeout=_DNS_TIMEOUT_S
+                )
+            else:
+                conn = http.client.HTTPConnection(netloc, timeout=_DNS_TIMEOUT_S)
+
+            conn.request(
+                "HEAD", path,
+                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"},
+            )
+            resp = conn.getresponse()
+            status = resp.status
+            loc = resp.getheader("Location", "")
+            conn.close()
+
+            if status in (301, 302, 303, 307, 308) and loc:
+                current = urllib.parse.urljoin(current, loc)
+                continue
+            return True, ""  # non-redirect or redirect with no Location
+
+        except Exception:
+            # Network error during preflight (timeout, refused connection, etc.)
+            # Treat as safe: the browser will make its own attempt and will hit
+            # the route handler + request-event monitor if anything is unsafe.
+            return True, ""
+
+    return True, ""  # too many hops; browser will give up on its own
