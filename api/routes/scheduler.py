@@ -1228,8 +1228,12 @@ async def job_enrich_stage4_nightly() -> dict:
     - Cost: $0.005/lead via Firecrawl
     """
     job_name = "enrich_stage4_nightly"
-    logger.info(f"[{job_name}] Starting...")
-    t_start = time.monotonic()
+    # STUBBED 2026-07-19 (Jim): Firecrawl deep-enrichment obsolete post pain-scoring redesign
+    # — owner/services/areas unused. Left intact but unscheduled. Re-enable by uncommenting.
+    notes = "STUBBED — Firecrawl deep-enrichment disabled 2026-07-19 (obsolete; owner/services/areas unused)"
+    logger.info(f"[{job_name}] {notes}")
+    await _log_job(job_name, status="skipped", notes=notes)
+    return {"job": job_name, "status": "skipped", "reason": notes}
 
     # ── Kill-switch gate (admin_settings.stage4_nightly_enabled) ─────────────
     enabled_raw = await _get_admin_setting("stage4_nightly_enabled", "true")
@@ -3089,7 +3093,8 @@ JOB_FUNCTIONS = {
     "email_clean_nightly":      job_email_clean_nightly,
     "email_clean_poll_batches": job_email_clean_poll_batches,
     "enrich_stage3_nightly":    job_enrich_stage3_nightly,
-    "enrich_stage4_nightly": job_enrich_stage4_nightly,
+    # STUBBED 2026-07-19 (Jim): Firecrawl deep-enrichment obsolete post pain-scoring redesign — owner/services/areas unused. Left intact but unscheduled. Re-enable by uncommenting.
+    # "enrich_stage4_nightly": job_enrich_stage4_nightly,
     "daily_cost_report":    job_daily_cost_report,
     "campaign_sync_hourly": job_campaign_sync_hourly,
     "fed_dnc_refresh_monthly": job_fed_dnc_refresh_monthly,
