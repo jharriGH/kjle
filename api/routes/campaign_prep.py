@@ -11,13 +11,15 @@ FRESHNESS APPROACH: enqueue-and-exclude
   accessibility scan. scan_jobs priority=9 triggers the daemon's axe scan path.
 
 PURL SEAM
-  attributes.purlLink = CE_PURL_BASE (env var, default https://scan.compliancemds.com/?url=)
-  + the lead's website domain. No ce_ tables are queried. To replace with a
+  attributes.purlLink = CE_PURL_BASE (env var, default https://scan.compliancemds.com/?d=)
+  + the lead's website domain. Uses "?d=" param (ComplianceMDs landing-page prefill). No ce_ tables are queried. To replace with a
   pre-baked slug, find the comment "# PURL SEAM: replace" in _purl_link() and
   swap in a GET /ce/v1/purl/by-lead/{lead_id} call when ComplianceMDs PURL API
   is integrated.
 
-topIssues: stubbed as "" — per-lead scan_results detail would require N+1 queries.
+topIssues: top-3 plain-English violation labels, severity-ranked (critical first).
+  Batch-fetched from scan_results in chunks of 200 lead_ids; Python-side DISTINCT ON
+  (latest row per lead_id) avoids N+1. Leads with no scan detail get topIssues="".
   violationCount, criticalCount, and accessibilityScore are populated from the
   leads table directly (no extra round-trips).
 
@@ -32,6 +34,7 @@ Protected imports (read-only, never modified):
 
 import csv
 import io
+import json
 import logging
 import os
 import re
@@ -51,7 +54,7 @@ API_SECRET_KEY = os.environ.get("API_SECRET_KEY", "kjle-prod-2026-secret")
 
 # PURL SEAM: swap CE_PURL_BASE + domain for a pre-baked slug when ComplianceMDs
 # PURL API is ready. See _purl_link() below for the exact replacement point.
-CE_PURL_BASE = os.environ.get("CE_PURL_BASE", "https://scan.compliancemds.com/?url=")
+CE_PURL_BASE = os.environ.get("CE_PURL_BASE", "https://scan.compliancemds.com/?d=")
 
 _ADA_COLS = (
     "id, business_name, email, phone, city, state, niche_slug, pain_score, "
@@ -60,6 +63,107 @@ _ADA_COLS = (
 )
 _HARD_CAP = 2000
 _SUPP_CHUNK = 100   # email_suppressions batch size
+_SCAN_CHUNK = 200   # scan_results IN-list chunk (avoids PostgREST URL-length blow-up)
+
+# axe impact severity order (critical=0 is highest priority)
+_IMPACT_ORDER = {"critical": 0, "serious": 1, "moderate": 2, "minor": 3}
+
+AXE_LABEL_MAP = {
+    "image-alt":            "Images missing alt text",
+    "color-contrast":       "Insufficient color contrast",
+    "label":                "Form fields without labels",
+    "link-name":            "Links without descriptive text",
+    "button-name":          "Buttons without labels",
+    "html-has-lang":        "Missing page language setting",
+    "document-title":       "Missing or empty page title",
+    "landmark-one-main":    "Missing main content landmark",
+    "page-has-heading-one": "Missing main heading (H1)",
+    "frame-title":          "Frames without titles",
+    "aria-required-attr":   "Incomplete ARIA attributes",
+    "duplicate-id":         "Duplicate element IDs",
+    "list":                 "Improperly structured lists",
+    "heading-order":        "Headings out of order",
+    "region":               "Content not in landmarks",
+}
+
+
+def _humanize_axe_id(axe_id: str) -> str:
+    return axe_id.replace("-", " ").title()
+
+
+def _top3_from_violations(violations_raw) -> list:
+    """Parse a scan_results.violations JSONB value and return top-3 plain-English labels."""
+    if not violations_raw:
+        return []
+    if isinstance(violations_raw, str):
+        try:
+            violations_raw = json.loads(violations_raw)
+        except Exception:
+            return []
+    if not isinstance(violations_raw, list):
+        return []
+
+    sorted_viols = sorted(
+        violations_raw,
+        key=lambda v: _IMPACT_ORDER.get((v.get("impact") or "minor"), 3),
+    )
+    labels = []
+    seen: set = set()
+    for v in sorted_viols:
+        axe_id = (v.get("id") or "").strip()
+        if not axe_id or axe_id in seen:
+            continue
+        labels.append(AXE_LABEL_MAP.get(axe_id) or _humanize_axe_id(axe_id))
+        seen.add(axe_id)
+        if len(labels) == 3:
+            break
+    return labels
+
+
+def _fetch_top_issues(db, lead_ids: list) -> tuple:
+    """
+    Batch-fetch top-3 violation labels per lead from scan_results in _SCAN_CHUNK-sized
+    IN queries. Python-side DISTINCT ON (max scanned_at per lead_id) avoids N+1.
+    Returns ({lead_id: "label1, label2, label3"}, no_detail_count).
+    """
+    if not lead_ids:
+        return {}, 0
+
+    latest_per_lead: dict = {}  # lead_id -> latest scan_results row dict
+
+    for i in range(0, len(lead_ids), _SCAN_CHUNK):
+        chunk = lead_ids[i:i + _SCAN_CHUNK]
+        try:
+            rows = (
+                db.table("scan_results")
+                .select("lead_id, violations, scanned_at")
+                .in_("lead_id", chunk)
+                .execute().data or []
+            )
+        except Exception as e:
+            logger.warning(f"[campaign_prep] scan_results fetch failed chunk={i}: {e}")
+            continue
+
+        for row in rows:
+            lid = row.get("lead_id")
+            if lid is None:
+                continue
+            sat = row.get("scanned_at") or ""
+            if lid not in latest_per_lead or sat > (latest_per_lead[lid].get("scanned_at") or ""):
+                latest_per_lead[lid] = row
+
+    result: dict = {}
+    no_detail_count = 0
+    for lid in lead_ids:
+        row = latest_per_lead.get(lid)
+        top3 = _top3_from_violations(row.get("violations") if row else None)
+        if top3:
+            result[lid] = ", ".join(top3)
+        else:
+            result[lid] = ""
+            no_detail_count += 1
+
+    return result, no_detail_count
 
 
 def verify_api_key(x_api_key: str = Header(...)):
@@ -132,14 +236,13 @@ def _scrub_suppressions(db, rows: list) -> tuple:
     return clean, before - len(clean)
 
 
-def _enrich_attrs(lead: dict, ri_payload: dict) -> dict:
+def _enrich_attrs(lead: dict, ri_payload: dict, top_issues_map: dict) -> dict:
     """Add ADA merge-tag attributes to a map_lead_to_ri payload (mutates attrs in-place)."""
     attrs = ri_payload.setdefault("attributes", {})
     attrs["violationCount"]     = lead.get("accessibility_violations") or 0
     attrs["criticalCount"]      = lead.get("accessibility_critical") or 0
     attrs["accessibilityScore"] = round(float(lead.get("accessibility_score") or 0.0), 1)
-    # topIssues stubbed — N+1 scan_results lookup avoided; see module docstring.
-    attrs["topIssues"]          = ""
+    attrs["topIssues"]          = top_issues_map.get(lead["id"]) or ""
     attrs["purlLink"]           = _purl_link(lead.get("website") or "")
     return ri_payload
 
@@ -249,11 +352,16 @@ async def campaign_prep(body: CampaignPrepRequest):
 
     final_count = len(surviving)
 
+    # ── Step 3.5: Batch-fetch top-3 violation labels from scan_results ────────
+    # ONE chunked query (chunks of _SCAN_CHUNK), Python-side DISTINCT ON per lead.
+    surviving_ids = [lead["id"] for lead in surviving]
+    top_issues_map, no_detail_count = _fetch_top_issues(db, surviving_ids)
+
     # ── Steps 4 + 5: Enrich for merge tags (PURL via CE_PURL_BASE) ──────────
     enriched: list = []
     for lead in surviving:
         ri_payload = map_lead_to_ri(lead)  # protected import — not reimplemented
-        ri_payload = _enrich_attrs(lead, ri_payload)
+        ri_payload = _enrich_attrs(lead, ri_payload, top_issues_map)
         enriched.append((lead, ri_payload))
 
     # Stats block — always returned regardless of output mode
@@ -266,6 +374,7 @@ async def campaign_prep(body: CampaignPrepRequest):
         "deferred":           len(enqueue_failed),
         "final_count":        final_count,
         "dnc_excluded":       dnc_excluded,
+        "no_detail_count":    no_detail_count,
     }
 
     # ── Step 6: Output ────────────────────────────────────────────────────────
