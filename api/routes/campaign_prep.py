@@ -68,22 +68,57 @@ _SCAN_CHUNK = 200   # scan_results IN-list chunk (avoids PostgREST URL-length bl
 # axe impact severity order (critical=0 is highest priority)
 _IMPACT_ORDER = {"critical": 0, "serious": 1, "moderate": 2, "minor": 3}
 
-AXE_LABEL_MAP = {
-    "image-alt":            "Images missing alt text",
-    "color-contrast":       "Insufficient color contrast",
-    "label":                "Form fields without labels",
-    "link-name":            "Links without descriptive text",
-    "button-name":          "Buttons without labels",
-    "html-has-lang":        "Missing page language setting",
-    "document-title":       "Missing or empty page title",
-    "landmark-one-main":    "Missing main content landmark",
-    "page-has-heading-one": "Missing main heading (H1)",
-    "frame-title":          "Frames without titles",
-    "aria-required-attr":   "Incomplete ARIA attributes",
-    "duplicate-id":         "Duplicate element IDs",
-    "list":                 "Improperly structured lists",
-    "heading-order":        "Headings out of order",
-    "region":               "Content not in landmarks",
+# Explicit axe rule-id -> business-friendly category. Explicit map takes precedence
+# over the aria-* prefix catch-all in _axe_category(). Multiple rules collapse to
+# the same category so deduplication removes near-duplicate top issues.
+AXE_CATEGORY_MAP = {
+    # Images
+    "image-alt":                   "Images missing alt text",
+    "role-img-alt":                "Images missing alt text",
+    "svg-img-alt":                 "Images missing alt text",
+    # Color
+    "color-contrast":              "Insufficient color contrast",
+    "color-contrast-enhanced":     "Insufficient color contrast",
+    # Forms (explicit aria form-field rule goes here, not to ARIA category)
+    "label":                       "Form fields without labels",
+    "form-field-multiple-labels":  "Form fields without labels",
+    "select-name":                 "Form fields without labels",
+    "aria-input-field-name":       "Form fields without labels",
+    # Links
+    "link-name":                   "Links without descriptive text",
+    # Buttons
+    "button-name":                 "Buttons without labels",
+    "input-button-name":           "Buttons without labels",
+    # Language
+    "html-has-lang":               "Missing page language setting",
+    "html-lang-valid":             "Missing page language setting",
+    "valid-lang":                  "Missing page language setting",
+    # Title
+    "document-title":              "Missing page title",
+    # Landmarks / structure
+    "landmark-one-main":           "Content not organized for assistive tech",
+    "region":                      "Content not organized for assistive tech",
+    # Headings
+    "page-has-heading-one":        "Improper heading structure",
+    "heading-order":               "Improper heading structure",
+    "empty-heading":               "Improper heading structure",
+    # Frames
+    "frame-title":                 "Frames without titles",
+    # Lists
+    "list":                        "Improperly structured lists",
+    "listitem":                    "Improperly structured lists",
+    "definition-list":             "Improperly structured lists",
+    # IDs
+    "duplicate-id":                "Duplicate element IDs",
+    "duplicate-id-active":         "Duplicate element IDs",
+    "duplicate-id-aria":           "Duplicate element IDs",
+    # Media
+    "video-caption":               "Media missing captions",
+    "audio-caption":               "Media missing captions",
+    # Tables
+    "table-fake-caption":          "Data tables not accessible",
+    "td-headers-attr":             "Data tables not accessible",
+    "th-has-data-cells":           "Data tables not accessible",
 }
 
 
@@ -91,8 +126,26 @@ def _humanize_axe_id(axe_id: str) -> str:
     return axe_id.replace("-", " ").title()
 
 
+def _axe_category(axe_id: str) -> str:
+    """Return a business-friendly category label for an axe rule id.
+
+    Explicit map wins; all remaining aria-* rules collapse to one category;
+    unknown rules fall back to title-cased humanization.
+    """
+    cat = AXE_CATEGORY_MAP.get(axe_id)
+    if cat:
+        return cat
+    if axe_id.startswith("aria-"):
+        return "Screen reader navigation errors"
+    return _humanize_axe_id(axe_id)
+
+
 def _top3_from_violations(violations_raw) -> list:
-    """Parse a scan_results.violations JSONB value and return top-3 plain-English labels."""
+    """Parse a scan_results.violations JSONB value and return top-3 plain-English labels.
+
+    Sort: critical first (impact rank 0). Dedup by CATEGORY (not rule id) so three
+    aria-* variants don't crowd out distinct business-friendly issues.
+    """
     if not violations_raw:
         return []
     if isinstance(violations_raw, str):
@@ -108,13 +161,16 @@ def _top3_from_violations(violations_raw) -> list:
         key=lambda v: _IMPACT_ORDER.get((v.get("impact") or "minor"), 3),
     )
     labels = []
-    seen: set = set()
+    seen_cats: set = set()
     for v in sorted_viols:
         axe_id = (v.get("id") or "").strip()
-        if not axe_id or axe_id in seen:
+        if not axe_id:
             continue
-        labels.append(AXE_LABEL_MAP.get(axe_id) or _humanize_axe_id(axe_id))
-        seen.add(axe_id)
+        cat = _axe_category(axe_id)
+        if cat in seen_cats:
+            continue
+        labels.append(cat)
+        seen_cats.add(cat)
         if len(labels) == 3:
             break
     return labels
@@ -361,6 +417,11 @@ async def campaign_prep(body: CampaignPrepRequest):
     enriched: list = []
     for lead in surviving:
         ri_payload = map_lead_to_ri(lead)  # protected import — not reimplemented
+        # Bug 1: KJLE leads are businesses, never addressed by first name.
+        # map_lead_to_ri splits business_name into firstName/lastName — remove both
+        # so the payload only carries companyName (in attributes) as the merge token.
+        ri_payload.pop("firstName", None)
+        ri_payload.pop("lastName", None)
         ri_payload = _enrich_attrs(lead, ri_payload, top_issues_map)
         enriched.append((lead, ri_payload))
 
