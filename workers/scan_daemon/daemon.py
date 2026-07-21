@@ -13,6 +13,9 @@ Required env vars:
   SCAN_BATCH_SIZE        jobs claimed per poll cycle (default: SCAN_CONCURRENCY)
   WORKER_ID              label in metadata.worker_id (default: scan-daemon)
   LOG_LEVEL              default: INFO
+  SCAN_NAV_TIMEOUT_MS    per-navigation Playwright timeout ms (default: 30000)
+  SCAN_TOTAL_TIMEOUT_S   per-lead overall scan ceiling seconds (default: 60)
+  STALL_THRESHOLD_S      idle-with-queue threshold before self-restart (default: 300)
 """
 from __future__ import annotations
 
@@ -45,9 +48,26 @@ SCAN_BATCH_SIZE = int(os.environ.get("SCAN_BATCH_SIZE", str(SCAN_CONCURRENCY)))
 WORKER_ID = os.environ.get("WORKER_ID", "scan-daemon").strip()
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
+# Per-navigation hard cap — bounds page.goto and EVERY Playwright op on the page
+# (set via set_default_timeout after page creation).
+SCAN_NAV_TIMEOUT_MS = int(os.environ.get("SCAN_NAV_TIMEOUT_MS", "30000"))
+# Per-lead total ceiling — thread-level; frees the worker slot even if the
+# browser thread is still winding down after a pathological page.
+SCAN_TOTAL_TIMEOUT_S = int(os.environ.get("SCAN_TOTAL_TIMEOUT_S", "60"))
+# Stall threshold: if no jobs complete for this many seconds while the queue is
+# non-empty, the watchdog exits with code 1 so systemd restarts the daemon fresh.
+STALL_THRESHOLD_S = int(os.environ.get("STALL_THRESHOLD_S", "300"))
+
 AXE_VERSION = "4.10.2"
 AXE_PATH = Path(__file__).parent / "axe.min.js"
-NAV_TIMEOUT_MS = 30_000  # 30 s, hard limit per navigation
+
+# ── Stall watchdog state (module-level, GIL-safe for scalar writes) ──────────
+_last_job_completed_at: float = 0.0    # monotonic; updated on every terminal job state
+_queue_had_jobs: bool = False           # True if last poll returned queued jobs
+_daemon_start_time: float = 0.0        # set in main() before watchdog starts
+_at_least_one_completion: bool = False  # prevents stall-detect before first job done
+_WATCHDOG_CHECK_S = 60
+_STARTUP_GRACE_S = 120
 
 # ── JSON logger (mirrors local_scraper_daemon pattern) ───────────────────────
 class _JsonFormatter(logging.Formatter):
@@ -252,9 +272,13 @@ def _scan_url(url: str, axe_js: str) -> dict:
                 ctx.route("**/*", _route_handler)
                 page = ctx.new_page()
                 _page_ref[0] = page
+                # Bound ALL Playwright operations on this page — goto, wait_for,
+                # evaluate, etc. — so no single op can hang a worker indefinitely.
+                page.set_default_timeout(SCAN_NAV_TIMEOUT_MS)
+                page.set_default_navigation_timeout(SCAN_NAV_TIMEOUT_MS)
                 page.on("request", _on_request_monitor)
                 try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+                    page.goto(url, wait_until="domcontentloaded", timeout=SCAN_NAV_TIMEOUT_MS)
                 except Exception as _nav_err:
                     _nav_str = str(_nav_err)
                     _is_ssrf = (
@@ -486,6 +510,48 @@ def _update_lead_summary(db: Client, job: dict, scan: dict) -> None:
              lead_id=lead_id, error=str(e))
 
 
+# ── Watchdog helpers ──────────────────────────────────────────────────────────
+def _mark_job_completed() -> None:
+    """Update the stall-watchdog heartbeat. Call at every terminal job state."""
+    global _last_job_completed_at, _at_least_one_completion
+    _last_job_completed_at = time.monotonic()
+    _at_least_one_completion = True
+
+
+def _watchdog_loop() -> None:
+    """
+    Wakes every 60 s. If no jobs have completed for > STALL_THRESHOLD_S while the
+    queue is non-empty, exits with code 1 so systemd (Restart=on-failure) restarts
+    the daemon fresh — the proven recovery for all-workers-wedged deadlock.
+
+    Conservative guards prevent false positives:
+      - startup grace: skip first _STARTUP_GRACE_S seconds
+      - at-least-one-completion: skip until the daemon has finished at least one job
+      - queue guard: empty queue = idle (normal), not stalled
+    """
+    while not _shutdown:
+        time.sleep(_WATCHDOG_CHECK_S)
+        if _shutdown:
+            break
+        if time.monotonic() - _daemon_start_time < _STARTUP_GRACE_S:
+            continue
+        if not _at_least_one_completion:
+            continue
+        if not _queue_had_jobs:
+            continue
+        seconds_idle = time.monotonic() - _last_job_completed_at
+        if seconds_idle > STALL_THRESHOLD_S:
+            _log(
+                "daemon_stall_detected",
+                level=logging.CRITICAL,
+                seconds_since_last_completion=int(seconds_idle),
+                stall_threshold_s=STALL_THRESHOLD_S,
+            )
+            # Hard exit — sys.exit raises SystemExit in this thread only; os._exit
+            # terminates the whole process so systemd actually restarts it.
+            os._exit(1)
+
+
 # ── Process one claimed job ───────────────────────────────────────────────────
 def _process_job(job: dict, axe_js: str, db: Client) -> None:
     job_id = job["id"]
@@ -531,15 +597,50 @@ def _process_job(job: dict, axe_js: str, db: Client) -> None:
         result_id = _insert_result(db, job, _pre_scan)
         _finish_job(db, job_id, done=True, result_id=result_id)
         _update_lead_summary(db, job, _pre_scan)
+        _mark_job_completed()
         return
 
-    scan = _scan_url(url, axe_js)
+    # Per-scan ceiling: run _scan_url in a daemon thread so this worker slot is
+    # freed after SCAN_TOTAL_TIMEOUT_S even if the browser is still winding down.
+    # page.set_default_timeout (set inside _scan_url) ensures all Playwright ops
+    # time out on their own, so the daemon thread terminates and the browser context
+    # is closed via the existing finally block — no permanent leak.
+    _scan_result: list[dict] = []
+    _scan_exc: list[BaseException] = []
+
+    def _run_scan() -> None:
+        try:
+            _scan_result.append(_scan_url(url, axe_js))
+        except BaseException as exc:
+            _scan_exc.append(exc)
+
+    _t = threading.Thread(target=_run_scan, daemon=True)
+    _t.start()
+    _t.join(timeout=SCAN_TOTAL_TIMEOUT_S)
+
+    if _t.is_alive():
+        # Ceiling hit: free the worker slot now; browser thread will clean up when
+        # Playwright ops time out (within SCAN_NAV_TIMEOUT_MS ms).
+        _log("scan_total_timeout", level=logging.WARNING, url=url,
+             timeout_s=SCAN_TOTAL_TIMEOUT_S, job_id=job_id)
+        _finish_job(db, job_id, done=False, error="scan_timeout")
+        _update_lead_summary(db, job, {"status": "error", "error": "scan_timeout"})
+        _mark_job_completed()
+        return
+
+    if _scan_exc:
+        raise _scan_exc[0]
+
+    scan = _scan_result[0] if _scan_result else {
+        "status": "error", "error": "scan_no_result", "violations": [],
+    }
 
     if scan["status"] == "blocked":
         # Redirect-to-internal SSRF block; already logged inside _scan_url.
         result_id = _insert_result(db, job, scan)
         _finish_job(db, job_id, done=True, result_id=result_id)
         _update_lead_summary(db, job, scan)
+        _mark_job_completed()
         return
 
     if scan["status"] == "error":
@@ -547,12 +648,14 @@ def _process_job(job: dict, axe_js: str, db: Client) -> None:
         _finish_job(db, job_id, done=False, error=scan.get("error"))
         _log("job_error", job_id=job_id, url=url, error=(scan.get("error") or "")[:200])
         _update_lead_summary(db, job, scan)
+        _mark_job_completed()
         return
 
     result_id = _insert_result(db, job, scan)
     if result_id is None:
         _finish_job(db, job_id, done=False, error="scan_results insert failed")
         _log("job_insert_failed", level=logging.ERROR, job_id=job_id, url=url)
+        _mark_job_completed()
         return
 
     _finish_job(db, job_id, done=True, result_id=result_id)
@@ -563,6 +666,7 @@ def _process_job(job: dict, axe_js: str, db: Client) -> None:
         result_id=result_id,
     )
     _update_lead_summary(db, job, scan)
+    _mark_job_completed()
 
 
 # ── Main poll loop ────────────────────────────────────────────────────────────
@@ -574,6 +678,9 @@ def main() -> int:
         batch_size=SCAN_BATCH_SIZE,
         poll_interval_sec=POLL_INTERVAL_SEC,
         axe_version=AXE_VERSION,
+        scan_nav_timeout_ms=SCAN_NAV_TIMEOUT_MS,
+        scan_total_timeout_s=SCAN_TOTAL_TIMEOUT_S,
+        stall_threshold_s=STALL_THRESHOLD_S,
     )
 
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
@@ -591,9 +698,17 @@ def main() -> int:
 
     db = _make_db()
 
+    global _daemon_start_time, _queue_had_jobs
+    _daemon_start_time = time.monotonic()
+    _watchdog = threading.Thread(target=_watchdog_loop, daemon=True, name="stall-watchdog")
+    _watchdog.start()
+    _log("watchdog_started", stall_threshold_s=STALL_THRESHOLD_S,
+         startup_grace_s=_STARTUP_GRACE_S, check_interval_s=_WATCHDOG_CHECK_S)
+
     while not _shutdown:
         try:
             jobs = _poll_queued(db, SCAN_BATCH_SIZE)
+            _queue_had_jobs = bool(jobs)  # watchdog: non-empty = active work expected
 
             if not jobs:
                 for _ in range(POLL_INTERVAL_SEC):
