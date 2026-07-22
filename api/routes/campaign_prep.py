@@ -73,52 +73,114 @@ _IMPACT_ORDER = {"critical": 0, "serious": 1, "moderate": 2, "minor": 3}
 # the same category so deduplication removes near-duplicate top issues.
 AXE_CATEGORY_MAP = {
     # Images
-    "image-alt":                   "Images missing alt text",
-    "role-img-alt":                "Images missing alt text",
-    "svg-img-alt":                 "Images missing alt text",
+    "image-alt":                             "Images missing alt text",
+    "role-img-alt":                          "Images missing alt text",
+    "svg-img-alt":                           "Images missing alt text",
+    "area-alt":                              "Images missing alt text",
+    "input-image-alt":                       "Images missing alt text",
+    "object-alt":                            "Images missing alt text",
+    "server-side-image-map":                 "Images missing alt text",
     # Color
-    "color-contrast":              "Insufficient color contrast",
-    "color-contrast-enhanced":     "Insufficient color contrast",
-    # Forms (explicit aria form-field rule goes here, not to ARIA category)
-    "label":                       "Form fields without labels",
-    "form-field-multiple-labels":  "Form fields without labels",
-    "select-name":                 "Form fields without labels",
-    "aria-input-field-name":       "Form fields without labels",
+    "color-contrast":                        "Insufficient color contrast",
+    "color-contrast-enhanced":               "Insufficient color contrast",
+    # Viewport / zoom
+    "meta-viewport":                         "Text that can't be zoomed or resized",
+    "meta-viewport-large":                   "Text that can't be zoomed or resized",
+    # Forms
+    "label":                                 "Form fields without labels",
+    "form-field-multiple-labels":            "Form fields without labels",
+    "label-title-only":                      "Form fields without labels",
+    "select-name":                           "Form fields without labels",
+    "aria-input-field-name":                 "Form fields without labels",
+    "autocomplete-valid":                    "Form fields hard to complete",
     # Links
-    "link-name":                   "Links without descriptive text",
+    "link-name":                             "Links without descriptive text",
+    "identical-links-same-purpose":          "Confusing duplicate links",
     # Buttons
-    "button-name":                 "Buttons without labels",
-    "input-button-name":           "Buttons without labels",
+    "button-name":                           "Buttons without labels",
+    "input-button-name":                     "Buttons without labels",
     # Language
-    "html-has-lang":               "Missing page language setting",
-    "html-lang-valid":             "Missing page language setting",
-    "valid-lang":                  "Missing page language setting",
+    "html-has-lang":                         "Missing page language setting",
+    "html-lang-valid":                       "Missing page language setting",
+    "valid-lang":                            "Missing page language setting",
     # Title
-    "document-title":              "Missing page title",
+    "document-title":                        "Missing page title",
     # Landmarks / structure
-    "landmark-one-main":           "Content not organized for assistive tech",
-    "region":                      "Content not organized for assistive tech",
+    "landmark-one-main":                     "Content not organized for assistive tech",
+    "region":                                "Content not organized for assistive tech",
+    "landmark-banner-is-top-level":          "Content not organized for assistive tech",
+    "landmark-complementary-is-top-level":   "Content not organized for assistive tech",
+    "landmark-contentinfo-is-top-level":     "Content not organized for assistive tech",
+    "landmark-main-is-top-level":            "Content not organized for assistive tech",
+    "landmark-no-duplicate-banner":          "Content not organized for assistive tech",
+    "landmark-no-duplicate-contentinfo":     "Content not organized for assistive tech",
+    "landmark-no-duplicate-main":            "Content not organized for assistive tech",
+    "landmark-unique":                       "Content not organized for assistive tech",
     # Headings
-    "page-has-heading-one":        "Improper heading structure",
-    "heading-order":               "Improper heading structure",
-    "empty-heading":               "Improper heading structure",
+    "page-has-heading-one":                  "Improper heading structure",
+    "heading-order":                         "Improper heading structure",
+    "empty-heading":                         "Improper heading structure",
+    "empty-table-header":                    "Improper heading structure",
     # Frames
-    "frame-title":                 "Frames without titles",
+    "frame-title":                           "Frames without titles",
+    "frame-focusable-content":               "Frames without titles",
+    "frame-title-unique":                    "Frames without titles",
+    "frame-tested":                          "Frames without titles",
     # Lists
-    "list":                        "Improperly structured lists",
-    "listitem":                    "Improperly structured lists",
-    "definition-list":             "Improperly structured lists",
+    "list":                                  "Improperly structured lists",
+    "listitem":                              "Improperly structured lists",
+    "definition-list":                       "Improperly structured lists",
+    "dlitem":                                "Improperly structured lists",
     # IDs
-    "duplicate-id":                "Duplicate element IDs",
-    "duplicate-id-active":         "Duplicate element IDs",
-    "duplicate-id-aria":           "Duplicate element IDs",
+    "duplicate-id":                          "Duplicate element IDs",
+    "duplicate-id-active":                   "Duplicate element IDs",
+    "duplicate-id-aria":                     "Duplicate element IDs",
     # Media
-    "video-caption":               "Media missing captions",
-    "audio-caption":               "Media missing captions",
+    "video-caption":                         "Media missing captions",
+    "audio-caption":                         "Media missing captions",
+    "no-autoplay-audio":                     "Audio that autoplays",
     # Tables
-    "table-fake-caption":          "Data tables not accessible",
-    "td-headers-attr":             "Data tables not accessible",
-    "th-has-data-cells":           "Data tables not accessible",
+    "table-fake-caption":                    "Data tables not accessible",
+    "td-headers-attr":                       "Data tables not accessible",
+    "th-has-data-cells":                     "Data tables not accessible",
+    "summary-name":                          "Data tables not accessible",
+    "table-duplicate-name":                  "Data tables not accessible",
+    "td-has-header":                         "Data tables not accessible",
+    "scope-attr-valid":                      "Data tables not accessible",
+    # Keyboard
+    "scrollable-region-focusable":           "Content not reachable by keyboard",
+    "focus-order-semantics":                 "Broken keyboard navigation",
+    "tabindex":                              "Broken keyboard navigation",
+    # Skip navigation
+    "bypass":                                "Missing skip-navigation link",
+    "skip-link":                             "Missing skip-navigation link",
+    "accesskeys":                            "Missing skip-navigation link",
+    # Mobile
+    "target-size":                           "Tap targets too small on mobile",
+    # Orientation
+    "css-orientation-lock":                  "Site locked to one screen orientation",
+    # Distraction / animation
+    "blink":                                 "Distracting moving content",
+    "marquee":                               "Distracting moving content",
+    # Page refresh
+    "meta-refresh":                          "Page refreshes/redirects too fast",
+    "meta-refresh-no-exceptions":            "Page refreshes/redirects too fast",
+    # Interactive
+    "nested-interactive":                    "Broken interactive elements",
+    # Screen reader (explicit rules — aria-* prefix catch-all in _axe_category() handles the rest)
+    "aria-command-name":                     "Screen reader navigation errors",
+    "aria-toggle-field-name":               "Screen reader navigation errors",
+    "aria-meter-name":                       "Screen reader navigation errors",
+    "aria-progressbar-name":                 "Screen reader navigation errors",
+    "aria-tooltip-name":                     "Screen reader navigation errors",
+    "aria-hidden-body":                      "Screen reader navigation errors",
+    "aria-hidden-focus":                     "Screen reader navigation errors",
+    "aria-deprecated-role":                  "Screen reader navigation errors",
+    "aria-prohibited-attr":                  "Screen reader navigation errors",
+    "aria-braille-equivalent":               "Screen reader navigation errors",
+    "aria-conditional-attr":                 "Screen reader navigation errors",
+    "aria-text":                             "Screen reader navigation errors",
+    "presentation-role-conflict":            "Screen reader navigation errors",
 }
 
 
@@ -130,14 +192,17 @@ def _axe_category(axe_id: str) -> str:
     """Return a business-friendly category label for an axe rule id.
 
     Explicit map wins; all remaining aria-* rules collapse to one category;
-    unknown rules fall back to title-cased humanization.
+    unknown rules fall back to a safe generic so no raw id jargon ever ships.
     """
     cat = AXE_CATEGORY_MAP.get(axe_id)
     if cat:
         return cat
     if axe_id.startswith("aria-"):
         return "Screen reader navigation errors"
-    return _humanize_axe_id(axe_id)
+    return "Other accessibility issues"
+
+
+_OTHER_LABEL = "Other accessibility issues"
 
 
 def _top3_from_violations(violations_raw) -> list:
@@ -145,6 +210,8 @@ def _top3_from_violations(violations_raw) -> list:
 
     Sort: critical first (impact rank 0). Dedup by CATEGORY (not rule id) so three
     aria-* variants don't crowd out distinct business-friendly issues.
+    "Other accessibility issues" is deferred — it only fills a slot when fewer than
+    3 real named categories exist, so it never crowds out a real label.
     """
     if not violations_raw:
         return []
@@ -162,17 +229,24 @@ def _top3_from_violations(violations_raw) -> list:
     )
     labels = []
     seen_cats: set = set()
+    has_other = False
     for v in sorted_viols:
         axe_id = (v.get("id") or "").strip()
         if not axe_id:
             continue
         cat = _axe_category(axe_id)
+        if cat == _OTHER_LABEL:
+            has_other = True
+            continue  # defer to end — real categories always win the 3 slots first
         if cat in seen_cats:
             continue
         labels.append(cat)
         seen_cats.add(cat)
         if len(labels) == 3:
             break
+    # Append the catch-all only if there's room and no real category already fills all 3
+    if len(labels) < 3 and has_other:
+        labels.append(_OTHER_LABEL)
     return labels
 
 
