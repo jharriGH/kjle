@@ -46,7 +46,7 @@ async def main() -> None:
     try:
         await stop.wait()
     finally:
-        scheduler.shutdown(wait=False)
+        scheduler.shutdown(wait=True, timeout=30)
         logger.info("scheduler worker shutting down")
 
 

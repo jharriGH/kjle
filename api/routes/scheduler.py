@@ -192,12 +192,12 @@ JOB_DEFINITIONS = {
     },
     "website_audit_nightly": {
         "description": "Nightly free-path website audit — bulk-fills WebSignalz signals (~22) for leads where last_audited_at IS NULL, pain_score DESC; no Firecrawl cost",
-        "schedule":    "Daily at 00:30 UTC",
+        "schedule":    "Daily at 05:30 UTC",
         "trigger":     "cron",
     },
     "pagespeed_nightly": {
         "description": "Nightly PageSpeed Insights bulk-fill (WebSignalz Phase 2) — mobile+desktop scores + LCP/CLS/TBT + mobile_friendly for leads where pagespeed_checked_at IS NULL; paced w/ 500-backoff + daily cap",
-        "schedule":    "Daily at 02:30 UTC",
+        "schedule":    "Daily at 07:30 UTC",
         "trigger":     "cron",
     },
     "axe_scan_nightly": {
@@ -2262,7 +2262,7 @@ async def job_website_audit_nightly() -> dict:
     """
     Nightly bulk-fill of WebSignalz signals via the free httpx fetch path.
 
-    - Fires at 00:30 UTC (~2h buffer before pagespeed at 02:30; email_clean at 00:00 takes ~5s)
+    - Fires at 05:30 UTC (moved from 00:30 — avoids typical Render deploy window 19:00-04:00 UTC)
     - Up to WEBSITE_AUDIT_NIGHTLY_LIMIT leads per run (default 15000), overridable via
       admin_settings key 'website_audit_nightly_limit'
     - Targets: website IS NOT NULL AND last_audited_at IS NULL, pain_score DESC
@@ -2303,6 +2303,21 @@ async def job_website_audit_nightly() -> dict:
 
     lock = asyncio.Lock()
     sem  = asyncio.Semaphore(concurrency)
+
+    # Checkpoint: write a "started" row immediately so we can detect OOM/SIGKILL
+    # (which bypasses the finally block). If the next scheduler_log row for this
+    # job is still "started", the process was killed before the finally block ran.
+    await _log_job(
+        job_name,
+        leads_processed=0,
+        duration_seconds=0.0,
+        status="started",
+        notes=(
+            f"nightly_limit={nightly_limit}, max_seconds={max_seconds}, "
+            f"concurrency={concurrency}, fetch_chunk={fetch_chunk}, "
+            f"rss_start_mb={rss_start_kb / 1024:.1f}"
+        ),
+    )
 
     async def _do_one_lead(lead: dict) -> None:
         nonlocal audited, unreachable, failed, robots_skipped, total_seen, db_writes
@@ -2426,6 +2441,17 @@ async def job_website_audit_nightly() -> dict:
                 f"[{job_name}] chunk {chunks_processed} done: "
                 f"leads={len(leads)}, audited={audited}, unreachable={unreachable}, "
                 f"failed={failed}, total_seen={total_seen}, rss_mb={rss_mb_now:.1f}"
+            )
+            # Checkpoint row: if OOM/SIGKILL hits mid-run, this shows how far we got.
+            await _log_job(
+                job_name,
+                leads_processed=audited,
+                duration_seconds=time.monotonic() - t_start,
+                status="checkpoint",
+                notes=(
+                    f"chunk={chunks_processed}, audited={audited}, unreachable={unreachable}, "
+                    f"failed={failed}, total_seen={total_seen}, rss_mb={rss_mb_now:.1f}"
+                ),
             )
 
             if db_writes == db_writes_before:
@@ -3250,29 +3276,29 @@ def setup_scheduler() -> AsyncIOScheduler:
         misfire_grace_time=3600,
     )
 
-    # Job 13: website_audit_nightly — daily at 00:30 UTC
+    # Job 13: website_audit_nightly — daily at 05:30 UTC
     # Free httpx bulk-fill of WebSignalz signals (~22) for leads where
-    # last_audited_at IS NULL. Slot chosen to avoid all registered crons:
-    # email_clean (00:00, ~5s), stale_cleanup (02:00), fed_dnc/tcpa (04:00+).
-    # Moved from 01:30 to 00:30 (Slice 6) to give a ~2h buffer before
-    # pagespeed_nightly at 02:30 as the nightly limit grows.
+    # last_audited_at IS NULL. Moved from 00:30 to 05:30 (Slice 19) to land
+    # after the typical WebSignalz slice deploy window (observed 19:00-04:00 UTC),
+    # which was killing the job mid-run via Render SIGTERM + scheduler.shutdown().
+    # 05:30 is clear of: email_clean (00:00), stale_cleanup (02:00), axe_scan (04:00).
     scheduler.add_job(
         job_website_audit_nightly,
-        trigger=CronTrigger(hour=0, minute=30),
+        trigger=CronTrigger(hour=5, minute=30),
         id="website_audit_nightly",
         name="Nightly Website Audit (WebSignalz bulk-fill, free)",
         replace_existing=True,
         misfire_grace_time=3600,
     )
 
-    # Job 14: pagespeed_nightly — daily at 02:30 UTC (WebSignalz Phase 2)
+    # Job 14: pagespeed_nightly — daily at 07:30 UTC (WebSignalz Phase 2)
     # Keyed PageSpeed Insights bulk-fill: mobile+desktop scores + LCP/CLS/TBT.
-    # Slot confirmed clear: email_clean (00:00), stage3 (01:00, manual only),
-    # website_audit (01:30), stale_cleanup (02:00), stage4 (03:00, manual only).
-    # 02:30 has no registered daily cron — confirmed by reading setup_scheduler.
+    # Moved from 02:30 to 07:30 (Slice 19) — same reason as website_audit above.
+    # Overlaps website_audit window (05:30-11:30) but they are independent jobs
+    # and the DB + network load is acceptable. 07:30 clear of all other daily crons.
     scheduler.add_job(
         job_pagespeed_nightly,
-        trigger=CronTrigger(hour=2, minute=30),
+        trigger=CronTrigger(hour=7, minute=30),
         id="pagespeed_nightly",
         name="Nightly PageSpeed Enrichment (WebSignalz Phase 2)",
         replace_existing=True,
