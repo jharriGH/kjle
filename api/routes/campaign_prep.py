@@ -30,6 +30,18 @@ DNC/contactable guards: replicates fetch_kjle_leads (reachinbox.py):
 Protected imports (read-only, never modified):
   - reachinbox.map_lead_to_ri  — maps lead dict to RI payload shape
   - reachinbox.ri_post         — RI HTTP POST (only called when dry_run=False)
+
+HYGIENE PASS (Slice 19)
+  Applied after freshness gate, before building output. Controlled by request flags:
+  - dedupe_email (default true): collapses cross-contaminated rows sharing one email
+    across different company names; keeps the row whose website domain best matches
+    the email domain, falling back to lowest accessibility_score.
+  - dedupe_domain (default true): collapses multiple rows for the same website domain;
+    keeps the row with the lowest accessibility_score (best outreach prospect).
+  - require_domain_match (default false): flags non-freemail email/domain mismatches
+    in the output (domainMatch=false); set true to DROP them instead of just flagging.
+  Fetch strategy: 2x the requested limit so the final post-hygiene count stays close
+  to the target after deduplication. Trimmed to limit before output.
 """
 
 import csv
@@ -67,6 +79,16 @@ _SCAN_CHUNK = 200   # scan_results IN-list chunk (avoids PostgREST URL-length bl
 
 # axe impact severity order (critical=0 is highest priority)
 _IMPACT_ORDER = {"critical": 0, "serious": 1, "moderate": 2, "minor": 3}
+
+# Freemail providers: small businesses legitimately use these; never flagged as mismatch.
+_FREEMAIL = frozenset({
+    "gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.uk", "yahoo.com.au",
+    "ymail.com", "outlook.com", "hotmail.com", "hotmail.co.uk", "hotmail.fr",
+    "live.com", "msn.com", "aol.com", "icloud.com", "me.com", "mac.com",
+    "protonmail.com", "proton.me", "pm.me", "zoho.com", "mail.com",
+    "gmx.com", "gmx.net", "inbox.com", "comcast.net", "verizon.net",
+    "att.net", "sbcglobal.net", "bellsouth.net",
+})
 
 # Explicit axe rule-id -> business-friendly category. Explicit map takes precedence
 # over the aria-* prefix catch-all in _axe_category(). Multiple rules collapse to
@@ -311,6 +333,9 @@ class CampaignPrepRequest(BaseModel):
     output: Literal["csv", "reachinbox_payload"] = "csv"
     dry_run: bool = True
     campaign_id: Optional[int] = None  # required for output=reachinbox_payload + dry_run=False
+    dedupe_email: bool = True
+    dedupe_domain: bool = True
+    require_domain_match: bool = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -322,6 +347,14 @@ def _extract_domain(website: str) -> str:
     if not website:
         return ""
     return re.sub(r'^https?://', '', website.strip()).split('/')[0]
+
+
+def _bare_domain(url: str) -> str:
+    """Registrable domain: strip scheme, www., path, port; lowercase."""
+    d = _extract_domain(url).lower()
+    if d.startswith("www."):
+        d = d[4:]
+    return d.split(":")[0]
 
 
 def _purl_link(website: str) -> str:
@@ -366,6 +399,95 @@ def _scrub_suppressions(db, rows: list) -> tuple:
     return clean, before - len(clean)
 
 
+def _dedupe_by_email(leads: list) -> tuple:
+    """Collapse rows sharing the same normalized email.
+
+    Multi-company/multi-domain rows for one email are cross-contaminated imports.
+    Keep the row whose website domain exactly matches the email domain; if no such
+    row exists, keep the lowest accessibility_score (best outreach prospect).
+    Returns (clean_leads, n_dropped).
+    """
+    groups: dict = {}
+    for lead in leads:
+        key = (lead.get("email") or "").strip().lower()
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(lead)
+
+    result = []
+    dropped = 0
+    for email, group in groups.items():
+        if len(group) == 1:
+            result.append(group[0])
+            continue
+        email_dom = email.split("@")[1] if "@" in email else ""
+        if email_dom:
+            matches = [l for l in group if _bare_domain(l.get("website") or "") == email_dom]
+        else:
+            matches = []
+        candidates = matches if matches else group
+        best = min(candidates, key=lambda l: float(l.get("accessibility_score") or 0))
+        result.append(best)
+        dropped += len(group) - 1
+    return result, dropped
+
+
+def _dedupe_by_domain(leads: list) -> tuple:
+    """Collapse multiple rows that share the same registrable website domain.
+
+    Keeps the row with the lowest accessibility_score (worst site = best prospect).
+    Returns (clean_leads, n_dropped).
+    """
+    groups: dict = {}
+    for lead in leads:
+        dom = _bare_domain(lead.get("website") or "")
+        key = dom if dom else f"__nodom_{lead.get('id', id(lead))}"
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(lead)
+
+    result = []
+    dropped = 0
+    for key, group in groups.items():
+        if len(group) == 1:
+            result.append(group[0])
+            continue
+        best = min(group, key=lambda l: float(l.get("accessibility_score") or 0))
+        result.append(best)
+        dropped += len(group) - 1
+    return result, dropped
+
+
+def _annotate_domain_match(leads: list, require_match: bool) -> tuple:
+    """Annotate each lead with _domain_match boolean.
+
+    Freemail domains (gmail, outlook, etc.) always pass — small businesses
+    legitimately use them. For non-freemail: MATCH when the email domain's
+    registrable part appears in the website domain or vice versa.
+    If require_match is False (default): keep the lead, annotate domainMatch=False.
+    If require_match is True: drop mismatched non-freemail leads.
+    Returns (annotated_leads, n_flagged, n_dropped).
+    """
+    result = []
+    flagged = 0
+    dropped = 0
+    for lead in leads:
+        email = (lead.get("email") or "").strip().lower()
+        email_dom = email.split("@")[1] if "@" in email else ""
+        if not email_dom or email_dom in _FREEMAIL:
+            result.append({**lead, "_domain_match": True})
+            continue
+        web_dom = _bare_domain(lead.get("website") or "")
+        match = bool(web_dom and (email_dom in web_dom or web_dom in email_dom))
+        if not match:
+            flagged += 1
+            if require_match:
+                dropped += 1
+                continue
+        result.append({**lead, "_domain_match": match})
+    return result, flagged, dropped
+
+
 def _enrich_attrs(lead: dict, ri_payload: dict, top_issues_map: dict) -> dict:
     """Add ADA merge-tag attributes to a map_lead_to_ri payload (mutates attrs in-place)."""
     attrs = ri_payload.setdefault("attributes", {})
@@ -374,6 +496,7 @@ def _enrich_attrs(lead: dict, ri_payload: dict, top_issues_map: dict) -> dict:
     attrs["accessibilityScore"] = round(float(lead.get("accessibility_score") or 0.0), 1)
     attrs["topIssues"]          = top_issues_map.get(lead["id"]) or ""
     attrs["purlLink"]           = _purl_link(lead.get("website") or "")
+    attrs["domainMatch"]        = lead.get("_domain_match", True)
     return ri_payload
 
 
@@ -387,8 +510,9 @@ async def campaign_prep(body: CampaignPrepRequest):
     ADA Campaign Prep — freshness-gated accessibility segment for cold outreach.
 
     Pulls hot ADA leads (accessibility_score < max_score), freshness-gates them
-    (enqueue stale for re-scan and exclude), enriches with merge tags, and returns
-    CSV data or ReachInbox payloads + stats.
+    (enqueue stale for re-scan and exclude), runs contact-data hygiene (email
+    dedupe, domain dedupe, domain-match annotation), enriches with merge tags,
+    and returns CSV data or ReachInbox payloads + stats.
     """
     if body.output == "reachinbox_payload" and not body.dry_run and not body.campaign_id:
         raise HTTPException(
@@ -397,6 +521,8 @@ async def campaign_prep(body: CampaignPrepRequest):
         )
 
     limit = min(body.limit, _HARD_CAP)
+    # Fetch 2x to absorb hygiene drops and still return close to the requested count.
+    fetch_limit = min(limit * 2, _HARD_CAP)
     db = get_db()
     now_dt = datetime.now(timezone.utc)
     stale_cutoff_dt = now_dt - timedelta(days=body.reverify_stale_days)
@@ -427,7 +553,7 @@ async def campaign_prep(body: CampaignPrepRequest):
         query
         .order("accessibility_score", desc=False)
         .order("id")
-        .limit(limit)
+        .limit(fetch_limit)
         .execute().data or []
     )
     total_matched = len(rows)
@@ -480,14 +606,32 @@ async def campaign_prep(body: CampaignPrepRequest):
         else:
             surviving.append(lead)
 
+    # ── Step 3.5: Contact-data hygiene ────────────────────────────────────────
+    # Order: dedupe email → dedupe domain → domain-match annotation.
+    # Controlled by request-body flags (all default on except require_domain_match).
+    deduped_email = 0
+    deduped_domain = 0
+    domain_mismatch_flagged = 0
+    domain_mismatch_dropped = 0
+
+    if body.dedupe_email:
+        surviving, deduped_email = _dedupe_by_email(surviving)
+    if body.dedupe_domain:
+        surviving, deduped_domain = _dedupe_by_domain(surviving)
+    surviving, domain_mismatch_flagged, domain_mismatch_dropped = _annotate_domain_match(
+        surviving, body.require_domain_match
+    )
+
+    # Trim to requested limit (2x prefetch absorbed dedupe losses)
+    surviving = surviving[:limit]
     final_count = len(surviving)
 
-    # ── Step 3.5: Batch-fetch top-3 violation labels from scan_results ────────
+    # ── Step 4: Batch-fetch top-3 violation labels from scan_results ──────────
     # ONE chunked query (chunks of _SCAN_CHUNK), Python-side DISTINCT ON per lead.
     surviving_ids = [lead["id"] for lead in surviving]
     top_issues_map, no_detail_count = _fetch_top_issues(db, surviving_ids)
 
-    # ── Steps 4 + 5: Enrich for merge tags (PURL via CE_PURL_BASE) ──────────
+    # ── Steps 5 + 6: Enrich for merge tags (PURL via CE_PURL_BASE) ──────────
     enriched: list = []
     for lead in surviving:
         ri_payload = map_lead_to_ri(lead)  # protected import — not reimplemented
@@ -501,18 +645,22 @@ async def campaign_prep(body: CampaignPrepRequest):
 
     # Stats block — always returned regardless of output mode
     stats = {
-        "total_matched":      total_matched,
-        "fresh":              len(fresh_leads),
-        "stale_reverified":   0,           # enqueue-and-exclude: no inline reverify
-        "requeued_stale":     len(requeued_stale),
-        "dropped_remediated": dropped_remediated,
-        "deferred":           len(enqueue_failed),
-        "final_count":        final_count,
-        "dnc_excluded":       dnc_excluded,
-        "no_detail_count":    no_detail_count,
+        "total_matched":           total_matched,
+        "fresh":                   len(fresh_leads),
+        "stale_reverified":        0,           # enqueue-and-exclude: no inline reverify
+        "requeued_stale":          len(requeued_stale),
+        "dropped_remediated":      dropped_remediated,
+        "deferred":                len(enqueue_failed),
+        "dnc_excluded":            dnc_excluded,
+        "deduped_email":           deduped_email,
+        "deduped_domain":          deduped_domain,
+        "domain_mismatch_flagged": domain_mismatch_flagged,
+        "domain_mismatch_dropped": domain_mismatch_dropped,
+        "final_count":             final_count,
+        "no_detail_count":         no_detail_count,
     }
 
-    # ── Step 6: Output ────────────────────────────────────────────────────────
+    # ── Step 7: Output ────────────────────────────────────────────────────────
 
     # CSV output: return JSON with embedded csv_data string + stats so the
     # operator can inspect stats and save the CSV without a separate request.
@@ -520,7 +668,7 @@ async def campaign_prep(body: CampaignPrepRequest):
         csv_cols = [
             "lead_id", "companyName", "email", "website",
             "accessibility_score", "accessibility_violations", "accessibility_critical",
-            "topIssues", "purlLink",
+            "topIssues", "purlLink", "domainMatch",
         ]
         buf = io.StringIO()
         writer = csv.DictWriter(buf, fieldnames=csv_cols, lineterminator="\n")
@@ -537,6 +685,7 @@ async def campaign_prep(body: CampaignPrepRequest):
                 "accessibility_critical":   attrs.get("criticalCount") or "",
                 "topIssues":                attrs.get("topIssues") or "",
                 "purlLink":                 attrs.get("purlLink") or "",
+                "domainMatch":              attrs.get("domainMatch", True),
             })
         buf.seek(0)
         csv_str = buf.getvalue()
