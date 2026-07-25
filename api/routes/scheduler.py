@@ -2313,7 +2313,7 @@ async def job_website_audit_nightly() -> dict:
         duration_seconds=0.0,
         status="started",
         notes=(
-            f"nightly_limit={nightly_limit}, max_seconds={max_seconds}, "
+            f"v=slice20, nightly_limit={nightly_limit}, max_seconds={max_seconds}, "
             f"concurrency={concurrency}, fetch_chunk={fetch_chunk}, "
             f"rss_start_mb={rss_start_kb / 1024:.1f}"
         ),
@@ -2340,9 +2340,11 @@ async def job_website_audit_nightly() -> dict:
             _host   = _parsed.netloc or _parsed.path.split("/")[0]
             if not await wa_check_robots_allowed(_host, _rurl, robots_cache):
                 try:
-                    db.table("leads").update({
-                        "last_audited_at": datetime.now(timezone.utc).isoformat(),
-                    }).eq("id", lead_id).execute()
+                    await asyncio.to_thread(
+                        db.table("leads").update({
+                            "last_audited_at": datetime.now(timezone.utc).isoformat(),
+                        }).eq("id", lead_id).execute
+                    )
                 except Exception:
                     pass
                 async with lock:
@@ -2352,14 +2354,20 @@ async def job_website_audit_nightly() -> dict:
                 return
 
         try:
-            html, final_url = await wa_fetch_html_free(website)
+            # Fix A: hard asyncio timeout so drip-feeding/hanging sites can't freeze the gather.
+            # asyncio.TimeoutError is a subclass of Exception — caught below, marks lead failed.
+            html, final_url = await asyncio.wait_for(wa_fetch_html_free(website), timeout=35.0)
 
             if html is None:
-                db.table("leads").update({
-                    "is_parked":       True,
-                    "website_has_ssl": False,
-                    "last_audited_at": datetime.now(timezone.utc).isoformat(),
-                }).eq("id", lead_id).execute()
+                # Fix B: synchronous .execute() moved to thread pool so it never blocks the
+                # event loop (blocking the loop delays httpx timeouts for other coroutines).
+                await asyncio.to_thread(
+                    db.table("leads").update({
+                        "is_parked":       True,
+                        "website_has_ssl": False,
+                        "last_audited_at": datetime.now(timezone.utc).isoformat(),
+                    }).eq("id", lead_id).execute
+                )
                 async with lock:
                     unreachable += 1
                     db_writes   += 1
@@ -2367,7 +2375,9 @@ async def job_website_audit_nightly() -> dict:
                 signals = wa_parse_signals_full(html, final_url)
                 safe_signals = {k: v for k, v in signals.items() if k in WA_FULL_AUDIT_COLUMNS}
                 safe_signals["last_audited_at"] = datetime.now(timezone.utc).isoformat()
-                db.table("leads").update(safe_signals).eq("id", lead_id).execute()
+                await asyncio.to_thread(
+                    db.table("leads").update(safe_signals).eq("id", lead_id).execute
+                )
                 async with lock:
                     audited   += 1
                     db_writes += 1
@@ -2375,9 +2385,11 @@ async def job_website_audit_nightly() -> dict:
         except Exception as e:
             logger.error(f"[{job_name}] Lead {lead_id} failed: {type(e).__name__}: {e}")
             try:
-                db.table("leads").update({
-                    "last_audited_at": datetime.now(timezone.utc).isoformat(),
-                }).eq("id", lead_id).execute()
+                await asyncio.to_thread(
+                    db.table("leads").update({
+                        "last_audited_at": datetime.now(timezone.utc).isoformat(),
+                    }).eq("id", lead_id).execute
+                )
             except Exception:
                 pass
             async with lock:
@@ -2423,7 +2435,7 @@ async def job_website_audit_nightly() -> dict:
                 break
 
             db_writes_before = db_writes
-            await asyncio.gather(*[_process_lead_gated(lead) for lead in leads])
+            await asyncio.gather(*[_process_lead_gated(lead) for lead in leads], return_exceptions=True)
             chunks_processed += 1
 
             # Sample RSS after each chunk on Linux (ru_maxrss is kilobytes); track peak
