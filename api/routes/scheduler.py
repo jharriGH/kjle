@@ -2313,7 +2313,7 @@ async def job_website_audit_nightly() -> dict:
         duration_seconds=0.0,
         status="started",
         notes=(
-            f"v=slice20, nightly_limit={nightly_limit}, max_seconds={max_seconds}, "
+            f"v=slice21, nightly_limit={nightly_limit}, max_seconds={max_seconds}, "
             f"concurrency={concurrency}, fetch_chunk={fetch_chunk}, "
             f"rss_start_mb={rss_start_kb / 1024:.1f}"
         ),
@@ -3365,6 +3365,16 @@ async def get_scheduler_status():
         "status": "success",
         "jobs":   jobs_out,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /scheduler/build-marker  — deploy verification endpoint
+# Returns 404 on old code, 200 + marker on new code. Poll this to confirm deploy.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/scheduler/build-marker")
+async def get_build_marker():
+    return {"marker": "v=slice21", "commit": "1c5fce8"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
