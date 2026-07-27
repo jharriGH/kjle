@@ -90,7 +90,7 @@ WEBSITE_AUDIT_NIGHTLY_LIMIT       = 15_000  # leads per run, overridable via adm
 WEBSITE_AUDIT_NIGHTLY_SUB_BATCH   = 500     # sub-batch page size for DB queries
 WEBSITE_AUDIT_NIGHTLY_SLEEP       = 0.5     # seconds between sub-batches (legacy; unused in concurrent path)
 WEBSITE_AUDIT_NIGHTLY_MAX_SECONDS = 21_600  # hard time ceiling: 6 hours
-WEBSITE_AUDIT_CONCURRENCY         = 25      # concurrent leads; overridable via admin_settings
+WEBSITE_AUDIT_CONCURRENCY         = 10      # concurrent leads; overridable via admin_settings
 WEBSITE_AUDIT_FETCH_CHUNK         = 2_000   # leads fetched per chunk; overridable via admin_settings key "website_audit_fetch_chunk"
 
 # PageSpeed nightly — keyed API, 25k/day free with key (2 calls/lead)
@@ -2338,13 +2338,11 @@ async def job_website_audit_nightly() -> dict:
             _rurl   = website if website.startswith(("http://", "https://")) else f"https://{website}"
             _parsed = urllib.parse.urlparse(_rurl)
             _host   = _parsed.netloc or _parsed.path.split("/")[0]
-            if not await wa_check_robots_allowed(_host, _rurl, robots_cache):
+            if not await asyncio.wait_for(wa_check_robots_allowed(_host, _rurl, robots_cache), timeout=6.0):
                 try:
-                    await asyncio.to_thread(
-                        db.table("leads").update({
-                            "last_audited_at": datetime.now(timezone.utc).isoformat(),
-                        }).eq("id", lead_id).execute
-                    )
+                    db.table("leads").update({
+                        "last_audited_at": datetime.now(timezone.utc).isoformat(),
+                    }).eq("id", lead_id).execute()
                 except Exception:
                     pass
                 async with lock:
@@ -2354,30 +2352,26 @@ async def job_website_audit_nightly() -> dict:
                 return
 
         try:
-            # Fix A: hard asyncio timeout so drip-feeding/hanging sites can't freeze the gather.
-            # asyncio.TimeoutError is a subclass of Exception — caught below, marks lead failed.
             html, final_url = await asyncio.wait_for(wa_fetch_html_free(website), timeout=35.0)
 
             if html is None:
-                # Fix B: synchronous .execute() moved to thread pool so it never blocks the
-                # event loop (blocking the loop delays httpx timeouts for other coroutines).
-                await asyncio.to_thread(
-                    db.table("leads").update({
-                        "is_parked":       True,
-                        "website_has_ssl": False,
-                        "last_audited_at": datetime.now(timezone.utc).isoformat(),
-                    }).eq("id", lead_id).execute
-                )
+                db.table("leads").update({
+                    "is_parked":       True,
+                    "website_has_ssl": False,
+                    "last_audited_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("id", lead_id).execute()
                 async with lock:
                     unreachable += 1
                     db_writes   += 1
             else:
-                signals = wa_parse_signals_full(html, final_url)
+                # CPU-bound: 24+ regex passes on arbitrary HTML — belongs in a thread, not the event loop.
+                signals = await asyncio.wait_for(
+                    asyncio.to_thread(wa_parse_signals_full, html, final_url),
+                    timeout=20.0,
+                )
                 safe_signals = {k: v for k, v in signals.items() if k in WA_FULL_AUDIT_COLUMNS}
                 safe_signals["last_audited_at"] = datetime.now(timezone.utc).isoformat()
-                await asyncio.to_thread(
-                    db.table("leads").update(safe_signals).eq("id", lead_id).execute
-                )
+                db.table("leads").update(safe_signals).eq("id", lead_id).execute()
                 async with lock:
                     audited   += 1
                     db_writes += 1
@@ -2385,11 +2379,9 @@ async def job_website_audit_nightly() -> dict:
         except Exception as e:
             logger.error(f"[{job_name}] Lead {lead_id} failed: {type(e).__name__}: {e}")
             try:
-                await asyncio.to_thread(
-                    db.table("leads").update({
-                        "last_audited_at": datetime.now(timezone.utc).isoformat(),
-                    }).eq("id", lead_id).execute
-                )
+                db.table("leads").update({
+                    "last_audited_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("id", lead_id).execute()
             except Exception:
                 pass
             async with lock:
