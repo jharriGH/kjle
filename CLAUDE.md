@@ -1,7 +1,7 @@
 # 🎯 KJLE — CLAUDE.md
 # Managed by brain_sync.py (Brain sections)
 # + Manual additions (never auto-updated)
-# Last synced: June 29, 2026 11:57 AM PST
+# Last synced: July 27, 2026 09:57 PM PST
 
 ---
 
@@ -200,12 +200,18 @@ Manual run: python brain_sync.py  (location: C:\Users\Jim\Documents\GitHub\)
   the file. One writer, no conflicts, always current.
 
 # ───────────────────────────────────────────────────────────
-# MANDATORY FOOTER — after every response
+# MANDATORY FOOTER — end EVERY response with this block
 # ───────────────────────────────────────────────────────────
-📊 [PROJECT] — [X]% complete | 📍 [PHASE] — [X]%
-🔄 EMPIRE IN FLIGHT
-| Session | Status | Jim Needed? |
-(populate from brain_search("active session") or known active sessions)
+📁 [PROJECT] · [TAG] · [DIR]
+🎯 Task: [TASK]
+📍 Now: [what you are doing this response]
+🕐 Started [STARTED]
+
+To fill PROJECT/TAG/DIR/STARTED: read the context file the cc launcher wrote at kickoff:
+  PowerShell: Get-Content "$env:TEMP\cc_context_<TAG>.txt"
+where <TAG> is your session tag (e.g. TEST-9). Lines: TAG=, TASK=, PROJECT=, DIR=, STARTED=.
+Use TASK for the Task line. Fill Now with your current action.
+If the file is not found, fall back to working directory + repo name; note "context file not found" once.
 
 # ───────────────────────────────────────────────────────────
 # TEMPLATE — UNIVERSAL SESSION ENDER (paste to a CC to close out)
@@ -221,11 +227,11 @@ Then give a plain-English summary of what we accomplished.
 
 ## CURRENT STATUS
 <!-- BRAIN-SYNC:START:STATUS -->
-*Brain sync: June 29, 2026 11:57 AM PST*
+*Brain sync: July 27, 2026 09:57 PM PST*
 
 **Status:** ACTIVE
 **Description:** Lead empire backend — 32/32 done, 28,849 leads ready
-**Next Action:** ⚡ KJLE Lead Finder UI audit COMPLETE - 10 of 10 surfaces certified (AVA Router, History, Help finished and verified live via Claude-in-Chrome this session). Non-blocking follow-ups only: optionally surface localStorage CSV exports in the EXPORTS tab; confirm Help render null-safety holds on API cold-start; AVA-to-Kokoro voice migration scoped and PARKED pending Jim (handoff doc ready for a dedicated AVA SC seat).
+**Next Action:** ⚡ Clarify project goals and context for kjle before resuming work.
 <!-- BRAIN-SYNC:END:STATUS -->
 
 ---
@@ -238,12 +244,12 @@ Then give a plain-English summary of what we accomplished.
 - Last decision: None
 
 **AI Costs:**
-- Today: $0.0049
-- This month: $0.0049
-- All time: $0.0049
+- Today: $0.0093
+- This month: $0.0093
+- All time: $0.0093
 
 **Empire:**
-- 2 live | 2 launch ready | 10 in progress
+- 4 live | 2 launch ready | 23 in progress
 <!-- BRAIN-SYNC:END:EMPIRE_STATE -->
 
 ---
@@ -264,34 +270,23 @@ Then give a plain-English summary of what we accomplished.
 
 ## BUILD STATE
 <!-- BRAIN-SYNC:START:BUILD_STATE -->
-**Card:** KJLE UI AUDIT BUILD_STATE 2026-06-27
-**Saved:** 2026-06-28
+**Card:** KJLE SESSION 2026-07-24
+**Saved:** 2026-07-24
 
-# KJLE UI AUDIT - BUILD STATE (2026-06-27)
+# KJLE Session Hand-off
+**Date:** 2026-07-24
+**Status:** completed
+**Session ID:** kjle_slice19_contact_hygiene_8c5a7793
 
-## STATUS: COMPLETE - 10 of 10 surfaces certified
+## Summary
+CC session 'kjle_slice19_contact_hygiene_8c5a7793' on kjle completed (rc=0, 575s). Prompt: MODEL: Run this task on SONNET, not Opus. (Standing cost rule.)
 
-### Certified (all 10)
-Find Leads, Campaign Push, Pipeline, Control, Cost Command Center, DNC Center, Admin Settings (prior 7) plus AVA Router, History, Help (this session).
+TASK: KJLE Slice 19 — add contact-data hygiene to the campaign-prep engine so cold-email batches never contain cross-contaminated or mismatched contact rows. A real 50-lead pull surfaced: the same email mapped to multiple different com
 
-### Fixes shipped + verified this session (all Lovable, 0 dollars)
-- History EXPORTS: was sourced from /csv/imports (50 import rows, no lead_count -> "Exported ? leads" + "Just now"). Repointed to server export-history. Verified: EXPORTS (3) demoenginez_push rows, real counts 5/1/2, real Apr 10 dates.
-- Help Scheduler article: corrected 7 jobs -> 13 with correct job names. Verified live.
-- Searchbug -> RealValidito rename across DNC Center + Cost Command Center. Verified: 0 Searchbug, 5 RealValidito.
-- Help render hardened against null-safety crash (TypeError reading section on cold-start). Watch-item, not a blocker.
-
-### AVA Router notes (fed to parked Kokoro handoff)
-- New Persona form: all 13 fields present, bindings clean.
-- voice dropdown = OpenAI TTS voices (alloy/echo/shimmer/ash/ballad/coral/sage/verse) -> AVA likely runs OpenAI TTS via Vapi today.
-- 5th sub-section "Voice URL Flip" exists - possible Kokoro migration lever.
-
-### Key gotcha (verify-before-trust)
-Inherited handoff claimed the History server source does not write a count. Live /export/history DID return count; real bug was the drawer sourcing /csv/imports. Caught by ground-truth curl.
-
-### Non-blocking follow-ups
-- Optionally also surface localStorage CSV exports in EXPORTS tab.
-- Confirm Help null-safety holds on API cold-start.
-- AVA-to-Kokoro voice migration: scoped, PARKED pending Jim. Handoff doc ready for a dedicated AVA SC seat.
+## Files Touched
+- api/worker_scheduler.py
+- api/routes/campaign_prep.py
+- api/routes/scheduler.py
 
 <!-- BRAIN-SYNC:END:BUILD_STATE -->
 
@@ -347,14 +342,5 @@ brain_save_card(
 
 ---
 
-*Synced: June 29, 2026 11:57 AM PST*
+*Synced: July 27, 2026 09:57 PM PST*
 *Refresh: `python brain_sync.py kjle`*
-
-<!-- KJE-ONBOARD-V1 -->
-## KJ Empire — SC Onboarding
-This repo belongs to the KJ Empire (DevelopingRiches Inc, owner Jim Harris / jharriGH).
-- Central repo: jharriGH/kjle. Brain: https://jim-brain-production.up.railway.app
-- New SC seats: run brain_status, brain_search this repo's slug, and verify live state before declaring anything done.
-- Decide-and-proceed. Cost-gate chargeable dispatches. Never echo secrets — pull keys from the Brain vault.
-- See ROADMAP.md for status.
-<!-- /KJE-ONBOARD-V1 -->
