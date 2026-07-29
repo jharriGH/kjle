@@ -1,7 +1,7 @@
 # 🎯 KJLE — CLAUDE.md
 # Managed by brain_sync.py (Brain sections)
 # + Manual additions (never auto-updated)
-# Last synced: July 27, 2026 09:57 PM PST
+# Last synced: July 28, 2026 08:25 PM PST
 
 ---
 
@@ -107,6 +107,79 @@ Report: unified diff + one-line summary
   cost recommendation. Fast AND safe — not fast INSTEAD of safe.
 
 # ───────────────────────────────────────────────────────────
+# 8. SC-TO-SC HANDOFF & CC REPORT PROTOCOL
+# ───────────────────────────────────────────────────────────
+Coordination between SCs (and reports from dispatched CCs) runs through Brain cards —
+no new endpoints, just brain_save_card / brain_get_cards addressed by project slug.
+
+HANDOFF (SC → SC). Format:
+  Title:   "HANDOFF → <recipient-slug>: <subject>"
+  project: <recipient-slug>                    (this is the addressing mechanism)
+  Content:
+    FROM: <sender-slug>
+    TO: <recipient-slug>
+    STATUS: open
+    PRIORITY: low | normal | high | urgent
+    CREATED: <date>
+    NEEDS-BY: <date, or "none">
+    REQUEST: <the ask>
+    REPLY: pending
+  Reply: recipient re-saves the SAME title (brain_save_card upserts by title — replaces,
+  does not duplicate) with REPLY filled in and STATUS: answered.
+
+REPORT (CC → SC). Format:
+  Title:   "REPORT → <project-slug>: <subject>"
+  project: <recipient SC's slug>
+  Content:
+    FROM: cc / <session-tag>
+    TYPE: report | diagnosis | deploy | test-result
+    STATUS: complete | blocked | needs-review
+    SUMMARY: <one-liner>
+    DETAILS: <diff / output / findings>
+    COMMIT: <hash or none>
+    NEXT: <what the SC must do, if any>
+  A dispatched CC writes its REPORT card BEFORE any long final step (so a watchdog reap
+  can't eat it) — write it EARLY, not as the last action.
+
+INBOX CHECK (every SC, every session — see SESSION START below):
+  After loading cards, scan for titles starting "HANDOFF →" or "REPORT →" addressed to
+  THIS project. If STATUS: open (handoffs) or present (reports), surface to Jim FIRST,
+  sorted by PRIORITY (urgent → low) then NEEDS-BY (soonest first):
+    "📬 [N] item(s) waiting:
+      🔴 [urgent] HANDOFF from [sender]: [subject] — needs by [date]
+      🟡 [normal] REPORT from CC [tag]: [subject]"
+  Flag any handoff whose NEEDS-BY is past/today as OVERDUE.
+
+ON DEMAND: Jim says "any handoffs?" / "check handoffs" → repeat the same read.
+
+TO SEND: Jim says "draft a handoff to [SC] for [X]" → ask PRIORITY + NEEDS-BY if not
+  stated (default PRIORITY normal, NEEDS-BY none), validate the recipient slug against
+  CANONICAL SLUGS below, write the card, READ IT BACK to confirm it landed (see
+  WRITE-CONFIRMATION below), then show Jim a ONE-LINE confirmation (not the full text).
+
+TO REPLY: Jim says "answer it" → fill REPLY, flip STATUS to answered, save (same title),
+  READ IT BACK to confirm REPLY/STATUS actually landed, then confirm to Jim.
+
+CANONICAL SLUGS — addressing is by exact slug; a wrong slug is an invisible message.
+  Before saving ANY handoff or report, validate the recipient against the live registry
+  (GET /projects). If the named recipient's slug isn't in the registry, DO NOT silently
+  save to a dead slug — flag it: "unknown recipient slug '<x>' — did you mean <closest
+  match>?" and wait for Jim to confirm. (kje-mcp is a known orphan: it has cards and an
+  MCP reference but is NOT a registered project slug — always flags.)
+
+WRITE-CONFIRMATION (read-back required, ALL critical writes — not just handoffs):
+  Never report a write successful unless a read-back proves it landed:
+    - After POST /cards → brain_get_cards(project), confirm the title is present.
+    - After PATCH /projects → confirm the field actually changed (GET /projects or
+      brain_get_project).
+    - After POST /memory → check the response shows {embedded:true} + an id; if a
+      card/next_action is the real source of truth for that fact, verify THAT instead
+      (memory search is recency-blind — never confirm a write via brain_search).
+  If read-back fails: say "⚠️ WRITE FAILED — [what] did not save, retrying once", retry
+  once. If still failing: "⚠️ WRITE STILL FAILING — likely brain MCP connection, flag to
+  Jim." Never mask a failed write as success.
+
+# ───────────────────────────────────────────────────────────
 # SESSION START — load context automatically (free, read-only)
 # ───────────────────────────────────────────────────────────
 On every new chat, load empire context (no permission needed — these are free reads):
@@ -115,6 +188,8 @@ On every new chat, load empire context (no permission needed — these are free 
 3. GET /projects
 4. GET /cards
 5. GET /logs?limit=10
+6. Scan step-4's cards for "HANDOFF →" (open) / "REPORT →" addressed to THIS project —
+   see section 8. Surface any BEFORE the ready-to-build confirmation, priority-sorted.
 Header for all REST calls: x-brain-key: jim-brain-kje-2026-kingjames
 Then confirm: "Jim Brain loaded. I can see [X] projects, [X] cards, and [X] memories.
 Ready to build. What are we working on?"
@@ -216,18 +291,29 @@ If the file is not found, fall back to working directory + repo name; note "cont
 # ───────────────────────────────────────────────────────────
 # TEMPLATE — UNIVERSAL SESSION ENDER (paste to a CC to close out)
 # ───────────────────────────────────────────────────────────
-Session complete. Do all three now and confirm each:
-1. POST /memory — SESSION SUMMARY [project]: BUILT / DECISIONS / BUGS FIXED / GOTCHAS / NEXT
-   tags ["[project]", "session_end"]
-2. PATCH /projects — next_action = [most important next task]  (match_by: id)
-3. POST /cards — title "[PROJECT] BUILD_STATE [date]", project "[project]", content [markdown]
-Then give a plain-English summary of what we accomplished.
+Session complete. Do all four now, IN THIS ORDER — read back and confirm EACH before
+moving to the next, and never report a write successful unless the read-back proves it:
+1. POST a REPORT card FIRST (before the slower steps below, so a watchdog reap can't eat
+   it): title "REPORT → [recipient-slug]: [subject]", project [recipient-slug], content
+   per the REPORT format in section 8. READ BACK: brain_get_cards([recipient-slug]),
+   confirm the title is present.
+2. POST /memory — SESSION SUMMARY [project]: BUILT / DECISIONS / BUGS FIXED / GOTCHAS / NEXT
+   tags ["[project]", "session_end"]. READ BACK: confirm the response shows
+   {embedded:true} + an id.
+3. PATCH /projects — next_action = [most important next task]  (match_by: id). READ BACK:
+   GET /projects or brain_get_project, confirm next_action actually changed.
+4. POST /cards — title "[PROJECT] BUILD_STATE [date]", project "[project]", content
+   [markdown]. READ BACK: brain_get_cards([project]), confirm the title is present.
+If any read-back fails: say "⚠️ WRITE FAILED — [what] did not save, retrying once", retry
+once; if still failing: "⚠️ WRITE STILL FAILING — likely brain MCP connection, flag to
+Jim." Then give a plain-English summary of what we accomplished — state "all writes
+verified landed" ONLY if every read-back above passed.
 
 ---
 
 ## CURRENT STATUS
 <!-- BRAIN-SYNC:START:STATUS -->
-*Brain sync: July 27, 2026 09:57 PM PST*
+*Brain sync: July 28, 2026 08:25 PM PST*
 
 **Status:** ACTIVE
 **Description:** Lead empire backend — 32/32 done, 28,849 leads ready
@@ -244,12 +330,12 @@ Then give a plain-English summary of what we accomplished.
 - Last decision: None
 
 **AI Costs:**
-- Today: $0.0093
-- This month: $0.0093
-- All time: $0.0093
+- Today: $0.0048
+- This month: $0.0048
+- All time: $0.0048
 
 **Empire:**
-- 4 live | 2 launch ready | 23 in progress
+- 4 live | 2 launch ready | 22 in progress
 <!-- BRAIN-SYNC:END:EMPIRE_STATE -->
 
 ---
@@ -342,5 +428,5 @@ brain_save_card(
 
 ---
 
-*Synced: July 27, 2026 09:57 PM PST*
+*Synced: July 28, 2026 08:25 PM PST*
 *Refresh: `python brain_sync.py kjle`*
