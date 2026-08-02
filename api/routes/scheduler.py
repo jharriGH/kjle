@@ -16,6 +16,7 @@ Call setup_scheduler() inside FastAPI lifespan (main.py).
 
 import asyncio
 import csv
+import gc
 from collections import deque
 import io
 import logging
@@ -91,7 +92,8 @@ WEBSITE_AUDIT_NIGHTLY_SUB_BATCH   = 500     # sub-batch page size for DB queries
 WEBSITE_AUDIT_NIGHTLY_SLEEP       = 0.5     # seconds between sub-batches (legacy; unused in concurrent path)
 WEBSITE_AUDIT_NIGHTLY_MAX_SECONDS = 21_600  # hard time ceiling: 6 hours
 WEBSITE_AUDIT_CONCURRENCY         = 10      # concurrent leads; overridable via admin_settings
-WEBSITE_AUDIT_FETCH_CHUNK         = 2_000   # leads fetched per chunk; overridable via admin_settings key "website_audit_fetch_chunk"
+WEBSITE_AUDIT_FETCH_CHUNK         = 500     # leads fetched per chunk; overridable via admin_settings key "website_audit_fetch_chunk"
+WEBSITE_AUDIT_RSS_LIMIT_MB        = 1_400   # RSS ceiling (MB) for safety valve; overridable via admin_settings key "website_audit_rss_limit_mb"
 
 # PageSpeed nightly — keyed API, 25k/day free with key (2 calls/lead)
 PAGESPEED_NIGHTLY_LIMIT       = 12_000  # leads per run (12k x 2 calls = 24k = real daily cap)
@@ -2269,14 +2271,16 @@ async def job_website_audit_nightly() -> dict:
     - Fetches in chunks of WEBSITE_AUDIT_FETCH_CHUNK (default 2000), overridable via
       admin_settings key 'website_audit_fetch_chunk'; no OFFSET pagination — the
       last_audited_at IS NULL predicate advances the cursor after each chunk
-    - Concurrent: asyncio.Semaphore(website_audit_concurrency, default 25) per chunk
+    - Concurrent: asyncio.Semaphore(website_audit_concurrency, default 10) per chunk
     - Reuses _fetch_html_free + _parse_signals_full from website_audit.py (single source)
     - Unreachable sites: is_parked=True, website_has_ssl=False, last_audited_at=now()
     - Failures: last_audited_at=now() written so the lead is not retried forever
     - Reachable sites: full ~22 signals + last_audited_at written (mirrors batch-free endpoint)
     - Hard time ceiling: stops cleanly after WEBSITE_AUDIT_NIGHTLY_MAX_SECONDS (default 6h)
     - _log_job() fires on EVERY exit path via try/finally — including CancelledError/SIGTERM
-    - Memory: peak RSS sampled after each chunk; logged in notes (peak_rss_mb, chunks_processed)
+    - Memory: peak RSS sampled after each chunk; safety valve breaks cleanly at
+      WEBSITE_AUDIT_RSS_LIMIT_MB (default 1400 MB, overridable via admin_settings
+      'website_audit_rss_limit_mb'); gc.collect() + del leads run after each chunk
     """
     job_name = "website_audit_nightly"
     logger.info(f"[{job_name}] Starting...")
@@ -2288,6 +2292,7 @@ async def job_website_audit_nightly() -> dict:
     max_seconds    = float(await _get_admin_setting("website_audit_nightly_max_seconds", WEBSITE_AUDIT_NIGHTLY_MAX_SECONDS))
     concurrency    = int(await _get_admin_setting("website_audit_concurrency", WEBSITE_AUDIT_CONCURRENCY))
     respect_robots = str(await _get_admin_setting("website_audit_respect_robots", WEBSITE_AUDIT_RESPECT_ROBOTS)).strip().lower() in ("true", "1", "yes", "on")
+    rss_limit_mb   = float(await _get_admin_setting("website_audit_rss_limit_mb", WEBSITE_AUDIT_RSS_LIMIT_MB))
     robots_cache: dict = {}
 
     db = get_db()
@@ -2465,6 +2470,19 @@ async def job_website_audit_nightly() -> dict:
                     f"but 0 DB writes (blank-website leads?) — breaking to avoid infinite loop"
                 )
                 break
+
+            # RSS safety valve: clean stop before OOM; job resumes next run via IS NULL predicate
+            if peak_rss_mb > rss_limit_mb:
+                logger.warning(
+                    f"[{job_name}] website_audit_rss_high: peak_rss_mb={peak_rss_mb:.1f} > "
+                    f"rss_limit_mb={rss_limit_mb:.0f} MB — stopping cleanly after chunk "
+                    f"{chunks_processed} (job resumes next run; IS NULL predicate advances)"
+                )
+                break
+
+            # Free chunk data before next iteration to prevent RSS accumulation across chunks
+            del leads
+            gc.collect()
 
     finally:
         duration = time.monotonic() - t_start
