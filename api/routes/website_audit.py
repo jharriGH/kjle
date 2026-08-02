@@ -285,6 +285,31 @@ async def _fetch_html_free(website: str) -> Tuple[Optional[str], Optional[str]]:
         return None, None
 
 
+async def _fetch_html_free_with_status(website: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+    """
+    Like _fetch_html_free but returns (html, final_url, status_code).
+    On 200: (html, final_url, 200).
+    On non-200 server response: (None, final_url, status_code) — server reached, error code preserved.
+    On exception (DNS/timeout/connection): (None, None, None) — genuinely unreachable.
+    _fetch_html_free is kept unchanged for scheduler.py / reverify.py callers (2-tuple contract).
+    """
+    url = website if website.startswith(("http://", "https://")) else f"https://{website}"
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=15.0, read=15.0, write=10.0, pool=5.0),
+            follow_redirects=True,
+        ) as client:
+            resp = await client.get(url, headers=_FREE_FETCH_HEADERS)
+            if resp.status_code != 200:
+                return None, str(resp.url), resp.status_code
+            return resp.text, str(resp.url), 200
+    except Exception as e:
+        logger.debug(
+            f"[website_audit_free] fetch failed for {url}: {type(e).__name__}: {e}"
+        )
+        return None, None, None
+
+
 # ── New signal detectors (pure -- no I/O) ────────────────────────────────────
 
 def _detect_ssl(url_final: str) -> bool:
@@ -577,6 +602,7 @@ _FULL_AUDIT_COLUMNS = frozenset({
     "website_has_privacy_policy", "website_has_terms", "website_has_cookie_consent",
     "website_outdated_tech", "website_missing_lang", "website_has_skip_link",
     "name_website_verified", "name_match_score",
+    "website_status_code",
     "last_audited_at",
 })
 
@@ -831,18 +857,21 @@ async def audit_batch_free(body: AuditBatchFreeRequest):
             unreachable += 1
             continue
 
-        html, final_url = await _fetch_html_free(website)
+        html, final_url, status_code = await _fetch_html_free_with_status(website)
 
         if html is None:
-            # Site unreachable -- mark parked, stamp audit time, leave other signals null
+            # Site unreachable or server returned non-200 -- mark parked, stamp audit time
+            # status_code=None means genuinely no response (exception); non-None = server error code
+            unreachable_update = {
+                "is_parked":       True,
+                "website_has_ssl": False,
+                "last_audited_at": datetime.now(timezone.utc).isoformat(),
+                "website_status_code": status_code,  # None for connection failure; 4xx/5xx for server errors
+            }
             try:
-                db.table("leads").update({
-                    "is_parked":       True,
-                    "website_has_ssl": False,
-                    "last_audited_at": datetime.now(timezone.utc).isoformat(),
-                }).eq("id", lead_id).execute()
+                db.table("leads").update(unreachable_update).eq("id", lead_id).execute()
                 unreachable += 1
-                results.append({"lead_id": lead_id, "status": "unreachable"})
+                results.append({"lead_id": lead_id, "status": "unreachable", "status_code": status_code})
             except Exception as e:
                 failed += 1
                 logger.error(f"[website_audit_free] DB write failed for {lead_id}: {e}")
@@ -865,6 +894,7 @@ async def audit_batch_free(body: AuditBatchFreeRequest):
         )
         signals["name_website_verified"] = nv
         signals["name_match_score"]      = nm_sc
+        signals["website_status_code"]   = status_code  # 200 on success path
 
         # Paranoia guard: only write columns in our known allow-list
         safe_signals = {k: v for k, v in signals.items() if k in _FULL_AUDIT_COLUMNS}
