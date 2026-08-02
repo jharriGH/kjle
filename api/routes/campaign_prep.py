@@ -71,7 +71,7 @@ CE_PURL_BASE = os.environ.get("CE_PURL_BASE", "https://scan.compliancemds.com/?d
 _ADA_COLS = (
     "id, business_name, email, phone, city, state, niche_slug, pain_score, "
     "website, accessibility_score, accessibility_violations, accessibility_critical, "
-    "accessibility_scanned_at"
+    "accessibility_scanned_at, name_website_verified"
 )
 _HARD_CAP = 2000
 _SUPP_CHUNK = 100   # email_suppressions batch size
@@ -336,6 +336,7 @@ class CampaignPrepRequest(BaseModel):
     dedupe_email: bool = True
     dedupe_domain: bool = True
     require_domain_match: bool = False
+    require_name_verified: bool = True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -497,6 +498,7 @@ def _enrich_attrs(lead: dict, ri_payload: dict, top_issues_map: dict) -> dict:
     attrs["topIssues"]          = top_issues_map.get(lead["id"]) or ""
     attrs["purlLink"]           = _purl_link(lead.get("website") or "")
     attrs["domainMatch"]        = lead.get("_domain_match", True)
+    attrs["nameVerified"]       = lead.get("name_website_verified")  # True/False/None
     return ri_payload
 
 
@@ -622,6 +624,33 @@ async def campaign_prep(body: CampaignPrepRequest):
         surviving, body.require_domain_match
     )
 
+    # ── Step 3.6: Name-website verification filter ────────────────────────────
+    # Exclude proven mismatches (name_website_verified = false).
+    # Keep verified (true) and unaudited (null) — never drop on absence of data.
+    name_verified_true    = 0
+    name_verified_null    = 0
+    name_mismatch_excluded = 0
+    if body.require_name_verified:
+        _nv_keep = []
+        for lead in surviving:
+            nv = lead.get("name_website_verified")
+            if nv is False:
+                name_mismatch_excluded += 1
+            else:
+                _nv_keep.append(lead)
+                if nv is True:
+                    name_verified_true += 1
+                else:
+                    name_verified_null += 1
+        surviving = _nv_keep
+    else:
+        for lead in surviving:
+            nv = lead.get("name_website_verified")
+            if nv is True:
+                name_verified_true += 1
+            elif nv is None:
+                name_verified_null += 1
+
     # Trim to requested limit (2x prefetch absorbed dedupe losses)
     surviving = surviving[:limit]
     final_count = len(surviving)
@@ -656,6 +685,9 @@ async def campaign_prep(body: CampaignPrepRequest):
         "deduped_domain":          deduped_domain,
         "domain_mismatch_flagged": domain_mismatch_flagged,
         "domain_mismatch_dropped": domain_mismatch_dropped,
+        "name_verified_true":      name_verified_true,
+        "name_verified_null":      name_verified_null,
+        "name_mismatch_excluded":  name_mismatch_excluded,
         "final_count":             final_count,
         "no_detail_count":         no_detail_count,
     }
@@ -668,7 +700,7 @@ async def campaign_prep(body: CampaignPrepRequest):
         csv_cols = [
             "lead_id", "companyName", "email", "website",
             "accessibility_score", "accessibility_violations", "accessibility_critical",
-            "topIssues", "purlLink", "domainMatch",
+            "topIssues", "purlLink", "domainMatch", "nameVerified",
         ]
         buf = io.StringIO()
         writer = csv.DictWriter(buf, fieldnames=csv_cols, lineterminator="\n")
@@ -686,6 +718,7 @@ async def campaign_prep(body: CampaignPrepRequest):
                 "topIssues":                attrs.get("topIssues") or "",
                 "purlLink":                 attrs.get("purlLink") or "",
                 "domainMatch":              attrs.get("domainMatch", True),
+                "nameVerified":             attrs.get("nameVerified"),
             })
         buf.seek(0)
         csv_str = buf.getvalue()

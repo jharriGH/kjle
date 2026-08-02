@@ -396,6 +396,84 @@ def _count_h1(html: str) -> int:
     return len(re.findall(r'<h1[\s>]', html, re.IGNORECASE))
 
 
+# ── Name-website verification ─────────────────────────────────────────────────
+
+_GENERIC_TOKENS = frozenset({
+    "roofing", "services", "service", "company", "co", "group", "inc",
+    "llc", "ltd", "the", "and", "of", "center", "clinic", "studio",
+    "shop", "store", "restaurant", "cafe", "salon", "spa",
+})
+
+# Domains where the business name won't appear in the hostname itself.
+_SITE_BUILDER_HOSTS = frozenset({
+    "ueniweb.com", "wixsite.com", "godaddysites.com", "business.site",
+    "squarespace.com", "weebly.com", "wordpress.com", "sonlet.com", "blogspot.com",
+})
+
+
+def _extract_title_text(html: str) -> str:
+    m = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return ""
+    text = re.sub(r'<[^>]+>', ' ', m.group(1))
+    return re.sub(r'\s+', ' ', text).strip().lower()
+
+
+def _extract_h1_text(html: str) -> str:
+    matches = re.findall(r'<h1[\s>](.*?)</h1>', html, re.IGNORECASE | re.DOTALL)
+    texts = []
+    for m in matches[:2]:
+        text = re.sub(r'<[^>]+>', ' ', m)
+        text = re.sub(r'\s+', ' ', text).strip().lower()
+        if text:
+            texts.append(text)
+    return " ".join(texts)
+
+
+def _is_platform_domain(domain: str) -> bool:
+    """True when domain is a site-builder/directory host — business name won't be in the hostname."""
+    d = re.sub(r'^https?://', '', domain.strip()).split('/')[0].lower()
+    d = re.sub(r'^www\.', '', d).split(':')[0]
+    for host in _SITE_BUILDER_HOSTS:
+        if d == host or d.endswith('.' + host):
+            return True
+    return len(d.split('.')) >= 3
+
+
+def _normalize_domain_for_match(domain: str) -> str:
+    """Strip scheme/www/TLD/hyphens from domain into a flat searchable string."""
+    d = re.sub(r'^https?://', '', domain.strip()).split('/')[0].lower()
+    d = re.sub(r'^www\.', '', d).split(':')[0]
+    parts = d.split('.')
+    if len(parts) > 1:
+        d = '.'.join(parts[:-1])
+    return re.sub(r'[-.]', ' ', d)
+
+
+def _verify_name_website(
+    business_name: str, title: str, h1: str, domain: str
+) -> tuple:
+    """
+    Return (verified: bool, score: float).
+    Score = fraction of distinctive business-name tokens found in title, H1, or
+    (non-platform) normalized domain. Returns (True, 0.5) when no distinctive
+    tokens remain — cannot disprove, so don't penalize.
+    """
+    bn = re.sub(r'[^\w\s]', ' ', business_name.lower())
+    tokens = [t for t in bn.split() if t not in _GENERIC_TOKENS and len(t) > 2]
+    if not tokens:
+        return (True, 0.5)
+
+    corpus_parts = [title, h1]
+    if not _is_platform_domain(domain):
+        corpus_parts.append(_normalize_domain_for_match(domain))
+    corpus = " ".join(corpus_parts)
+
+    found = sum(1 for t in tokens if t in corpus)
+    score = round(found / len(tokens), 3)
+    return (score >= 0.5, score)
+
+
 def _detect_noindex(html: str) -> bool:
     m = re.search(
         r'<meta[^>]+name=["\']robots["\'][^>]*content=["\']([^"\']*)["\']'
@@ -498,6 +576,7 @@ _FULL_AUDIT_COLUMNS = frozenset({
     "website_img_alt_missing", "has_phone_on_page", "has_address_on_page",
     "website_has_privacy_policy", "website_has_terms", "website_has_cookie_consent",
     "website_outdated_tech", "website_missing_lang", "website_has_skip_link",
+    "name_website_verified", "name_match_score",
     "last_audited_at",
 })
 
@@ -722,7 +801,7 @@ async def audit_batch_free(body: AuditBatchFreeRequest):
     if body.lead_ids:
         leads = (
             db.table("leads")
-            .select("id, website")
+            .select("id, website, business_name")
             .in_("id", body.lead_ids)
             .not_.is_("website", "null")
             .execute()
@@ -730,7 +809,7 @@ async def audit_batch_free(body: AuditBatchFreeRequest):
     else:
         leads = (
             db.table("leads")
-            .select("id, website")
+            .select("id, website, business_name")
             .eq("is_active", True)
             .not_.is_("website", "null")
             .is_("last_audited_at", "null")
@@ -775,6 +854,17 @@ async def audit_batch_free(body: AuditBatchFreeRequest):
             continue
 
         signals = _parse_signals_full(html, final_url)
+
+        # Name-website verification — zero new fetches, reuses already-fetched HTML
+        biz_name  = (lead.get("business_name") or "").strip()
+        nv, nm_sc = _verify_name_website(
+            biz_name,
+            _extract_title_text(html),
+            _extract_h1_text(html),
+            final_url,
+        )
+        signals["name_website_verified"] = nv
+        signals["name_match_score"]      = nm_sc
 
         # Paranoia guard: only write columns in our known allow-list
         safe_signals = {k: v for k, v in signals.items() if k in _FULL_AUDIT_COLUMNS}
