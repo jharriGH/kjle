@@ -52,6 +52,9 @@ from .website_audit import (
     _FULL_AUDIT_COLUMNS as WA_FULL_AUDIT_COLUMNS,
     WEBSITE_AUDIT_RESPECT_ROBOTS,
     _check_robots_allowed as wa_check_robots_allowed,
+    _verify_name_website as wa_verify_name_website,
+    _extract_title_text as wa_extract_title_text,
+    _extract_h1_text as wa_extract_h1_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -2374,6 +2377,16 @@ async def job_website_audit_nightly() -> dict:
                     asyncio.to_thread(wa_parse_signals_full, html, final_url),
                     timeout=20.0,
                 )
+                # Name-website verification — zero new fetches, reuses already-fetched HTML
+                biz_name  = (lead.get("business_name") or "").strip()
+                nv, nm_sc = wa_verify_name_website(
+                    biz_name,
+                    wa_extract_title_text(html),
+                    wa_extract_h1_text(html),
+                    final_url,
+                )
+                signals["name_website_verified"] = nv
+                signals["name_match_score"]      = nm_sc
                 safe_signals = {k: v for k, v in signals.items() if k in WA_FULL_AUDIT_COLUMNS}
                 safe_signals["last_audited_at"] = datetime.now(timezone.utc).isoformat()
                 db.table("leads").update(safe_signals).eq("id", lead_id).execute()
@@ -2414,7 +2427,7 @@ async def job_website_audit_nightly() -> dict:
             try:
                 leads = (
                     db.table("leads")
-                    .select("id, website")
+                    .select("id, website, business_name")
                     .eq("is_active", True)
                     .not_.is_("website", "null")
                     .is_("last_audited_at", "null")
