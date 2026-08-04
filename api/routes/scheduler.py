@@ -48,6 +48,7 @@ from .enrichment_email_clean import (
 )
 from .website_audit import (
     _fetch_html_free as wa_fetch_html_free,
+    _fetch_html_free_with_status as wa_fetch_html_free_with_status,
     _parse_signals_full as wa_parse_signals_full,
     _FULL_AUDIT_COLUMNS as WA_FULL_AUDIT_COLUMNS,
     WEBSITE_AUDIT_RESPECT_ROBOTS,
@@ -2360,13 +2361,14 @@ async def job_website_audit_nightly() -> dict:
                 return
 
         try:
-            html, final_url = await asyncio.wait_for(wa_fetch_html_free(website), timeout=35.0)
+            html, final_url, status_code = await asyncio.wait_for(wa_fetch_html_free_with_status(website), timeout=35.0)
 
             if html is None:
                 db.table("leads").update({
-                    "is_parked":       True,
-                    "website_has_ssl": False,
-                    "last_audited_at": datetime.now(timezone.utc).isoformat(),
+                    "is_parked":          True,
+                    "website_has_ssl":    False,
+                    "last_audited_at":    datetime.now(timezone.utc).isoformat(),
+                    "website_status_code": status_code,  # None for connection failure; 4xx/5xx for server errors
                 }).eq("id", lead_id).execute()
                 async with lock:
                     unreachable += 1
@@ -2387,6 +2389,7 @@ async def job_website_audit_nightly() -> dict:
                 )
                 signals["name_website_verified"] = nv
                 signals["name_match_score"]      = nm_sc
+                signals["website_status_code"]   = status_code  # 200 on success path
                 safe_signals = {k: v for k, v in signals.items() if k in WA_FULL_AUDIT_COLUMNS}
                 safe_signals["last_audited_at"] = datetime.now(timezone.utc).isoformat()
                 db.table("leads").update(safe_signals).eq("id", lead_id).execute()
