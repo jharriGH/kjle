@@ -424,9 +424,40 @@ def _count_h1(html: str) -> int:
 # ── Name-website verification ─────────────────────────────────────────────────
 
 _GENERIC_TOKENS = frozenset({
-    "roofing", "services", "service", "company", "co", "group", "inc",
-    "llc", "ltd", "the", "and", "of", "center", "clinic", "studio",
-    "shop", "store", "restaurant", "cafe", "salon", "spa",
+    # Corporate / legal suffixes
+    "co", "inc", "llc", "ltd", "corp", "company", "companies", "group",
+    # Prepositions / articles
+    "the", "and", "of", "for",
+    # Roofing trade
+    "roofing", "roof", "roofer", "roofers",
+    # Plumbing
+    "plumbing", "plumber", "plumbers",
+    # HVAC
+    "hvac", "heating", "cooling", "air",
+    # Electrical
+    "electric", "electrical", "electrician",
+    # Landscaping / tree
+    "landscaping", "landscape", "lawn", "tree",
+    # Painting
+    "painting", "painter", "painters",
+    # Concrete / construction / contracting
+    "concrete", "construction", "contractor", "contractors", "contracting",
+    # Remodel / restoration / cleaning
+    "remodeling", "remodel", "restoration", "cleaning", "cleaners",
+    # Pool / spa / wellness
+    "pools", "pool", "spa",
+    # Medical / dental
+    "dental", "dentist", "medical", "clinic", "chiropractic",
+    # Personal-care / automotive / repair
+    "salon", "barber", "auto", "automotive", "repair",
+    # Venue / retail
+    "center", "studio", "shop", "store", "restaurant", "cafe",
+    # Service / solution descriptors
+    "services", "service", "solutions", "systems",
+    # Common filler adjectives / descriptors that appear in many names within a sector
+    "pro", "premium", "best", "quality", "elite",
+    "expert", "experts", "professional", "professionals",
+    "national", "american", "america", "usa", "local",
 })
 
 # Domains where the business name won't appear in the hostname itself.
@@ -475,26 +506,99 @@ def _normalize_domain_for_match(domain: str) -> str:
     return re.sub(r'[-.]', ' ', d)
 
 
+def _remainder_explained(s: str, token_set: set, generic: frozenset) -> bool:
+    """Greedy left-to-right: every char of s must be covered by a known token or generic word."""
+    if not s:
+        return True
+    all_known = sorted(token_set | generic, key=len, reverse=True)
+    i = 0
+    while i < len(s):
+        matched = False
+        for word in all_known:
+            wl = len(word)
+            if s[i : i + wl] == word:
+                i += wl
+                matched = True
+                break
+        if not matched:
+            return False
+    return True
+
+
+def _domain_has_token(token: str, domain_core: str, token_set: set, generic: frozenset) -> bool:
+    """
+    True if token appears in domain_core AND the remainder of the domain string is
+    fully explained by other known tokens + generic words.
+    Prevents "modern" from matching "moderndb" (remainder "db" is unexplained),
+    while still allowing "fortuna" to match "fortunaroofing" (remainder "roofing" is generic).
+    """
+    idx = domain_core.find(token)
+    while idx != -1:
+        before = domain_core[:idx]
+        after = domain_core[idx + len(token):]
+        remainder = before + after
+        if _remainder_explained(remainder, token_set - {token}, generic):
+            return True
+        idx = domain_core.find(token, idx + 1)
+    return False
+
+
 def _verify_name_website(
     business_name: str, title: str, h1: str, domain: str
 ) -> tuple:
     """
     Return (verified: bool, score: float).
     Score = fraction of distinctive business-name tokens found in title, H1, or
-    (non-platform) normalized domain. Returns (True, 0.5) when no distinctive
-    tokens remain — cannot disprove, so don't penalize.
+    (non-platform) domain. Uses whole-word corpus matching plus a compound-domain
+    check that requires the non-token remainder to be fully explained by generic
+    words, preventing partial-word false positives like "modern" inside "moderndb".
     """
     bn = re.sub(r'[^\w\s]', ' ', business_name.lower())
     tokens = [t for t in bn.split() if t not in _GENERIC_TOKENS and len(t) > 2]
-    if not tokens:
-        return (True, 0.5)
 
+    # Build the corpus word-set and raw concatenated domain core.
     corpus_parts = [title, h1]
+    domain_core = ""
     if not _is_platform_domain(domain):
         corpus_parts.append(_normalize_domain_for_match(domain))
-    corpus = " ".join(corpus_parts)
+        d = re.sub(r'^https?://', '', domain.strip()).split('/')[0].lower()
+        d = re.sub(r'^www\.', '', d).split(':')[0]
+        d_parts = d.split('.')
+        if len(d_parts) > 1:
+            d = '.'.join(d_parts[:-1])
+        domain_core = re.sub(r'[-.]', '', d)
 
-    found = sum(1 for t in tokens if t in corpus)
+    corpus_text = " ".join(corpus_parts)
+    corpus_words = set(re.split(r'[^a-z0-9]+', corpus_text.lower()))
+    corpus_words.discard("")
+
+    if not tokens:
+        # All name words were generic/short — cannot disprove a mismatch.
+        # Check whether domain gives ANY evidence for the name. If none of the
+        # name words (even the stripped generic ones) appear in the domain, the
+        # domain most likely belongs to a different business.
+        if domain_core:
+            all_name_words = [t for t in bn.split() if len(t) > 2]
+            for word in all_name_words:
+                if word in corpus_words:
+                    return (True, 0.5)
+                if len(word) >= 4 and _domain_has_token(word, domain_core, set(), _GENERIC_TOKENS):
+                    return (True, 0.5)
+            return (False, 0.3)
+        return (True, 0.5)
+
+    token_set = set(tokens)
+
+    def _token_found(t: str) -> bool:
+        # Whole-word match in corpus (covers title, H1, hyphenated-domain word splits).
+        if t in corpus_words:
+            return True
+        # Compound domain match: token in raw domain with explained remainder.
+        if domain_core and len(t) >= 4:
+            return _domain_has_token(t, domain_core, token_set, _GENERIC_TOKENS)
+        return False
+
+    found = sum(1 for t in tokens if _token_found(t))
     score = round(found / len(tokens), 3)
     return (score >= 0.5, score)
 
