@@ -8,7 +8,7 @@ import logging
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List
-from fastapi import APIRouter, HTTPException, Header, Query
+from fastapi import APIRouter, HTTPException, Header, Query, Request
 from pydantic import BaseModel
 from supabase import create_client, Client
 
@@ -204,8 +204,15 @@ _DNC_STATUS_BLOCKED = (
 )
 
 
+_ELIGIBLE_KNOWN_PARAMS = frozenset({
+    "vertical", "niche", "segment_id", "pain_min", "limit", "offset",
+    "require_email_valid", "require_name_verified", "audited_after",
+})
+
+
 @router.get("/leads/eligible-for-campaign")
 async def eligible_for_campaign(
+    request: Request,
     vertical: Optional[str] = Query(None, description="Vertical (alias for niche)"),
     niche: Optional[str] = Query(None, description="niche_slug filter; takes precedence over `vertical`"),
     segment_id: Optional[str] = Query(None, description="Saved segment id; applies its stored filters and passes through"),
@@ -213,12 +220,19 @@ async def eligible_for_campaign(
     limit: int = Query(500, ge=1, le=2000),
     offset: int = Query(0, ge=0),
     require_email_valid: bool = Query(True, description="When true, restrict to email_status='valid' + email_valid=true"),
+    require_name_verified: bool = Query(False, description="When true, restrict to name_website_verified=true (excludes false and null)"),
+    audited_after: Optional[str] = Query(None, description="ISO timestamp; restrict to last_audited_at > this value. Unrecognized query params are reported in skipped_filters."),
     x_api_key: str = Header(...),
 ):
     verify_api_key(x_api_key)
     supabase = get_supabase()
 
     skipped_filters: List[str] = []
+
+    # GAP 3 — surface unrecognized query params so callers know their filter was ignored
+    for _qk in request.query_params:
+        if _qk not in _ELIGIBLE_KNOWN_PARAMS:
+            skipped_filters.append(f"unrecognized:{_qk}")
 
     # ── segment_id passthrough — apply stored filters when available ───────
     seg_niche: Optional[str] = None
@@ -252,7 +266,8 @@ async def eligible_for_campaign(
     effective_pain_min = pain_min if pain_min is not None else seg_pain_min
 
     # ── targeting + base query ─────────────────────────────────────────────
-    select_cols = "id, business_name, email, phone, niche_slug, pain_score, dnc_status"
+    # GAP 1 — include website + audit fields so BizReply can build demos and gate on verification
+    select_cols = "id, business_name, email, phone, niche_slug, pain_score, dnc_status, website, name_website_verified, name_match_score, last_audited_at, website_word_count, city, state, website_reachable"
     query = supabase.table("leads").select(select_cols).eq("is_active", True)
     count_query = supabase.table("leads").select("id", count="estimated").eq("is_active", True)
 
@@ -280,6 +295,19 @@ async def eligible_for_campaign(
     dnc_or = f"dnc_status.is.null,dnc_status.not.in.({blocked_csv})"
     query = query.or_(dnc_or)
     count_query = count_query.or_(dnc_or)
+
+    # GAP 2 — name verification + audit recency filters (optional; default=off, backward-compat)
+    if require_name_verified:
+        query = query.eq("name_website_verified", True)
+        count_query = count_query.eq("name_website_verified", True)
+
+    if audited_after is not None:
+        try:
+            datetime.fromisoformat(audited_after.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="audited_after must be an ISO timestamp")
+        query = query.gt("last_audited_at", audited_after)
+        count_query = count_query.gt("last_audited_at", audited_after)
 
     # ── reattach-cooldown exclusion ────────────────────────────────────────
     # Exclude leads attached to a campaign within the cooldown window
@@ -405,6 +433,15 @@ async def eligible_for_campaign(
             "niche": r.get("niche_slug"),
             "pain_score": r.get("pain_score"),
             "dnc_status": r.get("dnc_status"),
+            # GAP 1 additions — website + audit fields for BizReply
+            "website": r.get("website"),
+            "name_website_verified": r.get("name_website_verified"),
+            "name_match_score": r.get("name_match_score"),
+            "last_audited_at": r.get("last_audited_at"),
+            "website_word_count": r.get("website_word_count"),
+            "city": r.get("city"),
+            "state": r.get("state"),
+            "website_reachable": r.get("website_reachable"),
         }
         for r in rows
     ]
