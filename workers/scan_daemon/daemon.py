@@ -38,6 +38,44 @@ from supabase import create_client, Client
 
 from url_guard import is_url_safe, check_redirect_chain, UNREACHABLE_REASONS
 
+# ── Stealth browser constants (headless-detection hardening) ─────────────────
+# Desktop Windows Chrome UA — avoids "HeadlessChrome" / "Linux" UA signals that
+# Wordfence and Cloudflare use to identify headless scanners.
+_STEALTH_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+# Headers a real Chrome desktop sends; absence of these is a headless tell.
+_STEALTH_HEADERS = {
+    "Accept-Language": "en-US,en;q=0.9",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Upgrade-Insecure-Requests": "1",
+}
+# IIFE executed before any page JS: masks navigator.webdriver and other
+# headless tells that Wordfence/bot-detection scripts check.
+_STEALTH_INIT = """(() => {
+    Object.defineProperty(navigator, 'webdriver', {get: () => undefined, configurable: true});
+    Object.defineProperty(navigator, 'plugins', {
+        get: () => {
+            const a = [
+                {name:'Chrome PDF Plugin',filename:'internal-pdf-viewer',description:'Portable Document Format'},
+                {name:'Chrome PDF Viewer',filename:'mhjfbmdgcfjbbpaeojofohoefgiehjai',description:''},
+                {name:'Native Client',filename:'internal-nacl-plugin',description:''},
+            ];
+            a.__proto__ = PluginArray.prototype;
+            return a;
+        },
+        configurable: true,
+    });
+    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en'], configurable: true});
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+})();"""
+
 # ── Configuration ────────────────────────────────────────────────────────────
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
@@ -217,6 +255,10 @@ def _scan_url(url: str, axe_js: str) -> dict:
             safe, reason = _ssrf_cache[key]
             if safe:
                 route.continue_()
+            elif reason in UNREACHABLE_REASONS:
+                # Dead/unreachable domain (dns_resolution_failed) — NOT an SSRF threat.
+                # Let the browser handle it naturally; killing the scan is wrong here.
+                route.continue_()
             else:
                 _blocked[0] = reason
                 route.abort("blockedbyclient")
@@ -241,6 +283,10 @@ def _scan_url(url: str, axe_js: str) -> dict:
                 _ssrf_cache[key] = is_url_safe(req_url)
             safe, reason = _ssrf_cache[key]
             if not safe:
+                # Dead/unreachable domains (dns_resolution_failed) are not SSRF
+                # threats — skip close-page so a dead analytics pixel doesn't kill the scan.
+                if reason in UNREACHABLE_REASONS:
+                    return
                 _blocked[0] = reason
                 page = _page_ref[0]
                 if page is not None:
@@ -263,12 +309,12 @@ def _scan_url(url: str, axe_js: str) -> dict:
             try:
                 ctx = browser.new_context(
                     viewport={"width": 1280, "height": 800},
-                    user_agent=(
-                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                    ),
+                    user_agent=_STEALTH_UA,
                     java_script_enabled=True,
+                    extra_http_headers=_STEALTH_HEADERS,
                 )
+                # Mask navigator.webdriver and other headless tells before any page JS runs.
+                ctx.add_init_script(_STEALTH_INIT)
                 ctx.route("**/*", _route_handler)
                 page = ctx.new_page()
                 _page_ref[0] = page
