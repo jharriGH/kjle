@@ -6,12 +6,18 @@ GET  /kjle/v1/leads/search       — full-text search
 PATCH /kjle/v1/leads/{id}        — update lead fields
 DELETE /kjle/v1/leads/{id}       — soft delete (sets is_active=false)
 """
+import logging
 import os
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
 from typing import List, Optional
 from ..database import get_db
+
+_logger = logging.getLogger(__name__)
+# Safe cap for NOT IN suppression list; above this we fall back to post-page filtering
+# (which leaves `total` approximate) and log a warning.
+_SUPPRESS_CAP = 10_000
 
 router = APIRouter()
 
@@ -148,6 +154,7 @@ async def list_leads(
     g_maps_claimed:    Optional[str]   = Query(None, description="claimed | unclaimed"),
     source:            Optional[str]   = Query(None, description="Filter by ingest source (e.g. local_scraper, csv)"),
     is_active:          bool           = Query(True),
+    exclude_email_suppressed: bool   = Query(False, description="When true, exclude leads whose email is in the email_suppressions opt-out list. Use for auto-email campaign pulls to stay compliant-by-default."),
     page:           int             = Query(1, ge=1),
     page_size:      int             = Query(50, ge=1, le=500),
     order_by:       str             = Query("pain_score", description="Column to sort by"),
@@ -155,6 +162,33 @@ async def list_leads(
 ):
     db = get_db()
     offset = (page - 1) * page_size
+
+    # ── Email suppression pre-fetch ───────────────────────────────────────────
+    # Option A: load suppressed email set once, apply as NOT IN on BOTH the main
+    # query AND count_query so `total` stays correct and pagination is exact.
+    # Case-sensitivity note: email_suppressions stores normalized lowercase emails;
+    # leads.email may have mixed case (uncommon for validated leads). Mixed-case
+    # variants won't be excluded — document limitation, no schema change available.
+    # Cap: if list > _SUPPRESS_CAP, skip NOT IN (query URL too large), post-filter
+    # the result page instead (total becomes approximate, logged as warning).
+    suppressed_list: list = []
+    suppressed_set: set = set()
+    suppress_overflow = False
+    if exclude_email_suppressed:
+        try:
+            sup_res = db.table("email_suppressions").select("email").execute()
+            suppressed_set = {row["email"] for row in sup_res.data if row.get("email")}
+            if len(suppressed_set) > _SUPPRESS_CAP:
+                suppress_overflow = True
+                _logger.warning(
+                    "email_suppressions count %d exceeds cap %d; NOT IN filter skipped — "
+                    "`total` will not exclude suppressed emails (post-page filter still applied)",
+                    len(suppressed_set), _SUPPRESS_CAP,
+                )
+            else:
+                suppressed_list = list(suppressed_set)
+        except Exception as exc:
+            _logger.warning("email_suppressions fetch failed: %s — suppression filter skipped", exc)
 
     query = db.table("leads").select(
         "id, business_name, phone, email, website, city, state, niche_slug, "
@@ -284,6 +318,11 @@ async def list_leads(
         query = _apply_dynamic_filters(query, filters)
         count_query = _apply_dynamic_filters(count_query, filters)
 
+    # Email suppression NOT IN (applied to both queries when list is under cap)
+    if suppressed_list:
+        query = query.not_.in_("email", suppressed_list)
+        count_query = count_query.not_.in_("email", suppressed_list)
+
     # Get total count (estimated — avoids full-table scan timeout on 1.5M-row table)
     try:
         count_result = count_query.execute()
@@ -296,13 +335,21 @@ async def list_leads(
     query = query.range(offset, offset + page_size - 1)
 
     result = query.execute()
+    leads_data = result.data
+
+    # Overflow fallback: post-filter the page when suppressed_set exceeded NOT IN cap
+    if suppress_overflow and suppressed_set:
+        leads_data = [
+            r for r in leads_data
+            if (r.get("email") or "").strip().lower() not in suppressed_set
+        ]
 
     return {
         "page":      page,
         "page_size": page_size,
         "total":     total,
-        "count":     len(result.data),
-        "leads":     result.data,
+        "count":     len(leads_data),
+        "leads":     leads_data,
     }
 
 
