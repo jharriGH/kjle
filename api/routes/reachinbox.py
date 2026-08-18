@@ -113,8 +113,12 @@ class CreateCampaignRequest(BaseModel):
     # Email accounts to use (list of account IDs)
     account_ids: List[int] = []
 
-    # Lead filters — pulls from KJLE automatically
-    lead_filter: CampaignLeadFilter
+    # Lead source — exactly one of these must be provided.
+    # lead_ids: explicit list of KJLE lead UUIDs (push path, e.g. ReviewBombz).
+    # lead_filter: segment filter — KJLE pulls the list itself (pull path, existing callers).
+    # If lead_ids is provided and non-empty it takes precedence; lead_filter is ignored.
+    lead_ids:    Optional[List[str]]          = None
+    lead_filter: Optional[CampaignLeadFilter] = None
 
     # Auto-launch after creation
     auto_launch: bool = False
@@ -233,6 +237,67 @@ def fetch_kjle_leads(filters: CampaignLeadFilter) -> list:
         rows = [r for r in rows if (r.get("email") or "").strip().lower() not in suppressed]
         logger.info(f"reachinbox: suppression scrub removed {before - len(rows)} of {before} leads")
     return rows
+
+LEAD_IDS_CAP = 1000
+
+
+def fetch_leads_by_ids(lead_ids: List[str]) -> tuple:
+    """Fetch exact leads by UUID, applying the same suppression + valid-email
+    guards as fetch_kjle_leads.
+
+    Returns (valid_leads, skipped) where skipped is a list of
+    {lead_id, reason: "not_found_or_inactive"|"no_valid_email"|"email_suppressed"}.
+    Compliance-critical: callers (e.g. ReviewBombz) must NOT bypass suppression.
+    """
+    db = get_db()
+
+    result = (
+        db.table("leads")
+        .select("id, business_name, email, phone, city, state, niche_slug, pain_score, email_valid")
+        .in_("id", lead_ids)
+        .eq("is_active", True)
+        .execute()
+    )
+    rows = result.data or []
+
+    fetched_ids = {r["id"] for r in rows}
+    skipped: list = []
+
+    for lid in lead_ids:
+        if lid not in fetched_ids:
+            skipped.append({"lead_id": lid, "reason": "not_found_or_inactive"})
+
+    valid = []
+    for r in rows:
+        if not r.get("email") or not r.get("email_valid"):
+            skipped.append({"lead_id": r["id"], "reason": "no_valid_email"})
+        else:
+            valid.append(r)
+
+    if valid:
+        emails = sorted({(r.get("email") or "").strip().lower() for r in valid if r.get("email")})
+        suppressed: set = set()
+        for i in range(0, len(emails), 100):
+            chunk = emails[i:i+100]
+            try:
+                sup = db.table("email_suppressions").select("email").in_("email", chunk).execute().data or []
+                suppressed.update((s.get("email") or "").lower() for s in sup)
+            except Exception as e:
+                logger.warning(f"reachinbox: email_suppressions scrub failed for chunk: {e}")
+        still_valid = []
+        for r in valid:
+            if (r.get("email") or "").strip().lower() in suppressed:
+                skipped.append({"lead_id": r["id"], "reason": "email_suppressed"})
+            else:
+                still_valid.append(r)
+        valid = still_valid
+
+    logger.info(
+        f"reachinbox.fetch_leads_by_ids: requested={len(lead_ids)} "
+        f"fetched={len(rows)} valid={len(valid)} skipped={len(skipped)}"
+    )
+    return valid, skipped
+
 
 def map_lead_to_ri(lead: dict) -> dict:
     """Map KJLE lead to ReachInbox lead format.
@@ -389,14 +454,39 @@ async def create_full_campaign(body: CreateCampaignRequest):
     steps_completed = []
     campaign_id     = None
 
+    # ── At-least-one-of validation ────────────────────────────────────────────
+    has_ids    = bool(body.lead_ids)
+    has_filter = body.lead_filter is not None
+    if not has_ids and not has_filter:
+        raise HTTPException(
+            status_code=400,
+            detail="provide lead_ids (push path) or lead_filter (pull path) — both cannot be empty",
+        )
+    if has_ids and len(body.lead_ids) > LEAD_IDS_CAP:
+        raise HTTPException(
+            status_code=400,
+            detail=f"lead_ids cap is {LEAD_IDS_CAP}; got {len(body.lead_ids)}",
+        )
+
     # ── Pre-flight P1: Fetch leads BEFORE any RI call ─────────────────────────
     # Prior shape created the campaign first, then queried leads — when the
     # 596K-row leads table hit Postgres statement_timeout 57014, the RI
     # campaign was already created and the request returned an error,
     # leaving an orphan draft. Fetching first lets us 400 before any write.
-    kjle_leads = fetch_kjle_leads(body.lead_filter)
-    if not kjle_leads:
-        raise HTTPException(status_code=400, detail="no_eligible_leads_match_filter")
+    skipped_leads: List[dict] = []
+    if has_ids:
+        # Push path: caller supplies exact lead UUIDs. Suppression still applied.
+        kjle_leads, skipped_leads = fetch_leads_by_ids(body.lead_ids)
+        if not kjle_leads:
+            raise HTTPException(
+                status_code=400,
+                detail="no_eligible_leads_after_suppression_check",
+            )
+    else:
+        # Pull path: unchanged — KJLE filters the segment itself.
+        kjle_leads = fetch_kjle_leads(body.lead_filter)
+        if not kjle_leads:
+            raise HTTPException(status_code=400, detail="no_eligible_leads_match_filter")
 
     # ── Pre-flight P2: Translate account_ids → emails (Bug 1) ─────────────────
     # RI /campaigns/set-accounts "emails" field expects email-address strings,
@@ -636,7 +726,7 @@ async def create_full_campaign(body: CreateCampaignRequest):
         await _auto_register_from_ri_create(
             ri_campaign_id = str(campaign_id),
             campaign_name  = body.name,
-            niche          = body.lead_filter.niche_slug,
+            niche          = body.lead_filter.niche_slug if body.lead_filter else None,
             domain_used    = body.domain_used,
             offer_type     = body.offer_type,
             leads_count    = leads_added,
@@ -660,7 +750,7 @@ async def create_full_campaign(body: CreateCampaignRequest):
                     "reachinbox_campaign_id": str(campaign_id),
                     "email":                  lead_by_id.get(lid, {}).get("email"),
                     "phone":                  lead_by_id.get(lid, {}).get("phone"),
-                    "vertical":               body.lead_filter.niche_slug,
+                    "vertical":               body.lead_filter.niche_slug if body.lead_filter else None,
                     "campaign_name":          body.name,
                     "project":                "kjle",
                     "kje_product":            None,
@@ -682,11 +772,14 @@ async def create_full_campaign(body: CreateCampaignRequest):
         "campaign_name":   body.name,
         "steps_completed": steps_completed,
         "summary": {
-            "leads_added":      leads_added,
-            "sequences":        len(body.sequences),
+            "leads_added":       leads_added,
+            "leads_skipped":     len(skipped_leads),
+            "sequences":         len(body.sequences),
             "accounts_assigned": len(account_emails),
-            "auto_launched":    body.auto_launch,
+            "auto_launched":     body.auto_launch,
+            "lead_source":       "push" if has_ids else "pull",
         },
+        "skipped": skipped_leads,
     }
 
 
