@@ -52,7 +52,7 @@ import asyncio
 import io
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -318,6 +318,59 @@ def select_uncleaned_leads(db, limit: int) -> list[dict]:
     return out[:limit]
 
 
+def select_revalidation_leads(db, limit: int, min_age_days: int = 90) -> list[dict]:
+    """
+    Pull up to `limit` unknown-status leads for re-validation.
+
+    Predicate: is_active=True, email present, email_truelist_batch_id IS NULL
+    (not currently in-flight), email_status='unknown', AND
+    email_cleaned_at < now() - min_age_days.
+
+    The min_age_days cooldown prevents infinite nightly loops: ingest_batch_result
+    re-stamps email_cleaned_at on every result write (lines ~499-508), so a lead
+    that stays 'unknown' after re-check won't re-qualify for ~90 more days.
+
+    Order: email_cleaned_at ASC (oldest re-checks first — drain backlog front-to-back).
+    Invalid leads (email_status='invalid') are intentionally excluded.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=min_age_days)).isoformat()
+    PAGE = 1000
+
+    collected: list[dict] = []
+    offset = 0
+    while True:
+        need = limit - len(collected)
+        if need <= 0:
+            break
+        page_size = min(PAGE, need)
+        try:
+            rows = (
+                db.table("leads")
+                .select("id, email, segment_label, pain_score")
+                .eq("is_active", True)
+                .not_.is_("email", "null")
+                .neq("email", "")
+                .is_("email_truelist_batch_id", "null")
+                .eq("email_status", "unknown")
+                .lt("email_cleaned_at", cutoff)
+                .order("email_cleaned_at", desc=False)
+                .range(offset, offset + page_size - 1)
+                .execute()
+                .data or []
+            )
+        except Exception as e:
+            logger.error(f"[select_revalidation_leads] page fetch failed: {e}")
+            rows = []
+        if not rows:
+            break
+        collected.extend(rows)
+        if len(rows) < page_size:
+            break
+        offset += page_size
+
+    return collected[:limit]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Batch poller + result ingestion
 # ─────────────────────────────────────────────────────────────────────────────
@@ -566,11 +619,50 @@ async def submit_endpoint(body: SubmitRequest, db=Depends(get_db)):
             batch_size = 25000
     batch_size = max(1, min(batch_size, 250_000))
 
+    # Re-validation settings — configurable via admin_settings, safe defaults hardcoded.
+    revalidation_enabled = True
+    revalidation_min_age_days = 90
+    try:
+        rv_res = db.table("admin_settings").select("key, value").in_("key", [
+            "email_revalidation_enabled",
+            "email_revalidation_min_age_days",
+        ]).execute()
+        for row in (rv_res.data or []):
+            if row["key"] == "email_revalidation_enabled":
+                revalidation_enabled = str(row.get("value", "true")).lower() not in ("false", "0", "no")
+            elif row["key"] == "email_revalidation_min_age_days":
+                try:
+                    revalidation_min_age_days = int(row["value"])
+                except (TypeError, ValueError):
+                    pass
+    except Exception as e:
+        logger.warning(f"[submit_endpoint] Could not load revalidation settings: {e}")
+
     results = []
     for i in range(body.batches):
-        leads = select_uncleaned_leads(db, batch_size)
+        # New (never-cleaned) leads get first priority, filling up to batch_size.
+        new_leads = select_uncleaned_leads(db, batch_size)
+
+        # Top up remaining capacity with re-validation of old 'unknown' leads.
+        # This reallocates unused quota — it does NOT inflate total submission volume.
+        revalidation_leads: list[dict] = []
+        if revalidation_enabled and len(new_leads) < batch_size:
+            remaining = batch_size - len(new_leads)
+            revalidation_leads = select_revalidation_leads(
+                db, remaining, revalidation_min_age_days
+            )
+
+        leads = new_leads + revalidation_leads
+
         if not leads:
-            results.append({"index": i, "submitted": 0, "skipped": True, "reason": "no_uncleaned_leads"})
+            results.append({
+                "index": i,
+                "submitted": 0,
+                "skipped": True,
+                "reason": "no_uncleaned_leads",
+                "new_leads": 0,
+                "revalidation_leads": 0,
+            })
             break
         try:
             r = await submit_batch(
@@ -579,16 +671,20 @@ async def submit_endpoint(body: SubmitRequest, db=Depends(get_db)):
                 notes=body.notes,
             )
             r["index"] = i
+            r["new_leads"] = len(new_leads)
+            r["revalidation_leads"] = len(revalidation_leads)
             results.append(r)
         except HTTPException as e:
             results.append({"index": i, "submitted": 0, "error": e.detail})
             break
 
     return {
-        "status":           "ok" if results else "no_op",
-        "batches_attempted":len(results),
-        "batch_size":       batch_size,
-        "results":          results,
+        "status":                    "ok" if results else "no_op",
+        "batches_attempted":         len(results),
+        "batch_size":                batch_size,
+        "revalidation_enabled":      revalidation_enabled,
+        "revalidation_min_age_days": revalidation_min_age_days,
+        "results":                   results,
     }
 
 
