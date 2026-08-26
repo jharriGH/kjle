@@ -41,6 +41,7 @@ from .enrichment import _extract_schema_types
 from .webhooks import fire_event
 from .enrichment_email_clean import (
     select_uncleaned_leads as ec_select_uncleaned_leads,
+    select_revalidation_leads as ec_select_revalidation_leads,
     submit_batch as ec_submit_batch,
     poll_batch as ec_poll_batch,
     ingest_batch_result as ec_ingest_batch_result,
@@ -787,23 +788,51 @@ async def job_email_clean_nightly() -> dict:
         except Exception:
             return default
 
-    max_batches = max(1, min(_get_int("email_clean_max_batches_per_night", 4), 50))
-    batch_size  = max(1, min(_get_int("email_clean_batch_size_emails", 25_000), 250_000))
+    def _get_bool(key: str, default: bool) -> bool:
+        try:
+            r = db.table("admin_settings").select("value").eq("key", key).execute()
+            v = str((r.data or [{}])[0].get("value", "")).lower()
+            return v in ("true", "1", "yes")
+        except Exception:
+            return default
 
-    logger.info(f"[{job_name}] V2 starting — max_batches={max_batches}, batch_size={batch_size}")
+    max_batches    = max(1, min(_get_int("email_clean_max_batches_per_night", 4), 50))
+    batch_size     = max(1, min(_get_int("email_clean_batch_size_emails", 25_000), 250_000))
+    reval_enabled  = _get_bool("email_revalidation_enabled", True)
+    reval_min_days = _get_int("email_revalidation_min_age_days", 90)
+
+    logger.info(
+        f"[{job_name}] V2 starting — max_batches={max_batches}, batch_size={batch_size}, "
+        f"reval_enabled={reval_enabled}, reval_min_days={reval_min_days}"
+    )
 
     submitted_batches: list[dict] = []
     selector_total_returned = 0
     submit_exception_count = 0
     for i in range(max_batches):
         logger.info(f"[{job_name}] iteration={i} requesting batch_size={batch_size}")
-        leads = ec_select_uncleaned_leads(db, batch_size)
+        new_leads = ec_select_uncleaned_leads(db, batch_size)
         logger.info(
-            f"[{job_name}] iteration={i} selected={len(leads)} leads, "
-            f"first_3_ids={[l.get('id') for l in leads[:3]]}"
+            f"[{job_name}] iteration={i} new_leads={len(new_leads)}, "
+            f"first_3_ids={[l.get('id') for l in new_leads[:3]]}"
         )
+        # Top up remaining capacity with re-validation leads (unknown, >reval_min_days old).
+        # new_leads keep priority (gathered first); reval fills leftover slots only.
+        reval_leads: list[dict] = []
+        if reval_enabled:
+            remaining = batch_size - len(new_leads)
+            if remaining > 0:
+                reval_leads = ec_select_revalidation_leads(db, remaining, reval_min_days)
+                # Safety dedup: sets are disjoint by query predicate, but guard by ID anyway.
+                new_ids = {l.get("id") for l in new_leads}
+                reval_leads = [l for l in reval_leads if l.get("id") not in new_ids]
+                logger.info(
+                    f"[{job_name}] iteration={i} reval_leads={len(reval_leads)}, "
+                    f"first_3_ids={[l.get('id') for l in reval_leads[:3]]}"
+                )
+        leads = new_leads + reval_leads
         if not leads:
-            logger.info(f"[{job_name}] No more uncleaned leads after {i} batches — stopping early")
+            logger.info(f"[{job_name}] No more leads (new or reval) after {i} iterations — stopping early")
             break
         selector_total_returned += len(leads)
         try:
@@ -840,7 +869,7 @@ async def job_email_clean_nightly() -> dict:
         status = "success"
     elif selector_total_returned == 0:
         # Select returned [] on iteration 0 — nothing to clean, not a failure.
-        notes = "no_uncleaned_leads_available (selector returned 0 on iteration 0)"
+        notes = "no_leads_available (new+reval selectors both returned 0 on iteration 0)"
         status = "success"
     else:
         # Selector found leads but every submit attempt raised.
