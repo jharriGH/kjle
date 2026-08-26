@@ -37,7 +37,7 @@ DYNAMIC_FILTER_COLUMNS = {
     "uses_wordpress","uses_shopify","mobile_friendly","seo_schema_present","website_platform",
     "website_reachable","website_has_ssl","website_has_cta","website_has_contact_form","website_has_chat_widget","website_has_booking","website_has_testimonials","website_has_video","website_has_blog","website_blog_stale","website_copyright_stale","website_is_parked","website_is_franchise","has_chatbot","is_parked",
     "website_has_privacy_policy","website_has_terms","website_has_cookie_consent","website_outdated_tech","website_missing_lang","website_has_skip_link",
-    "website_img_alt_missing","website_h1_count","website_word_count","website_meta_desc","website_has_sitemap","website_noindex",
+    "website_img_alt_missing","website_h1_count","website_word_count","website_internal_page_count","website_meta_desc","website_has_sitemap","website_noindex",
     "has_phone_on_page","has_address_on_page","schema_types","last_audited_at",
     "schema_has_local_biz","schema_has_review","schema_has_faq","schema_has_service","has_schema_markup",
     "pagespeed_mobile","pagespeed_desktop","pagespeed_lcp","pagespeed_cls",
@@ -155,6 +155,8 @@ async def list_leads(
     source:            Optional[str]   = Query(None, description="Filter by ingest source (e.g. local_scraper, csv)"),
     is_active:          bool           = Query(True),
     exclude_email_suppressed: bool   = Query(False, description="When true, exclude leads whose email is in the email_suppressions opt-out list. Use for auto-email campaign pulls to stay compliant-by-default."),
+    min_word_count:     Optional[int]   = Query(None, description="Minimum website_word_count (homepage words). Use with min_internal_pages for BizReply depth filter."),
+    min_internal_pages: Optional[int]   = Query(None, description="Minimum website_internal_page_count (distinct internal links from homepage). >=5 filters one-pagers."),
     page:           int             = Query(1, ge=1),
     page_size:      int             = Query(50, ge=1, le=500),
     order_by:       str             = Query("pain_score", description="Column to sort by"),
@@ -197,7 +199,8 @@ async def list_leads(
         "facebook, instagram, twitter, linkedin, timezone, "
         "enrichment_stage, "
         "data_quality_score, email_state, email_sub_state, email_status, email_valid, is_active, created_at, "
-        "has_chatbot, mobile_friendly, is_parked, has_schema_markup"
+        "has_chatbot, mobile_friendly, is_parked, has_schema_markup, "
+        "website_word_count, website_internal_page_count"
     ).eq("is_active", is_active)
 
     count_query = db.table("leads").select("id", count="exact", head=True).eq("is_active", is_active)
@@ -312,6 +315,13 @@ async def list_leads(
         cond = "g_maps_claimed.is.null,g_maps_claimed.eq.unclaimed,g_maps_claimed.eq.false"
         query = query.or_(cond)
         count_query = count_query.or_(cond)
+
+    if min_word_count is not None:
+        query = query.gte("website_word_count", min_word_count)
+        count_query = count_query.gte("website_word_count", min_word_count)
+    if min_internal_pages is not None:
+        query = query.gte("website_internal_page_count", min_internal_pages)
+        count_query = count_query.gte("website_internal_page_count", min_internal_pages)
 
     # Dynamic whitelisted filters (additive; applied to both queries)
     if filters:

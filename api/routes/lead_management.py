@@ -207,6 +207,7 @@ _DNC_STATUS_BLOCKED = (
 _ELIGIBLE_KNOWN_PARAMS = frozenset({
     "vertical", "niche", "segment_id", "pain_min", "limit", "offset",
     "require_email_valid", "require_name_verified", "audited_after",
+    "min_word_count", "min_internal_pages",
 })
 
 
@@ -222,6 +223,8 @@ async def eligible_for_campaign(
     require_email_valid: bool = Query(True, description="When true, restrict to email_status='valid' + email_valid=true"),
     require_name_verified: bool = Query(False, description="When true, restrict to name_website_verified=true (excludes false and null)"),
     audited_after: Optional[str] = Query(None, description="ISO timestamp; restrict to last_audited_at > this value. Unrecognized query params are reported in skipped_filters."),
+    min_word_count: Optional[int] = Query(None, description="Minimum website_word_count (homepage words, e.g. >=1500 for BizReply depth filter)."),
+    min_internal_pages: Optional[int] = Query(None, description="Minimum website_internal_page_count (distinct internal links from homepage, e.g. >=5 filters one-pagers)."),
     x_api_key: str = Header(...),
 ):
     verify_api_key(x_api_key)
@@ -267,7 +270,7 @@ async def eligible_for_campaign(
 
     # ── targeting + base query ─────────────────────────────────────────────
     # GAP 1 — include website + audit fields so BizReply can build demos and gate on verification
-    select_cols = "id, business_name, email, phone, niche_slug, pain_score, dnc_status, website, name_website_verified, name_match_score, last_audited_at, website_word_count, city, state, website_reachable"
+    select_cols = "id, business_name, email, phone, niche_slug, pain_score, dnc_status, website, name_website_verified, name_match_score, last_audited_at, website_word_count, website_internal_page_count, city, state, website_reachable"
     query = supabase.table("leads").select(select_cols).eq("is_active", True)
     count_query = supabase.table("leads").select("id", count="estimated").eq("is_active", True)
 
@@ -308,6 +311,13 @@ async def eligible_for_campaign(
             raise HTTPException(status_code=400, detail="audited_after must be an ISO timestamp")
         query = query.gt("last_audited_at", audited_after)
         count_query = count_query.gt("last_audited_at", audited_after)
+
+    if min_word_count is not None:
+        query = query.gte("website_word_count", min_word_count)
+        count_query = count_query.gte("website_word_count", min_word_count)
+    if min_internal_pages is not None:
+        query = query.gte("website_internal_page_count", min_internal_pages)
+        count_query = count_query.gte("website_internal_page_count", min_internal_pages)
 
     # ── reattach-cooldown exclusion ────────────────────────────────────────
     # Exclude leads attached to a campaign within the cooldown window
@@ -439,6 +449,7 @@ async def eligible_for_campaign(
             "name_match_score": r.get("name_match_score"),
             "last_audited_at": r.get("last_audited_at"),
             "website_word_count": r.get("website_word_count"),
+            "website_internal_page_count": r.get("website_internal_page_count"),
             "city": r.get("city"),
             "state": r.get("state"),
             "website_reachable": r.get("website_reachable"),
