@@ -147,18 +147,45 @@ async def push_batch(body: BatchPushRequest):
         source="demoenginez_push_batch",
     )
     # Slice 1B returns blocked_leads as list[dict{lead_id, reason, result_source}].
+    # Hard-fail short-circuit: dedupe_and_check_phones fails CLOSED on upstream errors —
+    # it returns everything in blocked_leads plus a top-level 'error' key. Surface that
+    # loudly so a real upstream exception is never misread as a successful compliance block.
+    dnc_error = dnc_summary.get("error")
+    if dnc_error:
+        logger.error(f"[demoenginez_push] DNC batch failed closed: {dnc_error}")
+        return {
+            "status": "error",
+            "message": f"Compliance check failed (upstream error) — no leads pushed. Detail: {dnc_error}",
+            "summary": {
+                "pushed":                0,
+                "duplicates":            0,
+                "failed":                0,
+                "blocked_by_dnc":        0,
+                "dnc_error":             dnc_error,
+                "unique_phones_checked": dnc_summary.get("unique_phones_checked", 0),
+                "dnc_cost_usd":          dnc_summary.get("cost_usd", 0.0),
+            },
+        }
+
     blocked_ids = {b["lead_id"] for b in dnc_summary.get("blocked_leads", [])}
     allowed_leads = [lead for lead in leads if lead.get("id") not in blocked_ids]
 
     if not allowed_leads:
+        # Genuine full block (no upstream error) — tally reasons so the caller
+        # can distinguish email_suppressed vs phone_dnc vs litigator, etc.
+        blocked_reasons: dict[str, int] = {}
+        for b in dnc_summary.get("blocked_leads", []):
+            r = b.get("reason") or "unknown"
+            blocked_reasons[r] = blocked_reasons.get(r, 0) + 1
         return {
             "status": "success",
-            "message": "All eligible leads blocked by DNC",
+            "message": f"All {len(blocked_ids)} eligible leads were suppressed/blocked (see blocked_reasons)",
             "summary": {
                 "pushed":                0,
                 "duplicates":            0,
                 "failed":                0,
                 "blocked_by_dnc":        len(blocked_ids),
+                "blocked_reasons":       blocked_reasons,
                 "unique_phones_checked": dnc_summary.get("unique_phones_checked", 0),
                 "dnc_cost_usd":          dnc_summary.get("cost_usd", 0.0),
             },
@@ -242,7 +269,7 @@ async def push_single_lead(lead_id: str):
     # so the response-shape contract matches the batch path.
     dnc_result = await check_lead_for_channel(
         lead_id,
-        channel="voice",
+        channel="email",
         source="demoenginez_push_single",
     )
     dnc = dnc_result.to_dict()
