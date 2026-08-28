@@ -134,8 +134,8 @@ async def push_batch(body: BatchPushRequest):
         }
 
     # ── DNC gating (Phase 4 Layer 1, Slice 1C) ─────────────────────────────
-    # DemoEnginez is a voice-channel destination; gate via the voice channel
-    # check. dedupe_and_check_phones takes list[str] of lead_ids; we extract
+    # DemoEnginez is an EMAIL destination; gate via the email channel.
+    # Dedupe_and_check_phones takes list[str] of lead_ids; we extract
     # them from the leads we already fetched. The function runs internal
     # suppressions + fed_dnc_list + TCPA litigator + Searchbug (full tier)
     # and fans the verdict per-unique-phone to all leads sharing that phone.
@@ -143,7 +143,7 @@ async def push_batch(body: BatchPushRequest):
 
     dnc_summary = await dedupe_and_check_phones(
         lead_id_list,
-        channel="voice",
+        channel="email",
         source="demoenginez_push_batch",
     )
     # Slice 1B returns blocked_leads as list[dict{lead_id, reason, result_source}].
