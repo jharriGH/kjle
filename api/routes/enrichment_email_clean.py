@@ -186,36 +186,73 @@ async def submit_batch(
     if not payload_data:
         return {"submitted": 0, "skipped": True, "reason": "no_usable_emails"}
 
+    # Unique name per submission so Truelist doesn't hash-dedup identical email lists
+    # across nightly runs (same 9K unknown leads → same content hash → 409 without this).
+    batch_name = f"kjle_reval_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
     async with httpx.AsyncClient(timeout=SUBMIT_TIMEOUT_SEC) as client:
         r = await client.post(
             TRUELIST_BATCHES_URL,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"data": payload_data},
+            json={"data": payload_data, "name": batch_name},
         )
-    if r.status_code != 200 and r.status_code != 201:
+
+    adopted_existing = False
+    if r.status_code == 409:
+        # Truelist deduped the upload — extract the pre-existing batch id and adopt it
+        # so the leads still get associated with a live batch and drained normally.
+        try:
+            err_body = r.json()
+            existing_batch_id = (err_body.get("existing_batch") or {}).get("id")
+        except Exception:
+            existing_batch_id = None
+        if existing_batch_id:
+            logger.warning(
+                f"[truelist.submit_batch] Truelist returned existing batch {existing_batch_id} "
+                f"for duplicate submission; adopting it"
+            )
+            body = {"id": existing_batch_id}
+            adopted_existing = True
+        else:
+            body_excerpt = r.text[:500]
+            logger.error(f"[truelist.submit_batch] HTTP 409 without existing_batch: {body_excerpt}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Truelist submit failed: HTTP 409 (no existing_batch id): {body_excerpt}",
+            )
+    elif r.status_code != 200 and r.status_code != 201:
         body_excerpt = r.text[:500]
         logger.error(f"[truelist.submit_batch] HTTP {r.status_code}: {body_excerpt}")
         raise HTTPException(
             status_code=502,
             detail=f"Truelist submit failed: HTTP {r.status_code}: {body_excerpt}",
         )
+    else:
+        body = r.json()
 
-    body = r.json()
     batch_id = body.get("id")
     if not batch_id:
         logger.error(f"[truelist.submit_batch] response missing id: {body}")
         raise HTTPException(status_code=502, detail="Truelist response missing batch id")
 
-    # Insert truelist_batches row
+    # Insert truelist_batches row; on the adopt path the row may already exist
+    # (it was created when the original submission went through), so upsert with
+    # ignore_duplicates to keep it idempotent.
     try:
-        db.table("truelist_batches").insert({
+        batch_record = {
             "id":           batch_id,
             "email_count":  body.get("email_count") or len(payload_data),
             "status":       body.get("batch_state") or "pending",
             "submitted_at": _now_iso(),
             "submitted_by": submitted_by,
             "notes":        notes,
-        }).execute()
+        }
+        if adopted_existing:
+            db.table("truelist_batches").upsert(
+                batch_record, on_conflict="id", ignore_duplicates=True
+            ).execute()
+        else:
+            db.table("truelist_batches").insert(batch_record).execute()
     except Exception as e:
         # If audit insert fails, the batch is still live at Truelist — bail
         # before marking leads pending_batch so we don't lose track of them.
