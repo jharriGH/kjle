@@ -716,15 +716,18 @@ def ingest_file(filepath: Path, niche_slug: str, existing_fps: set) -> dict:
 
     imported = 0
     if transformed:
-        # Bulk insert in batches of 500
+        # Bulk upsert in batches of 500 — ON CONFLICT (fingerprint) DO NOTHING
+        # so a single dup skips that row instead of failing the whole batch.
         batch_size = 500
         for i in range(0, len(transformed), batch_size):
             batch = transformed[i:i + batch_size]
             try:
-                supabase.table('leads').insert(batch).execute()
-                imported += len(batch)
+                supabase.table('leads').upsert(
+                    batch, on_conflict='fingerprint', ignore_duplicates=True
+                ).execute()
+                imported += len(batch)  # best-effort; conflicts silently skipped
             except Exception as e:
-                log.error(f"  Batch insert failed at row {i}: {e}")
+                log.error(f"  Batch upsert failed at row {i}: {e}")
                 failures += len(batch)
 
     avg_quality = round(
