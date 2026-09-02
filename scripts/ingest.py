@@ -691,13 +691,21 @@ def ingest_file(filepath: Path, niche_slug: str, existing_fps: set) -> dict:
     total_rows = len(df)
     log.info(f"  {total_rows:,} rows in file")
 
-    transformed = []
-    duplicates  = 0
-    failures    = 0
+    transformed    = []
+    duplicates     = 0
+    failures       = 0
+    skipped_no_name = 0
 
     for _, raw_row in tqdm(df.iterrows(), total=total_rows, desc=f"  Processing", unit="rows"):
         try:
             row = transform_row(raw_row.to_dict(), niche_slug, filename)
+
+            # Skip rows with null/blank business_name — a NOT NULL constraint would
+            # otherwise cause a single bad row to wipe out its entire 500-row batch.
+            if not row.get('business_name') or not str(row.get('business_name')).strip():
+                skipped_no_name += 1
+                log.warning(f"  Skipping row with null/blank business_name (will not fail batch)")
+                continue
 
             # Skip if fingerprint already in DB or in this batch
             fp = row.get('fingerprint')
@@ -727,8 +735,16 @@ def ingest_file(filepath: Path, niche_slug: str, existing_fps: set) -> dict:
                 ).execute()
                 imported += len(batch)  # best-effort; conflicts silently skipped
             except Exception as e:
-                log.error(f"  Batch upsert failed at row {i}: {e}")
-                failures += len(batch)
+                log.warning(f"  Batch upsert failed at row {i}, retrying row-by-row: {e}")
+                for single_row in batch:
+                    try:
+                        supabase.table('leads').upsert(
+                            [single_row], on_conflict='fingerprint', ignore_duplicates=True
+                        ).execute()
+                        imported += 1
+                    except Exception as re:
+                        failures += 1
+                        log.warning(f"  Row dropped (business_name={single_row.get('business_name')!r}): {re}")
 
     avg_quality = round(
         sum(r.get('data_quality_score', 0) for r in transformed) / len(transformed)
@@ -754,7 +770,7 @@ def ingest_file(filepath: Path, niche_slug: str, existing_fps: set) -> dict:
         'failures':    failures,
         'avg_quality': avg_quality,
     }
-    log.info(f"  ✓ Imported: {imported:,} | Dupes: {duplicates:,} | Failed: {failures:,} | Avg Quality: {avg_quality}")
+    log.info(f"  ✓ Imported: {imported:,} | Dupes: {duplicates:,} | Skipped(no-name): {skipped_no_name:,} | Failed: {failures:,} | Avg Quality: {avg_quality}")
     return stats
 
 
