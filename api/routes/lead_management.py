@@ -652,52 +652,20 @@ async def provider_breakdown(
     verify_api_key(x_api_key)
     supabase = get_supabase()
 
-    # Try the RPC function first (fast, server-side GROUP BY)
+    # RPC-only: server-side GROUP BY. No client-side fallback (it would paginate 1.25M rows and wedge the API).
     raw_counts: dict = {}
-    used_rpc = False
     try:
-        rpc_params = {}
-        if niche_slug:
-            rpc_params["p_niche_slug"] = niche_slug
-        if segment_label:
-            rpc_params["p_segment_label"] = segment_label
-        if email_status:
-            rpc_params["p_email_status"] = email_status
+        rpc_params = {
+            "p_niche_slug": niche_slug,
+            "p_segment_label": segment_label,
+            "p_email_status": email_status,
+        }
         rpc_res = supabase.rpc("get_provider_breakdown", rpc_params).execute()
         for row in (rpc_res.data or []):
-            raw_counts[row.get("provider", "unknown")] = row.get("lead_count", 0)
-        used_rpc = True
-    except Exception:
-        # RPC not yet created — fall back to Python-side aggregation
-        pass
-
-    if not used_rpc:
-        # Fallback: fetch a large batch and aggregate client-side
-        # (Acceptable given this is an admin/analytics endpoint, not a hot path)
-        try:
-            q = supabase.table("leads").select("email_provider").eq("is_active", True)
-            if niche_slug:
-                q = q.eq("niche_slug", niche_slug)
-            if segment_label:
-                q = q.eq("segment_label", segment_label)
-            if email_status:
-                q = q.eq("email_status", email_status)
-
-            # Paginate to avoid row limit
-            offset_fb = 0
-            page_size_fb = 1000
-            while True:
-                chunk = q.range(offset_fb, offset_fb + page_size_fb - 1).execute()
-                rows = chunk.data or []
-                for row in rows:
-                    bucket = row.get("email_provider") or "unknown"
-                    raw_counts[bucket] = raw_counts.get(bucket, 0) + 1
-                if len(rows) < page_size_fb:
-                    break
-                offset_fb += page_size_fb
-        except Exception as e:
-            logger.error(f"provider_breakdown fallback failed: {e}")
-            raise HTTPException(status_code=500, detail=f"provider_breakdown_failed: {e}")
+            raw_counts[row["provider"]] = row["lead_count"]
+    except Exception as e:
+        logger.error(f"provider_breakdown RPC failed: {e}")
+        raise HTTPException(status_code=503, detail="provider-breakdown temporarily unavailable")
 
     # Normalize to the 9 canonical buckets (0 for absent)
     breakdown = {bucket: raw_counts.get(bucket, 0) for bucket in _PROVIDER_BUCKETS}
