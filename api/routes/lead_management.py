@@ -7,7 +7,7 @@ import os
 import logging
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List
+from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Header, Query, Request
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -19,6 +19,11 @@ SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 API_SECRET_KEY = os.environ.get("API_SECRET_KEY", "kjle-prod-2026-secret")
 
 router = APIRouter()
+
+_PROVIDER_BUCKETS = [
+    "gmail_consumer", "google_workspace", "office365", "ms_consumer",
+    "yahoo", "apple", "other", "self_hosted", "unknown",
+]
 
 
 def get_supabase() -> Client:
@@ -32,11 +37,7 @@ def verify_api_key(x_api_key: str = Header(...)):
 
 
 def _reattach_cutoff_iso(supabase) -> Optional[str]:
-    """ISO cutoff for reattach-cooldown dedup, or None when disabled.
-
-    Reads admin_settings 'campaign_reattach_cooldown_days' (default 30).
-    Returns None when days <= 0, else (utcnow - days) as ISO-8601.
-    """
+    """ISO cutoff for reattach-cooldown dedup, or None when disabled."""
     try:
         res = (
             supabase.table("admin_settings")
@@ -55,11 +56,7 @@ def _reattach_cutoff_iso(supabase) -> Optional[str]:
 
 
 def score_to_segment(pain_score) -> str:
-    """Inline threshold logic — mirrors segments_engine.py::_classify_lead.
-    No import to avoid circular deps. Keep in sync.
-
-    v2 thresholds (2026-05-09): HOT >= 30 | WARM 15-29 | COLD < 15.
-    """
+    """v2 thresholds: HOT >= 30 | WARM 15-29 | COLD < 15."""
     if pain_score is None:
         return "unclassified"
     try:
@@ -96,13 +93,44 @@ class BatchEnrichmentRequest(BaseModel):
     updates: List[BatchEnrichmentItem]
 
 
+class EnrichmentBulkItem(BaseModel):
+    lead_id: str
+    fields: Dict[str, Any]
+
+
+class EnrichmentBulkRequest(BaseModel):
+    updates: List[EnrichmentBulkItem]
+
+
+class MarkContactedItem(BaseModel):
+    lead_id: str
+    campaign_id: str
+    product: str
+    sequence_step: int = 1
+    status: str = "sent"
+    contacted_at: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class MarkContactedRequest(BaseModel):
+    # Single-item form
+    lead_id: Optional[str] = None
+    campaign_id: Optional[str] = None
+    product: Optional[str] = None
+    sequence_step: int = 1
+    status: str = "sent"
+    contacted_at: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    # Batch form
+    updates: Optional[List[MarkContactedItem]] = None
+
+
 # ─────────────────────────────────────────────────
 # GET /kjle/v1/leads/stats
-# Registered BEFORE /leads/{lead_id} to avoid route shadowing
 # ─────────────────────────────────────────────────
 
 _stats_cache: dict = {}
-_CACHE_TTL = 60  # seconds
+_CACHE_TTL = 60
 
 
 @router.get("/leads/stats")
@@ -129,7 +157,6 @@ async def lead_stats(x_api_key: str = Header(...)):
 
 # ─────────────────────────────────────────────────
 # POST /kjle/v1/leads/bulk
-# Registered BEFORE /{lead_id} to avoid route shadowing
 # ─────────────────────────────────────────────────
 
 @router.post("/leads/bulk")
@@ -163,7 +190,6 @@ async def bulk_action(payload: BulkActionRequest, x_api_key: str = Header(...)):
                 )
 
         elif payload.action == "reclassify":
-            from datetime import datetime, timezone
             leads_res = supabase.table("leads").select("id, pain_score").in_("id", payload.lead_ids).execute()
             now = datetime.now(timezone.utc).isoformat()
             for lead in (leads_res.data or []):
@@ -178,7 +204,6 @@ async def bulk_action(payload: BulkActionRequest, x_api_key: str = Header(...)):
                     errors.append({"lead_id": lead["id"], "error": str(e)})
 
         elif payload.action in ("push_demoenginez", "push_voicedrop"):
-            # Uses shared Supabase — target schema not exposed via REST, log as not supported via bulk
             raise HTTPException(
                 status_code=400,
                 detail="push_demoenginez and push_voicedrop bulk actions must be triggered via the dedicated push routes."
@@ -199,15 +224,8 @@ async def bulk_action(payload: BulkActionRequest, x_api_key: str = Header(...)):
 
 # ─────────────────────────────────────────────────
 # GET /kjle/v1/leads/eligible-for-campaign
-# Registered BEFORE /leads/{lead_id} to avoid route shadowing.
-# Returns campaign-ready leads for the n8n route→create→attach flow:
-# passes compliance (email valid, internal phone suppressions, dnc_status)
-# and targeting filters (niche / pain / segment scoping).
 # ─────────────────────────────────────────────────
 
-# dnc_status values that mean "do not contact". Allowed states are NULL
-# (column unpopulated = not yet evaluated) plus 'unchecked' / 'searchbug_clean'.
-# Enum source: migrations/leads_dnc_status.sql.
 _DNC_STATUS_BLOCKED = (
     "fed_dnc_flagged",
     "tcpa_litigator_flagged",
@@ -216,11 +234,11 @@ _DNC_STATUS_BLOCKED = (
     "leadcrap_filtered",
 )
 
-
 _ELIGIBLE_KNOWN_PARAMS = frozenset({
     "vertical", "niche", "segment_id", "pain_min", "limit", "offset",
     "require_email_valid", "require_name_verified", "audited_after",
     "min_word_count", "min_internal_pages", "email_provider",
+    "product", "exclude_already_contacted", "cooldown_days",
 })
 
 
@@ -229,16 +247,19 @@ async def eligible_for_campaign(
     request: Request,
     vertical: Optional[str] = Query(None, description="Vertical (alias for niche)"),
     niche: Optional[str] = Query(None, description="niche_slug filter; takes precedence over `vertical`"),
-    segment_id: Optional[str] = Query(None, description="Saved segment id; applies its stored filters and passes through"),
+    segment_id: Optional[str] = Query(None, description="Saved segment id; applies its stored filters"),
     pain_min: Optional[int] = Query(None, description="Minimum pain_score (inclusive)"),
     limit: int = Query(500, ge=1, le=2000),
     offset: int = Query(0, ge=0),
     require_email_valid: bool = Query(True, description="When true, restrict to email_status='valid' + email_valid=true"),
-    require_name_verified: bool = Query(False, description="When true, restrict to name_website_verified=true (excludes false and null)"),
-    audited_after: Optional[str] = Query(None, description="ISO timestamp; restrict to last_audited_at > this value. Unrecognized query params are reported in skipped_filters."),
-    min_word_count: Optional[int] = Query(None, description="Minimum website_word_count (homepage words, e.g. >=1500 for BizReply depth filter)."),
-    min_internal_pages: Optional[int] = Query(None, description="Minimum website_internal_page_count (distinct internal links from homepage, e.g. >=5 filters one-pagers)."),
-    email_provider: Optional[str] = Query(None, description="Filter by email provider bucket(s). Single value or comma-separated list (e.g. 'google_workspace,office365,self_hosted'). Values: gmail_consumer|google_workspace|office365|ms_consumer|yahoo|apple|other|self_hosted|unknown"),
+    require_name_verified: bool = Query(False, description="When true, restrict to name_website_verified=true"),
+    audited_after: Optional[str] = Query(None, description="ISO timestamp; restrict to last_audited_at > this value"),
+    min_word_count: Optional[int] = Query(None, description="Minimum website_word_count"),
+    min_internal_pages: Optional[int] = Query(None, description="Minimum website_internal_page_count"),
+    email_provider: Optional[str] = Query(None, description="Filter by email provider bucket(s). Single value or comma-separated."),
+    product: Optional[str] = Query(None, description="Product slug (e.g. compliancemds, bizreply). Used with exclude_already_contacted."),
+    exclude_already_contacted: bool = Query(False, description="When true and product is set, exclude leads with a lead_campaign_history row for that product."),
+    cooldown_days: Optional[int] = Query(None, description="Exclude leads whose last_contacted_at is within this many days."),
     x_api_key: str = Header(...),
 ):
     verify_api_key(x_api_key)
@@ -246,12 +267,11 @@ async def eligible_for_campaign(
 
     skipped_filters: List[str] = []
 
-    # GAP 3 — surface unrecognized query params so callers know their filter was ignored
     for _qk in request.query_params:
         if _qk not in _ELIGIBLE_KNOWN_PARAMS:
             skipped_filters.append(f"unrecognized:{_qk}")
 
-    # ── segment_id passthrough — apply stored filters when available ───────
+    # ── segment_id passthrough ─────────────────────────────────────────────────
     seg_niche: Optional[str] = None
     seg_pain_min: Optional[int] = None
     seg_label: Optional[str] = None
@@ -282,9 +302,13 @@ async def eligible_for_campaign(
     effective_niche = niche or vertical or seg_niche
     effective_pain_min = pain_min if pain_min is not None else seg_pain_min
 
-    # ── targeting + base query ─────────────────────────────────────────────
-    # GAP 1 — include website + audit fields so BizReply can build demos and gate on verification
-    select_cols = "id, business_name, email, phone, niche_slug, pain_score, dnc_status, website, name_website_verified, name_match_score, last_audited_at, website_word_count, website_internal_page_count, city, state, website_reachable"
+    # ── base query ─────────────────────────────────────────────────────────────
+    select_cols = (
+        "id, business_name, email, phone, niche_slug, pain_score, dnc_status, "
+        "website, name_website_verified, name_match_score, last_audited_at, "
+        "website_word_count, website_internal_page_count, city, state, "
+        "website_reachable, enrichment"
+    )
     query = supabase.table("leads").select(select_cols).eq("is_active", True)
     count_query = supabase.table("leads").select("id", count="estimated").eq("is_active", True)
 
@@ -300,20 +324,19 @@ async def eligible_for_campaign(
         query = query.gte("pain_score", int(effective_pain_min))
         count_query = count_query.gte("pain_score", int(effective_pain_min))
 
-    # ── email presence + Truelist validity ─────────────────────────────────
+    # ── email filters ──────────────────────────────────────────────────────────
     query = query.neq("email", None)
     count_query = count_query.neq("email", None)
     if require_email_valid:
         query = query.eq("email_status", "valid").eq("email_valid", True)
         count_query = count_query.eq("email_status", "valid").eq("email_valid", True)
 
-    # ── dnc_status: allow NULL (not-yet-evaluated) or non-blocked values ───
+    # ── dnc_status ─────────────────────────────────────────────────────────────
     blocked_csv = ",".join(_DNC_STATUS_BLOCKED)
     dnc_or = f"dnc_status.is.null,dnc_status.not.in.({blocked_csv})"
     query = query.or_(dnc_or)
     count_query = count_query.or_(dnc_or)
 
-    # GAP 2 — name verification + audit recency filters (optional; default=off, backward-compat)
     if require_name_verified:
         query = query.eq("name_website_verified", True)
         count_query = count_query.eq("name_website_verified", True)
@@ -341,17 +364,24 @@ async def eligible_for_campaign(
             query = query.in_("email_provider", providers)
             count_query = count_query.in_("email_provider", providers)
 
-    # ── reattach-cooldown exclusion ────────────────────────────────────────
-    # Exclude leads attached to a campaign within the cooldown window
-    # (admin_settings 'campaign_reattach_cooldown_days', default 30). NULL =
-    # never attached, so it always passes. Same predicate on BOTH queries.
+    # ── cooldown_days: exclude leads contacted within N days ───────────────────
+    if cooldown_days is not None and cooldown_days > 0:
+        try:
+            cd_cutoff = (datetime.now(timezone.utc) - timedelta(days=cooldown_days)).isoformat()
+            cd_or = f"last_contacted_at.is.null,last_contacted_at.lt.{cd_cutoff}"
+            query = query.or_(cd_or)
+            count_query = count_query.or_(cd_or)
+        except Exception as e:
+            skipped_filters.append(f"cooldown_days_failed:{e}")
+
+    # ── reattach-cooldown exclusion ────────────────────────────────────────────
     cutoff = _reattach_cutoff_iso(supabase)
     if cutoff:
         attached_or = f"last_campaign_attached_at.is.null,last_campaign_attached_at.lt.{cutoff}"
         query = query.or_(attached_or)
-        count_query = count_query.or_(attached_or)   # SAME predicate on BOTH
+        count_query = count_query.or_(attached_or)
 
-    # ── pre-suppression total ──────────────────────────────────────────────
+    # ── count ──────────────────────────────────────────────────────────────────
     try:
         count_result = count_query.execute()
         total = count_result.count if count_result.count is not None else 0
@@ -359,7 +389,7 @@ async def eligible_for_campaign(
         logger.error(f"eligible_for_campaign count failed: {e}")
         raise HTTPException(status_code=500, detail=f"count_query_failed: {e}")
 
-    # ── fetch the page, ordered by pain_score desc ─────────────────────────
+    # ── fetch page ─────────────────────────────────────────────────────────────
     try:
         page = (
             query.order("pain_score", desc=True)
@@ -368,14 +398,29 @@ async def eligible_for_campaign(
         )
         rows = page.data or []
     except Exception as e:
-        logger.error(f"eligible_for_campaign fetch failed: {e}")
-        raise HTTPException(status_code=500, detail=f"lead_query_failed: {e}")
+        # enrichment column might not exist yet — retry without it
+        if "enrichment" in str(e):
+            logger.warning("enrichment column missing, retrying without it")
+            select_cols_fallback = select_cols.replace(", enrichment", "")
+            try:
+                page = (
+                    supabase.table("leads").select(select_cols_fallback).eq("is_active", True)
+                    .order("pain_score", desc=True)
+                    .range(offset, offset + limit - 1)
+                    .execute()
+                )
+                rows = page.data or []
+                skipped_filters.append("enrichment_col_missing:apply_cez_keystone.sql")
+            except Exception as e2:
+                logger.error(f"eligible_for_campaign fetch failed: {e2}")
+                raise HTTPException(status_code=500, detail=f"lead_query_failed: {e2}")
+        else:
+            logger.error(f"eligible_for_campaign fetch failed: {e}")
+            raise HTTPException(status_code=500, detail=f"lead_query_failed: {e}")
 
-    # ── dnc_suppressions (phone-based internal suppression list) ───────────
-    # Read-only batch lookup mirrors api/lib/dnc_check.py::_check_internal_suppression
-    # but vectorized to one round-trip per page.
+    # ── dnc_suppressions (phone-based) ─────────────────────────────────────────
     if rows:
-        from ..lib import phone_utils  # local import; module is pure-function
+        from ..lib import phone_utils
         phone_norm_by_row: dict = {}
         unique_norms: set = set()
         for r in rows:
@@ -401,11 +446,7 @@ async def eligible_for_campaign(
         if suppressed:
             rows = [r for r in rows if phone_norm_by_row.get(r["id"]) not in suppressed]
 
-    # ── campaign_lead_attachments exclusion (active/paused campaigns) ──────────
-    # Exclude leads whose email is currently attached to an active or paused
-    # campaign within the campaign_attach_cooldown_days window. Mirrors the
-    # dnc_suppressions block above — collect emails, batch lookup, set-filter,
-    # fail-open into skipped_filters on any error.
+    # ── campaign_lead_attachments exclusion ────────────────────────────────────
     if rows:
         unique_emails = {r.get("email") for r in rows if r.get("email")}
         if unique_emails:
@@ -418,9 +459,9 @@ async def eligible_for_campaign(
                     .execute()
                 )
                 cooldown_rows = cooldown_res.data or []
-                cooldown_days = int(cooldown_rows[0]["value"]) if cooldown_rows else 30
+                cooldown_days_attach = int(cooldown_rows[0]["value"]) if cooldown_rows else 30
                 attach_cutoff = (
-                    datetime.now(timezone.utc) - timedelta(days=cooldown_days)
+                    datetime.now(timezone.utc) - timedelta(days=cooldown_days_attach)
                 ).isoformat()
 
                 cp_res = (
@@ -456,6 +497,29 @@ async def eligible_for_campaign(
                 logger.warning(f"eligible_for_campaign campaign_attach lookup failed: {e}")
                 skipped_filters.append(f"campaign_attach_lookup_failed:{e}")
 
+    # ── exclude_already_contacted: filter via lead_campaign_history ────────────
+    if exclude_already_contacted and product and rows:
+        try:
+            row_ids = [r["id"] for r in rows]
+            # Chunk to avoid URL-length limits
+            already_contacted_ids: set = set()
+            for i in range(0, len(row_ids), 500):
+                chunk = row_ids[i:i + 500]
+                lch_res = (
+                    supabase.table("lead_campaign_history")
+                    .select("lead_id")
+                    .in_("lead_id", chunk)
+                    .eq("product", product)
+                    .execute()
+                )
+                for row in (lch_res.data or []):
+                    already_contacted_ids.add(row["lead_id"])
+            if already_contacted_ids:
+                rows = [r for r in rows if r["id"] not in already_contacted_ids]
+        except Exception as e:
+            logger.warning(f"eligible_for_campaign exclude_already_contacted failed: {e}")
+            skipped_filters.append(f"exclude_already_contacted_failed:{e}")
+
     leads_out = [
         {
             "id": r.get("id"),
@@ -465,7 +529,6 @@ async def eligible_for_campaign(
             "niche": r.get("niche_slug"),
             "pain_score": r.get("pain_score"),
             "dnc_status": r.get("dnc_status"),
-            # GAP 1 additions — website + audit fields for BizReply
             "website": r.get("website"),
             "name_website_verified": r.get("name_website_verified"),
             "name_match_score": r.get("name_match_score"),
@@ -475,6 +538,7 @@ async def eligible_for_campaign(
             "city": r.get("city"),
             "state": r.get("state"),
             "website_reachable": r.get("website_reachable"),
+            "enrichment": r.get("enrichment") or {},
         }
         for r in rows
     ]
@@ -490,8 +554,7 @@ async def eligible_for_campaign(
 
 # ─────────────────────────────────────────────────
 # POST /kjle/v1/leads/enrichment/batch
-# Registered BEFORE /{lead_id} to avoid route shadowing.
-# Batch PURL (demo_url) write for DemoEnginez.
+# Legacy demo_url batch writer (backward compat).
 # ─────────────────────────────────────────────────
 
 @router.post("/leads/enrichment/batch")
@@ -517,6 +580,234 @@ async def batch_enrich_leads(payload: BatchEnrichmentRequest, x_api_key: str = H
             not_found.append(item.lead_id)
 
     return {"updated": updated, "not_found": not_found}
+
+
+# ─────────────────────────────────────────────────
+# POST /kjle/v1/leads/enrichment
+# Generic jsonb-merge bulk enrichment writer.
+# Merges arbitrary key:value pairs into leads.enrichment
+# without clobbering existing keys.
+# Body: {"updates": [{"lead_id": "...", "fields": {...}}]}
+# ─────────────────────────────────────────────────
+
+_ENRICH_CHUNK = 500
+
+
+@router.post("/leads/enrichment")
+async def bulk_enrich_leads(payload: EnrichmentBulkRequest, x_api_key: str = Header(...)):
+    verify_api_key(x_api_key)
+
+    if not payload.updates:
+        raise HTTPException(status_code=400, detail="updates list is empty")
+    if len(payload.updates) > 1000:
+        raise HTTPException(status_code=400, detail="Max 1000 updates per call")
+
+    supabase = get_supabase()
+    results = []
+    updated = 0
+    failed = []
+
+    # Process per-lead (each is an independent jsonb merge)
+    for item in payload.updates:
+        if not item.fields:
+            results.append({"lead_id": item.lead_id, "ok": False, "error": "fields is empty"})
+            failed.append(item.lead_id)
+            continue
+        try:
+            # Read current enrichment, merge, write back
+            cur = supabase.table("leads").select("id, enrichment").eq("id", item.lead_id).execute()
+            if not cur.data:
+                results.append({"lead_id": item.lead_id, "ok": False, "error": "not_found"})
+                failed.append(item.lead_id)
+                continue
+            existing = cur.data[0].get("enrichment") or {}
+            merged = {**existing, **item.fields}
+            supabase.table("leads").update({"enrichment": merged}).eq("id", item.lead_id).execute()
+            results.append({"lead_id": item.lead_id, "ok": True})
+            updated += 1
+        except Exception as e:
+            logger.error(f"bulk_enrich_leads lead_id={item.lead_id}: {e}")
+            results.append({"lead_id": item.lead_id, "ok": False, "error": str(e)})
+            failed.append(item.lead_id)
+
+    return {
+        "updated": updated,
+        "failed": failed,
+        "results": results,
+    }
+
+
+# ─────────────────────────────────────────────────
+# GET /kjle/v1/leads/provider-breakdown
+# Returns lead counts by email_provider bucket (9 fixed buckets).
+# ─────────────────────────────────────────────────
+
+@router.get("/leads/provider-breakdown")
+async def provider_breakdown(
+    niche_slug: Optional[str] = Query(None),
+    segment_label: Optional[str] = Query(None),
+    email_status: Optional[str] = Query(None),
+    x_api_key: str = Header(...),
+):
+    verify_api_key(x_api_key)
+    supabase = get_supabase()
+
+    # Try the RPC function first (fast, server-side GROUP BY)
+    raw_counts: dict = {}
+    used_rpc = False
+    try:
+        rpc_params = {}
+        if niche_slug:
+            rpc_params["p_niche_slug"] = niche_slug
+        if segment_label:
+            rpc_params["p_segment_label"] = segment_label
+        if email_status:
+            rpc_params["p_email_status"] = email_status
+        rpc_res = supabase.rpc("get_provider_breakdown", rpc_params).execute()
+        for row in (rpc_res.data or []):
+            raw_counts[row.get("provider", "unknown")] = row.get("lead_count", 0)
+        used_rpc = True
+    except Exception:
+        # RPC not yet created — fall back to Python-side aggregation
+        pass
+
+    if not used_rpc:
+        # Fallback: fetch a large batch and aggregate client-side
+        # (Acceptable given this is an admin/analytics endpoint, not a hot path)
+        try:
+            q = supabase.table("leads").select("email_provider").eq("is_active", True)
+            if niche_slug:
+                q = q.eq("niche_slug", niche_slug)
+            if segment_label:
+                q = q.eq("segment_label", segment_label)
+            if email_status:
+                q = q.eq("email_status", email_status)
+
+            # Paginate to avoid row limit
+            offset_fb = 0
+            page_size_fb = 1000
+            while True:
+                chunk = q.range(offset_fb, offset_fb + page_size_fb - 1).execute()
+                rows = chunk.data or []
+                for row in rows:
+                    bucket = row.get("email_provider") or "unknown"
+                    raw_counts[bucket] = raw_counts.get(bucket, 0) + 1
+                if len(rows) < page_size_fb:
+                    break
+                offset_fb += page_size_fb
+        except Exception as e:
+            logger.error(f"provider_breakdown fallback failed: {e}")
+            raise HTTPException(status_code=500, detail=f"provider_breakdown_failed: {e}")
+
+    # Normalize to the 9 canonical buckets (0 for absent)
+    breakdown = {bucket: raw_counts.get(bucket, 0) for bucket in _PROVIDER_BUCKETS}
+    # Any unexpected bucket values merge into "other"
+    for bucket, count in raw_counts.items():
+        if bucket not in breakdown:
+            breakdown["other"] = breakdown.get("other", 0) + count
+
+    return {
+        "breakdown": breakdown,
+        "total": sum(breakdown.values()),
+        "filters": {
+            "niche_slug": niche_slug,
+            "segment_label": segment_label,
+            "email_status": email_status,
+        },
+    }
+
+
+# ─────────────────────────────────────────────────
+# POST /kjle/v1/leads/mark-contacted
+# Records a contact event in lead_campaign_history and
+# increments leads.contact_count + sets last_contacted_at.
+# Accepts single-item or batch (updates list).
+# ─────────────────────────────────────────────────
+
+@router.post("/leads/mark-contacted")
+async def mark_contacted(payload: MarkContactedRequest, x_api_key: str = Header(...)):
+    verify_api_key(x_api_key)
+    supabase = get_supabase()
+
+    # Normalize single-item or batch
+    items: List[MarkContactedItem] = []
+    if payload.updates:
+        items = payload.updates
+    elif payload.lead_id and payload.campaign_id and payload.product:
+        items = [MarkContactedItem(
+            lead_id=payload.lead_id,
+            campaign_id=payload.campaign_id,
+            product=payload.product,
+            sequence_step=payload.sequence_step,
+            status=payload.status,
+            contacted_at=payload.contacted_at,
+            metadata=payload.metadata,
+        )]
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either (lead_id + campaign_id + product) or updates list"
+        )
+
+    if len(items) > 500:
+        raise HTTPException(status_code=400, detail="Max 500 items per call")
+
+    recorded = 0
+    skipped = 0
+    errors = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for item in items:
+        ts = item.contacted_at or now_iso
+        try:
+            # Insert history row (ON CONFLICT DO NOTHING via unique constraint)
+            hist_row = {
+                "lead_id": item.lead_id,
+                "campaign_id": item.campaign_id,
+                "product": item.product,
+                "sequence_step": item.sequence_step,
+                "status": item.status,
+                "contacted_at": ts,
+            }
+            if item.metadata:
+                hist_row["metadata"] = item.metadata
+
+            ins_res = (
+                supabase.table("lead_campaign_history")
+                .insert(hist_row, ignore_duplicates=True)
+                .execute()
+            )
+            inserted = bool(ins_res.data)
+
+            if inserted:
+                # Increment contact_count and set last_contacted_at
+                # Read current count first (Supabase doesn't support atomic increment via REST)
+                cur = (
+                    supabase.table("leads")
+                    .select("contact_count")
+                    .eq("id", item.lead_id)
+                    .execute()
+                )
+                cur_count = 0
+                if cur.data:
+                    cur_count = cur.data[0].get("contact_count") or 0
+                supabase.table("leads").update({
+                    "last_contacted_at": ts,
+                    "contact_count": cur_count + 1,
+                }).eq("id", item.lead_id).execute()
+                recorded += 1
+            else:
+                skipped += 1
+
+        except Exception as e:
+            logger.error(f"mark_contacted lead_id={item.lead_id}: {e}")
+            errors.append({"lead_id": item.lead_id, "error": str(e)})
+
+    return {
+        "recorded": recorded,
+        "skipped": skipped,
+        "errors": errors,
+    }
 
 
 # ─────────────────────────────────────────────────
@@ -554,7 +845,6 @@ async def reclassify_lead(lead_id: str, x_api_key: str = Header(...)):
         if not lead_res.data:
             raise HTTPException(status_code=404, detail="Lead not found")
 
-        from datetime import datetime, timezone
         new_label = score_to_segment(lead_res.data.get("pain_score"))
         now = datetime.now(timezone.utc).isoformat()
 
@@ -596,7 +886,7 @@ async def mark_dnc(lead_id: str, x_api_key: str = Header(...)):
         if "do_not_contact" in error_msg or "column" in error_msg.lower():
             raise HTTPException(
                 status_code=500,
-                detail="do_not_contact column does not exist. Run this in Supabase SQL editor (project dhzpwobfihrprlcxqjbq): ALTER TABLE leads ADD COLUMN IF NOT EXISTS do_not_contact BOOLEAN DEFAULT FALSE;"
+                detail="do_not_contact column does not exist. Run: ALTER TABLE leads ADD COLUMN IF NOT EXISTS do_not_contact BOOLEAN DEFAULT FALSE;"
             )
         logger.error(f"mark_dnc error: {e}")
         raise HTTPException(status_code=500, detail=error_msg)
@@ -604,7 +894,7 @@ async def mark_dnc(lead_id: str, x_api_key: str = Header(...)):
 
 # ─────────────────────────────────────────────────
 # POST /kjle/v1/leads/{lead_id}/enrichment
-# Write demo_url (PURL) onto a single lead for DemoEnginez.
+# Legacy per-lead demo_url writer (backward compat).
 # ─────────────────────────────────────────────────
 
 @router.post("/leads/{lead_id}/enrichment")
