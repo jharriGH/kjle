@@ -83,6 +83,19 @@ class BulkActionRequest(BaseModel):
     action: str  # delete | reclassify | dnc | push_demoenginez | push_voicedrop
 
 
+class EnrichmentUpdate(BaseModel):
+    demo_url: str
+
+
+class BatchEnrichmentItem(BaseModel):
+    lead_id: str
+    demo_url: str
+
+
+class BatchEnrichmentRequest(BaseModel):
+    updates: List[BatchEnrichmentItem]
+
+
 # ─────────────────────────────────────────────────
 # GET /kjle/v1/leads/stats
 # Registered BEFORE /leads/{lead_id} to avoid route shadowing
@@ -207,7 +220,7 @@ _DNC_STATUS_BLOCKED = (
 _ELIGIBLE_KNOWN_PARAMS = frozenset({
     "vertical", "niche", "segment_id", "pain_min", "limit", "offset",
     "require_email_valid", "require_name_verified", "audited_after",
-    "min_word_count", "min_internal_pages",
+    "min_word_count", "min_internal_pages", "email_provider",
 })
 
 
@@ -225,6 +238,7 @@ async def eligible_for_campaign(
     audited_after: Optional[str] = Query(None, description="ISO timestamp; restrict to last_audited_at > this value. Unrecognized query params are reported in skipped_filters."),
     min_word_count: Optional[int] = Query(None, description="Minimum website_word_count (homepage words, e.g. >=1500 for BizReply depth filter)."),
     min_internal_pages: Optional[int] = Query(None, description="Minimum website_internal_page_count (distinct internal links from homepage, e.g. >=5 filters one-pagers)."),
+    email_provider: Optional[str] = Query(None, description="Filter by email provider bucket(s). Single value or comma-separated list (e.g. 'google_workspace,office365,self_hosted'). Values: gmail_consumer|google_workspace|office365|ms_consumer|yahoo|apple|other|self_hosted|unknown"),
     x_api_key: str = Header(...),
 ):
     verify_api_key(x_api_key)
@@ -318,6 +332,14 @@ async def eligible_for_campaign(
     if min_internal_pages is not None:
         query = query.gte("website_internal_page_count", min_internal_pages)
         count_query = count_query.gte("website_internal_page_count", min_internal_pages)
+    if email_provider:
+        providers = [p.strip() for p in email_provider.split(",") if p.strip()]
+        if len(providers) == 1:
+            query = query.eq("email_provider", providers[0])
+            count_query = count_query.eq("email_provider", providers[0])
+        elif len(providers) > 1:
+            query = query.in_("email_provider", providers)
+            count_query = count_query.in_("email_provider", providers)
 
     # ── reattach-cooldown exclusion ────────────────────────────────────────
     # Exclude leads attached to a campaign within the cooldown window
@@ -467,6 +489,37 @@ async def eligible_for_campaign(
 
 
 # ─────────────────────────────────────────────────
+# POST /kjle/v1/leads/enrichment/batch
+# Registered BEFORE /{lead_id} to avoid route shadowing.
+# Batch PURL (demo_url) write for DemoEnginez.
+# ─────────────────────────────────────────────────
+
+@router.post("/leads/enrichment/batch")
+async def batch_enrich_leads(payload: BatchEnrichmentRequest, x_api_key: str = Header(...)):
+    verify_api_key(x_api_key)
+
+    if len(payload.updates) > 1000:
+        raise HTTPException(status_code=400, detail="Max 1000 updates per batch request")
+
+    supabase = get_supabase()
+    updated = 0
+    not_found: List[str] = []
+
+    for item in payload.updates:
+        try:
+            res = supabase.table("leads").update({"demo_url": item.demo_url}).eq("id", item.lead_id).execute()
+            if res.data:
+                updated += 1
+            else:
+                not_found.append(item.lead_id)
+        except Exception as e:
+            logger.error(f"batch_enrich_leads update error lead_id={item.lead_id}: {e}")
+            not_found.append(item.lead_id)
+
+    return {"updated": updated, "not_found": not_found}
+
+
+# ─────────────────────────────────────────────────
 # GET /kjle/v1/leads/{lead_id}
 # ─────────────────────────────────────────────────
 
@@ -547,6 +600,31 @@ async def mark_dnc(lead_id: str, x_api_key: str = Header(...)):
             )
         logger.error(f"mark_dnc error: {e}")
         raise HTTPException(status_code=500, detail=error_msg)
+
+
+# ─────────────────────────────────────────────────
+# POST /kjle/v1/leads/{lead_id}/enrichment
+# Write demo_url (PURL) onto a single lead for DemoEnginez.
+# ─────────────────────────────────────────────────
+
+@router.post("/leads/{lead_id}/enrichment")
+async def enrich_lead(lead_id: str, payload: EnrichmentUpdate, x_api_key: str = Header(...)):
+    verify_api_key(x_api_key)
+    supabase = get_supabase()
+
+    try:
+        check = supabase.table("leads").select("id").eq("id", lead_id).execute()
+        if not (check.data):
+            raise HTTPException(status_code=404, detail="Lead not found")
+
+        supabase.table("leads").update({"demo_url": payload.demo_url}).eq("id", lead_id).execute()
+        return {"lead_id": lead_id, "demo_url": payload.demo_url, "updated": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"enrich_lead error lead_id={lead_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─────────────────────────────────────────────────
