@@ -742,7 +742,7 @@ async def mark_contacted(payload: MarkContactedRequest, x_api_key: str = Header(
 
             ins_res = (
                 supabase.table("lead_campaign_history")
-                .insert(hist_row, ignore_duplicates=True)
+                .upsert(hist_row, on_conflict="lead_id,campaign_id,sequence_step", ignore_duplicates=True)
                 .execute()
             )
             inserted = bool(ins_res.data)
