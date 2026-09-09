@@ -237,7 +237,7 @@ _DNC_STATUS_BLOCKED = (
 _ELIGIBLE_KNOWN_PARAMS = frozenset({
     "vertical", "niche", "segment_id", "pain_min", "limit", "offset",
     "require_email_valid", "require_name_verified", "audited_after",
-    "min_word_count", "min_internal_pages", "email_provider",
+    "min_word_count", "min_internal_pages", "email_provider", "email_trust",
     "product", "exclude_already_contacted", "cooldown_days",
 })
 
@@ -257,6 +257,7 @@ async def eligible_for_campaign(
     min_word_count: Optional[int] = Query(None, description="Minimum website_word_count"),
     min_internal_pages: Optional[int] = Query(None, description="Minimum website_internal_page_count"),
     email_provider: Optional[str] = Query(None, description="Filter by email provider bucket(s). Single value or comma-separated."),
+    email_trust: Optional[str] = Query(None, description="Filter by email trust value(s). Single value or comma-separated. Values: valid|catch_all|role|unconfirmable|invalid"),
     product: Optional[str] = Query(None, description="Product slug (e.g. compliancemds, bizreply). Used with exclude_already_contacted."),
     exclude_already_contacted: bool = Query(False, description="When true and product is set, exclude leads with a lead_campaign_history row for that product."),
     cooldown_days: Optional[int] = Query(None, description="Exclude leads whose last_contacted_at is within this many days."),
@@ -307,7 +308,7 @@ async def eligible_for_campaign(
         "id, business_name, email, phone, niche_slug, pain_score, dnc_status, "
         "website, name_website_verified, name_match_score, last_audited_at, "
         "website_word_count, website_internal_page_count, city, state, "
-        "website_reachable, enrichment"
+        "website_reachable, enrichment, email_provider, email_trust"
     )
     query = supabase.table("leads").select(select_cols).eq("is_active", True)
     count_query = supabase.table("leads").select("id", count="estimated").eq("is_active", True)
@@ -363,6 +364,14 @@ async def eligible_for_campaign(
         elif len(providers) > 1:
             query = query.in_("email_provider", providers)
             count_query = count_query.in_("email_provider", providers)
+    if email_trust:
+        trusts = [t.strip() for t in email_trust.split(",") if t.strip()]
+        if len(trusts) == 1:
+            query = query.eq("email_trust", trusts[0])
+            count_query = count_query.eq("email_trust", trusts[0])
+        elif len(trusts) > 1:
+            query = query.in_("email_trust", trusts)
+            count_query = count_query.in_("email_trust", trusts)
 
     # ── cooldown_days: exclude leads contacted within N days ───────────────────
     if cooldown_days is not None and cooldown_days > 0:
@@ -539,6 +548,8 @@ async def eligible_for_campaign(
             "state": r.get("state"),
             "website_reachable": r.get("website_reachable"),
             "enrichment": r.get("enrichment") or {},
+            "email_provider": r.get("email_provider"),
+            "email_trust": r.get("email_trust"),
         }
         for r in rows
     ]

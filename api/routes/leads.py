@@ -158,6 +158,7 @@ async def list_leads(
     min_word_count:     Optional[int]   = Query(None, description="Minimum website_word_count (homepage words). Use with min_internal_pages for BizReply depth filter."),
     min_internal_pages: Optional[int]   = Query(None, description="Minimum website_internal_page_count (distinct internal links from homepage). >=5 filters one-pagers."),
     email_provider:     Optional[str]   = Query(None, description="Filter by email provider bucket(s). Single value or comma-separated list (e.g. 'google_workspace,office365,self_hosted'). Values: gmail_consumer|google_workspace|office365|ms_consumer|yahoo|apple|other|self_hosted|unknown"),
+    email_trust:        Optional[str]   = Query(None, description="Filter by email trust value(s). Single value or comma-separated list. Values: valid|catch_all|role|unconfirmable|invalid"),
     page:           int             = Query(1, ge=1),
     page_size:      int             = Query(50, ge=1, le=500),
     order_by:       str             = Query("pain_score", description="Column to sort by"),
@@ -201,7 +202,7 @@ async def list_leads(
         "enrichment_stage, "
         "data_quality_score, email_state, email_sub_state, email_status, email_valid, is_active, created_at, "
         "has_chatbot, mobile_friendly, is_parked, has_schema_markup, "
-        "website_word_count, website_internal_page_count, email_provider"
+        "website_word_count, website_internal_page_count, email_provider, email_trust"
     ).eq("is_active", is_active)
 
     count_query = db.table("leads").select("id", count="exact", head=True).eq("is_active", is_active)
@@ -331,6 +332,14 @@ async def list_leads(
         elif len(providers) > 1:
             query = query.in_("email_provider", providers)
             count_query = count_query.in_("email_provider", providers)
+    if email_trust:
+        trusts = [t.strip() for t in email_trust.split(",") if t.strip()]
+        if len(trusts) == 1:
+            query = query.eq("email_trust", trusts[0])
+            count_query = count_query.eq("email_trust", trusts[0])
+        elif len(trusts) > 1:
+            query = query.in_("email_trust", trusts)
+            count_query = count_query.in_("email_trust", trusts)
 
     # Dynamic whitelisted filters (additive; applied to both queries)
     if filters:
