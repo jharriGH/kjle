@@ -117,6 +117,32 @@ AXE_QUEUE_TARGET          = 5_000   # top-up ceiling; overridable via admin_sett
 AXE_SCAN_NIGHTLY_MAX_SECONDS = 300     # 5-minute ceiling (OFFSET makes this fast; long run = bug signal)
 AXE_SCAN_FETCH_CHUNK      = 2_000   # leads fetched per chunk
 
+# Provider classify nightly — TIER-1 string-match, no DNS
+PROVIDER_CLASSIFY_BATCH_SIZE   = 20_000   # rows per SELECT (bounded)
+PROVIDER_CLASSIFY_UPDATE_CHUNK = 500      # IDs per UPDATE .in_() call
+PROVIDER_CLASSIFY_MAX_ITER     = 20       # iteration guard (~400k rows max)
+
+# Tier-1 domain → provider (consumer free-mail + ISP; no DNS needed)
+_PROVIDER_TIER1_MAP: dict = {
+    "gmail.com": "gmail_consumer",      "googlemail.com": "gmail_consumer",
+    "hotmail.com": "ms_consumer",       "outlook.com": "ms_consumer",
+    "live.com": "ms_consumer",          "msn.com": "ms_consumer",
+    "hotmail.co.uk": "ms_consumer",     "outlook.co.uk": "ms_consumer",
+    "live.co.uk": "ms_consumer",        "hotmail.fr": "ms_consumer",
+    "yahoo.com": "yahoo",               "ymail.com": "yahoo",
+    "aol.com": "yahoo",                 "rocketmail.com": "yahoo",
+    "yahoo.co.uk": "yahoo",             "yahoo.ca": "yahoo",
+    "icloud.com": "apple",              "me.com": "apple",
+    "mac.com": "apple",
+    "comcast.net": "other",             "verizon.net": "other",
+    "att.net": "other",                 "sbcglobal.net": "other",
+    "cox.net": "other",                 "charter.net": "other",
+    "spectrum.net": "other",            "earthlink.net": "other",
+    "bellsouth.net": "other",           "roadrunner.com": "other",
+    "frontier.com": "other",            "optonline.net": "other",
+    "windstream.net": "other",
+}
+
 # ── Campaign sync targets (config-driven) ──
 # Each entry describes one (project, server) pair to sync hourly from ReachInbox.
 # Adding a new project or server = append one dict. No logic changes required.
@@ -210,6 +236,11 @@ JOB_DEFINITIONS = {
     "axe_scan_nightly": {
         "description": "Nightly axe accessibility scan enqueue (WebSignalz Phase 3) — top-up scan_jobs to AXE_QUEUE_TARGET; inserts at priority=1 (low); VPS daemon does the actual scanning",
         "schedule":    "Daily at 04:00 UTC",
+        "trigger":     "cron",
+    },
+    "provider_classify_nightly": {
+        "description": "Nightly TIER-1 email provider classifier — string-match of consumer/ISP domains (no DNS) for valid leads with email_provider='unknown'",
+        "schedule":    "Daily at 03:30 UTC",
         "trigger":     "cron",
     },
 }
@@ -726,6 +757,132 @@ async def job_stale_cleanup() -> dict:
         "deactivated":      deactivated,
         "failed":           failed,
         "cutoff_date":      cutoff[:10],
+        "duration_seconds": round(duration, 3),
+        "status":           status,
+    }
+    logger.info(f"[{job_name}] Done. {result}")
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 4b — Nightly Email Provider Classify (03:30 UTC)
+# TIER-1 string-match: classifies new valid leads with email_provider='unknown'.
+# No DNS, no external calls. Bounded by PROVIDER_CLASSIFY_MAX_ITER iterations.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def job_provider_classify_nightly() -> dict:
+    """
+    Nightly TIER-1 email provider classification for new valid leads.
+
+    Selects leads with email_status='valid' AND email_provider='unknown' in
+    bounded batches (LIMIT PROVIDER_CLASSIFY_BATCH_SIZE), classifies each
+    email domain via _PROVIDER_TIER1_MAP (no DNS), then batch-updates by
+    provider in UPDATE_CHUNK-sized .in_() calls. Exits early when no TIER-1
+    domains are found in a full batch (remaining unknowns are business domains).
+    """
+    job_name = "provider_classify_nightly"
+    logger.info(f"[{job_name}] Starting...")
+    t_start = time.monotonic()
+    db = get_db()
+
+    total_classified = 0
+    failed = 0
+    iterations = 0
+
+    while iterations < PROVIDER_CLASSIFY_MAX_ITER:
+        iterations += 1
+
+        try:
+            rows = (
+                db.table("leads")
+                .select("id,email")
+                .eq("email_status", "valid")
+                .eq("email_provider", "unknown")
+                .limit(PROVIDER_CLASSIFY_BATCH_SIZE)
+                .execute()
+                .data or []
+            )
+        except Exception as e:
+            logger.error(f"[{job_name}] SELECT failed on iteration {iterations}: {e}", exc_info=True)
+            break
+
+        if not rows:
+            logger.info(f"[{job_name}] No unclassified leads after {iterations - 1} iteration(s) — done")
+            break
+
+        # Classify in Python — pure dict lookup, zero I/O
+        provider_ids: dict = {}
+        for row in rows:
+            email = (row.get("email") or "").strip().lower()
+            if "@" not in email:
+                continue
+            domain = email.split("@", 1)[1]
+            provider = _PROVIDER_TIER1_MAP.get(domain)
+            if provider:
+                provider_ids.setdefault(provider, []).append(row["id"])
+
+        if not provider_ids:
+            # Full batch contained no TIER-1 consumer domains — queue is drained
+            logger.info(
+                f"[{job_name}] iter={iterations} scanned={len(rows)} — "
+                "no TIER-1 domains found, remaining unknowns are business domains"
+            )
+            break
+
+        # Batch-update per provider in safe sub-chunks
+        batch_classified = 0
+        now = _now_iso()
+        for provider, ids in provider_ids.items():
+            for i in range(0, len(ids), PROVIDER_CLASSIFY_UPDATE_CHUNK):
+                chunk = ids[i : i + PROVIDER_CLASSIFY_UPDATE_CHUNK]
+                try:
+                    db.table("leads").update({
+                        "email_provider": provider,
+                        "updated_at":     now,
+                    }).in_("id", chunk).execute()
+                    batch_classified += len(chunk)
+                except Exception as e:
+                    failed += len(chunk)
+                    logger.error(
+                        f"[{job_name}] UPDATE failed provider={provider} chunk_start={i}: {e}",
+                        exc_info=True,
+                    )
+
+        total_classified += batch_classified
+        logger.info(
+            f"[{job_name}] iter={iterations} scanned={len(rows)} "
+            f"classified={batch_classified} cumulative={total_classified}"
+        )
+
+        if len(rows) < PROVIDER_CLASSIFY_BATCH_SIZE:
+            # Returned fewer rows than the limit — queue is drained
+            break
+
+    duration = time.monotonic() - t_start
+    notes = (
+        f"total_classified={total_classified}, failed={failed}, "
+        f"iterations={iterations}, duration_s={round(duration, 1)}"
+    )
+    if failed > 0 and total_classified > 0:
+        status = "partial"
+    elif failed > 0:
+        status = "failed"
+    else:
+        status = "success"
+
+    await _log_job(
+        job_name,
+        leads_processed=total_classified,
+        duration_seconds=duration,
+        status=status,
+        notes=notes,
+    )
+
+    result = {
+        "job":              job_name,
+        "total_classified": total_classified,
+        "failed":           failed,
+        "iterations":       iterations,
         "duration_seconds": round(duration, 3),
         "status":           status,
     }
@@ -3193,9 +3350,10 @@ JOB_FUNCTIONS = {
     "fed_dnc_refresh_monthly": job_fed_dnc_refresh_monthly,
     "nanpa_refresh_monthly":   job_nanpa_refresh_monthly,
     "tcpa_refresh_weekly":     job_tcpa_refresh_weekly,
-    "website_audit_nightly":   job_website_audit_nightly,
-    "pagespeed_nightly":       job_pagespeed_nightly,
-    "axe_scan_nightly":        job_axe_scan_nightly,
+    "website_audit_nightly":        job_website_audit_nightly,
+    "pagespeed_nightly":            job_pagespeed_nightly,
+    "axe_scan_nightly":             job_axe_scan_nightly,
+    "provider_classify_nightly":    job_provider_classify_nightly,
 }
 
 
@@ -3383,6 +3541,20 @@ def setup_scheduler() -> AsyncIOScheduler:
         name="Nightly Axe Scan Enqueue (WebSignalz Phase 3)",
         replace_existing=True,
         misfire_grace_time=3600,
+    )
+
+    # Job 16: provider_classify_nightly — daily at 03:30 UTC
+    # TIER-1 string-match classifier for new valid leads with email_provider='unknown'.
+    # No DNS, no external calls. 03:30 is clear of all other daily crons:
+    # email_clean=0:00, stale_cleanup=2:00, axe_scan=4:00, website_audit=5:30,
+    # pagespeed=7:30, cost_digest=8:00, daily_cost_report=16:00.
+    scheduler.add_job(
+        job_provider_classify_nightly,
+        trigger=CronTrigger(hour=3, minute=30),
+        id="provider_classify_nightly",
+        name="Nightly Email Provider Classify (TIER-1)",
+        replace_existing=True,
+        misfire_grace_time=1800,
     )
 
     logger.info(f"⏰ APScheduler configured: {len(scheduler.get_jobs())} jobs registered")
