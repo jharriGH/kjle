@@ -122,6 +122,14 @@ PROVIDER_CLASSIFY_BATCH_SIZE   = 20_000   # rows per SELECT (bounded)
 PROVIDER_CLASSIFY_UPDATE_CHUNK = 500      # IDs per UPDATE .in_() call
 PROVIDER_CLASSIFY_MAX_ITER     = 20       # iteration guard (~400k rows max)
 
+# Email trust derivation — role local-parts (applies when email_status='unknown')
+_TRUST_ROLE_LOCAL_PARTS: frozenset = frozenset({
+    "info", "sales", "admin", "contact", "office", "support", "billing",
+    "hello", "team", "service", "help", "marketing", "enquiries", "inquiries",
+    "mail", "noreply", "no-reply", "accounts", "hr", "jobs", "careers",
+    "press", "media", "webmaster", "postmaster",
+})
+
 # Tier-1 domain → provider (consumer free-mail + ISP; no DNS needed)
 _PROVIDER_TIER1_MAP: dict = {
     "gmail.com": "gmail_consumer",      "googlemail.com": "gmail_consumer",
@@ -772,13 +780,21 @@ async def job_stale_cleanup() -> dict:
 
 async def job_provider_classify_nightly() -> dict:
     """
-    Nightly TIER-1 email provider classification for new valid leads.
+    Nightly TIER-1 email provider + email_trust classification for new leads.
 
-    Selects leads with email_status='valid' AND email_provider='unknown' in
-    bounded batches (LIMIT PROVIDER_CLASSIFY_BATCH_SIZE), classifies each
-    email domain via _PROVIDER_TIER1_MAP (no DNS), then batch-updates by
-    provider in UPDATE_CHUNK-sized .in_() calls. Exits early when no TIER-1
-    domains are found in a full batch (remaining unknowns are business domains).
+    Phase A — Provider: selects leads with email_status='valid' AND
+    email_provider='unknown' in bounded batches, classifies each email domain
+    via _PROVIDER_TIER1_MAP (no DNS), batch-updates by provider.
+
+    Phase B — Trust (runs after A, since trust depends on email_provider):
+    derives email_trust for any lead with email_trust IS NULL using only data
+    already on the row (no DNS). Bucketing order:
+      valid/invalid email_status -> 'valid'/'invalid'
+      unknown + role local-part  -> 'role'
+      unknown + known provider   -> 'catch_all'
+      unknown + unknown provider -> 'unconfirmable'
+    Leaves email_status='pending_batch'/other as email_trust NULL.
+    Both phases are bounded by PROVIDER_CLASSIFY_MAX_ITER + BATCH_SIZE.
     """
     job_name = "provider_classify_nightly"
     logger.info(f"[{job_name}] Starting...")
@@ -858,10 +874,137 @@ async def job_provider_classify_nightly() -> dict:
             # Returned fewer rows than the limit — queue is drained
             break
 
+    # ── PHASE B: EMAIL TRUST DERIVATION ──────────────────────────────────────
+    # Runs after provider classification (trust depends on email_provider).
+    # Only touches leads where email_trust IS NULL (new or previously missed).
+    trust_classified = 0
+    trust_failed = 0
+    trust_iters = 0
+    now_t = _now_iso()
+
+    # B-1: email_status='valid' -> email_trust='valid'
+    t_iter = 0
+    while t_iter < PROVIDER_CLASSIFY_MAX_ITER:
+        t_iter += 1
+        trust_iters += 1
+        try:
+            t_rows = (
+                db.table("leads")
+                .select("id")
+                .eq("email_status", "valid")
+                .is_("email_trust", "null")
+                .limit(PROVIDER_CLASSIFY_BATCH_SIZE)
+                .execute()
+                .data or []
+            )
+        except Exception as e:
+            logger.error(f"[{job_name}] TRUST SELECT valid failed: {e}", exc_info=True)
+            break
+        if not t_rows:
+            break
+        ids = [r["id"] for r in t_rows]
+        for i in range(0, len(ids), PROVIDER_CLASSIFY_UPDATE_CHUNK):
+            chunk = ids[i : i + PROVIDER_CLASSIFY_UPDATE_CHUNK]
+            try:
+                db.table("leads").update({"email_trust": "valid", "updated_at": now_t}).in_("id", chunk).execute()
+                trust_classified += len(chunk)
+            except Exception as e:
+                trust_failed += len(chunk)
+                logger.error(f"[{job_name}] TRUST UPDATE valid failed: {e}", exc_info=True)
+        if len(t_rows) < PROVIDER_CLASSIFY_BATCH_SIZE:
+            break
+
+    # B-2: email_status='invalid' -> email_trust='invalid'
+    t_iter = 0
+    while t_iter < PROVIDER_CLASSIFY_MAX_ITER:
+        t_iter += 1
+        trust_iters += 1
+        try:
+            t_rows = (
+                db.table("leads")
+                .select("id")
+                .eq("email_status", "invalid")
+                .is_("email_trust", "null")
+                .limit(PROVIDER_CLASSIFY_BATCH_SIZE)
+                .execute()
+                .data or []
+            )
+        except Exception as e:
+            logger.error(f"[{job_name}] TRUST SELECT invalid failed: {e}", exc_info=True)
+            break
+        if not t_rows:
+            break
+        ids = [r["id"] for r in t_rows]
+        for i in range(0, len(ids), PROVIDER_CLASSIFY_UPDATE_CHUNK):
+            chunk = ids[i : i + PROVIDER_CLASSIFY_UPDATE_CHUNK]
+            try:
+                db.table("leads").update({"email_trust": "invalid", "updated_at": now_t}).in_("id", chunk).execute()
+                trust_classified += len(chunk)
+            except Exception as e:
+                trust_failed += len(chunk)
+                logger.error(f"[{job_name}] TRUST UPDATE invalid failed: {e}", exc_info=True)
+        if len(t_rows) < PROVIDER_CLASSIFY_BATCH_SIZE:
+            break
+
+    # B-3: email_status='unknown' -> Python-classify into role/catch_all/unconfirmable
+    t_iter = 0
+    while t_iter < PROVIDER_CLASSIFY_MAX_ITER:
+        t_iter += 1
+        trust_iters += 1
+        try:
+            t_rows = (
+                db.table("leads")
+                .select("id,email,email_provider")
+                .eq("email_status", "unknown")
+                .is_("email_trust", "null")
+                .limit(PROVIDER_CLASSIFY_BATCH_SIZE)
+                .execute()
+                .data or []
+            )
+        except Exception as e:
+            logger.error(f"[{job_name}] TRUST SELECT unknown failed: {e}", exc_info=True)
+            break
+        if not t_rows:
+            break
+
+        bucket: dict[str, list] = {"role": [], "catch_all": [], "unconfirmable": []}
+        for row in t_rows:
+            email = (row.get("email") or "").strip().lower()
+            local = email.split("@", 1)[0] if "@" in email else ""
+            provider = (row.get("email_provider") or "unknown").strip().lower()
+            if local in _TRUST_ROLE_LOCAL_PARTS:
+                bucket["role"].append(row["id"])
+            elif provider != "unknown":
+                bucket["catch_all"].append(row["id"])
+            else:
+                bucket["unconfirmable"].append(row["id"])
+
+        for trust_val, ids in bucket.items():
+            if not ids:
+                continue
+            for i in range(0, len(ids), PROVIDER_CLASSIFY_UPDATE_CHUNK):
+                chunk = ids[i : i + PROVIDER_CLASSIFY_UPDATE_CHUNK]
+                try:
+                    db.table("leads").update({"email_trust": trust_val, "updated_at": now_t}).in_("id", chunk).execute()
+                    trust_classified += len(chunk)
+                except Exception as e:
+                    trust_failed += len(chunk)
+                    logger.error(f"[{job_name}] TRUST UPDATE {trust_val} failed: {e}", exc_info=True)
+
+        if len(t_rows) < PROVIDER_CLASSIFY_BATCH_SIZE:
+            break
+
+    logger.info(
+        f"[{job_name}] TRUST done: trust_classified={trust_classified} "
+        f"trust_failed={trust_failed} trust_iters={trust_iters}"
+    )
+    # ── END PHASE B ───────────────────────────────────────────────────────────
+
     duration = time.monotonic() - t_start
     notes = (
         f"total_classified={total_classified}, failed={failed}, "
-        f"iterations={iterations}, duration_s={round(duration, 1)}"
+        f"iterations={iterations}, trust_classified={trust_classified}, "
+        f"trust_failed={trust_failed}, duration_s={round(duration, 1)}"
     )
     if failed > 0 and total_classified > 0:
         status = "partial"
@@ -883,6 +1026,8 @@ async def job_provider_classify_nightly() -> dict:
         "total_classified": total_classified,
         "failed":           failed,
         "iterations":       iterations,
+        "trust_classified": trust_classified,
+        "trust_failed":     trust_failed,
         "duration_seconds": round(duration, 3),
         "status":           status,
     }
