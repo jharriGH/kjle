@@ -339,8 +339,8 @@ async def eligible_for_campaign(
     count_query = count_query.or_(dnc_or)
 
     if require_name_verified:
-        query = query.eq("name_website_verified", True)
-        count_query = count_query.eq("name_website_verified", True)
+        query = query.eq("name_website_verified", "true")
+        count_query = count_query.eq("name_website_verified", "true")
 
     if audited_after is not None:
         try:

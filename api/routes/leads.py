@@ -202,10 +202,10 @@ async def list_leads(
         "enrichment_stage, "
         "data_quality_score, email_state, email_sub_state, email_status, email_valid, is_active, created_at, "
         "has_chatbot, mobile_friendly, is_parked, has_schema_markup, "
-        "website_word_count, website_internal_page_count, email_provider, email_trust"
+        "website_word_count, website_internal_page_count, email_provider, email_trust, name_website_verified"
     ).eq("is_active", is_active)
 
-    count_query = db.table("leads").select("id", count="exact", head=True).eq("is_active", is_active)
+    count_query = db.table("leads").select("id", count="exact").eq("is_active", is_active)
 
     # Apply filters to both queries
     if niche_slug:
@@ -351,11 +351,13 @@ async def list_leads(
         query = query.not_.in_("email", suppressed_list)
         count_query = count_query.not_.in_("email", suppressed_list)
 
-    # Get total count (estimated — avoids full-table scan timeout on 1.5M-row table)
+    # Get total count; .range(0,0) limits row data transfer while keeping exact count.
+    # count_query intentionally uses GET (not HEAD) so NOT IN filters work identically to the row query.
     try:
-        count_result = count_query.execute()
+        count_result = count_query.range(0, 0).execute()
         total = count_result.count if count_result.count is not None else 0
-    except Exception:
+    except Exception as exc:
+        _logger.warning("count_query failed: %s — total set to 0", exc)
         total = 0
 
     # Ordering + pagination
