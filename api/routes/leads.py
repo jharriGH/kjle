@@ -290,7 +290,7 @@ async def list_leads(
             elif len(trusts) > 1:
                 q = q.in_("email_trust", trusts)
         if require_name_verified is not None:
-            q = q.eq("name_website_verified", _b(require_name_verified))
+            q = q.is_("name_website_verified", require_name_verified)
         if filters:
             q = _apply_dynamic_filters(q, filters)
         return q
