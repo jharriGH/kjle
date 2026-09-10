@@ -346,19 +346,25 @@ async def list_leads(
         query = _apply_dynamic_filters(query, filters)
         count_query = _apply_dynamic_filters(count_query, filters)
 
-    # Email suppression NOT IN (applied to both queries when list is under cap)
-    if suppressed_list:
-        query = query.not_.in_("email", suppressed_list)
-        count_query = count_query.not_.in_("email", suppressed_list)
-
-    # Get total count; .range(0,0) limits row data transfer while keeping exact count.
-    # count_query intentionally uses GET (not HEAD) so NOT IN filters work identically to the row query.
+    # Email suppression count: base_count minus suppressed_match_count.
+    # NOT IN drops NULL-email rows (SQL NULL NOT IN (...) = NULL = excluded).
+    # Instead: count rows matching all filters (base), then subtract those whose
+    # email is actually in the suppressed list (IN never drops NULLs).
     try:
         count_result = count_query.range(0, 0).execute()
-        total = count_result.count if count_result.count is not None else 0
+        base_count = count_result.count if count_result.count is not None else 0
     except Exception as exc:
         _logger.warning("count_query failed: %s — total set to 0", exc)
-        total = 0
+        base_count = 0
+
+    total = base_count
+    if suppressed_list and not suppress_overflow:
+        try:
+            sup_match = count_query.in_("email", suppressed_list).execute()
+            suppressed_match_count = sup_match.count if sup_match.count is not None else 0
+            total = base_count - suppressed_match_count
+        except Exception as exc:
+            _logger.warning("suppressed_match_count failed: %s — using base_count as total", exc)
 
     # Ordering + pagination
     query = query.order(order_by, desc=(order_dir == "desc"), nullsfirst=False)
@@ -367,8 +373,9 @@ async def list_leads(
     result = query.execute()
     leads_data = result.data
 
-    # Overflow fallback: post-filter the page when suppressed_set exceeded NOT IN cap
-    if suppress_overflow and suppressed_set:
+    # Post-filter the page: remove any row whose email is in the suppressed set.
+    # Handles both the overflow case and the normal case (avoids NOT IN NULL bug).
+    if suppressed_set:
         leads_data = [
             r for r in leads_data
             if (r.get("email") or "").strip().lower() not in suppressed_set
