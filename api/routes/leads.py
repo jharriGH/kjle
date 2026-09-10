@@ -194,164 +194,127 @@ async def list_leads(
         except Exception as exc:
             _logger.warning("email_suppressions fetch failed: %s — suppression filter skipped", exc)
 
-    query = db.table("leads").select(
-        "id, business_name, phone, email, website, city, state, niche_slug, "
-        "pain_score, fit_demoenginez, fit_reputation, fit_schema_ranker, fit_voicedrop, "
-        "google_stars, google_review_count, g_maps_claimed, "
-        "facebook, instagram, twitter, linkedin, timezone, "
-        "enrichment_stage, "
-        "data_quality_score, email_state, email_sub_state, email_status, email_valid, is_active, created_at, "
-        "has_chatbot, mobile_friendly, is_parked, has_schema_markup, "
-        "website_word_count, website_internal_page_count, email_provider, email_trust, name_website_verified"
-    ).eq("is_active", is_active)
+    # ── Filter closure: applies all request-scoped filters to any fresh builder ──
+    # Each call to apply_filters() must receive a FRESH query builder — supabase-py
+    # builders are mutable and re-executing the same builder yields non-deterministic
+    # results. Never call apply_filters() on an already-executed builder.
+    def apply_filters(q):
+        if niche_slug:
+            q = q.eq("niche_slug", niche_slug)
+        if state:
+            q = q.eq("state", state.upper())
+        if city:
+            q = q.ilike("city", f"%{city}%")
+        if min_pain is not None:
+            q = q.gte("pain_score", min_pain)
+        if max_pain is not None:
+            q = q.lte("pain_score", max_pain)
+        if fit_demoenginez is not None:
+            q = q.eq("fit_demoenginez", _b(fit_demoenginez))
+        if fit_reputation is not None:
+            q = q.eq("fit_reputation", _b(fit_reputation))
+        if fit_schema_ranker is not None:
+            q = q.eq("fit_schema_ranker", _b(fit_schema_ranker))
+        if fit_voicedrop is not None:
+            q = q.eq("fit_voicedrop", _b(fit_voicedrop))
+        if enrichment_stage is not None:
+            q = q.eq("enrichment_stage", enrichment_stage)
+        if email_state:
+            q = q.eq("email_state", email_state)
+        if email_sub_state:
+            q = q.eq("email_sub_state", email_sub_state)
+        if email_status:
+            q = q.eq("email_status", email_status)
+        if min_stars is not None:
+            q = q.gte("google_stars", min_stars)
+        if max_stars is not None:
+            q = q.lte("google_stars", max_stars)
+        if min_reviews is not None:
+            q = q.gte("google_review_count", min_reviews)
+        if max_reviews is not None:
+            q = q.lte("google_review_count", max_reviews)
+        if source:
+            q = q.eq("source", source)
+        if has_facebook is not None:
+            if has_facebook:
+                q = q.not_.is_("facebook", "null")
+            else:
+                q = q.is_("facebook", "null")
+        if has_instagram is not None:
+            if has_instagram:
+                q = q.not_.is_("instagram", "null")
+            else:
+                q = q.is_("instagram", "null")
+        if has_linkedin is not None:
+            if has_linkedin:
+                q = q.not_.is_("linkedin", "null")
+            else:
+                q = q.is_("linkedin", "null")
+        if has_website is not None:
+            if has_website:
+                q = q.not_.is_("website", "null")
+            else:
+                q = q.is_("website", "null")
+        if ssl is not None:
+            if ssl:
+                q = q.like("website", "https://%")
+            else:
+                q = q.like("website", "http://%")
+        if has_chatbot is not None:
+            q = q.eq("has_chatbot", _b(has_chatbot))
+        if mobile_friendly is not None:
+            q = q.eq("mobile_friendly", _b(mobile_friendly))
+        if parked is not None:
+            q = q.eq("is_parked", _b(parked))
+        if has_schema_markup is not None:
+            q = q.eq("has_schema_markup", _b(has_schema_markup))
+        if g_maps_claimed == "claimed":
+            q = q.or_("g_maps_claimed.eq.claimed,g_maps_claimed.like.http%")
+        elif g_maps_claimed == "unclaimed":
+            q = q.or_("g_maps_claimed.is.null,g_maps_claimed.eq.unclaimed,g_maps_claimed.eq.false")
+        if min_word_count is not None:
+            q = q.gte("website_word_count", min_word_count)
+        if min_internal_pages is not None:
+            q = q.gte("website_internal_page_count", min_internal_pages)
+        if email_provider:
+            providers = [p.strip() for p in email_provider.split(",") if p.strip()]
+            if len(providers) == 1:
+                q = q.eq("email_provider", providers[0])
+            elif len(providers) > 1:
+                q = q.in_("email_provider", providers)
+        if email_trust:
+            trusts = [t.strip() for t in email_trust.split(",") if t.strip()]
+            if len(trusts) == 1:
+                q = q.eq("email_trust", trusts[0])
+            elif len(trusts) > 1:
+                q = q.in_("email_trust", trusts)
+        if filters:
+            q = _apply_dynamic_filters(q, filters)
+        return q
 
-    count_query = db.table("leads").select("id", count="exact").eq("is_active", is_active)
-
-    # Apply filters to both queries
-    if niche_slug:
-        query = query.eq("niche_slug", niche_slug)
-        count_query = count_query.eq("niche_slug", niche_slug)
-    if state:
-        query = query.eq("state", state.upper())
-        count_query = count_query.eq("state", state.upper())
-    if city:
-        query = query.ilike("city", f"%{city}%")
-        count_query = count_query.ilike("city", f"%{city}%")
-    if min_pain is not None:
-        query = query.gte("pain_score", min_pain)
-        count_query = count_query.gte("pain_score", min_pain)
-    if max_pain is not None:
-        query = query.lte("pain_score", max_pain)
-        count_query = count_query.lte("pain_score", max_pain)
-    if fit_demoenginez is not None:
-        query = query.eq("fit_demoenginez", _b(fit_demoenginez))
-        count_query = count_query.eq("fit_demoenginez", _b(fit_demoenginez))
-    if fit_reputation is not None:
-        query = query.eq("fit_reputation", _b(fit_reputation))
-        count_query = count_query.eq("fit_reputation", _b(fit_reputation))
-    if fit_schema_ranker is not None:
-        query = query.eq("fit_schema_ranker", _b(fit_schema_ranker))
-        count_query = count_query.eq("fit_schema_ranker", _b(fit_schema_ranker))
-    if fit_voicedrop is not None:
-        query = query.eq("fit_voicedrop", _b(fit_voicedrop))
-        count_query = count_query.eq("fit_voicedrop", _b(fit_voicedrop))
-    if enrichment_stage is not None:
-        query = query.eq("enrichment_stage", enrichment_stage)
-        count_query = count_query.eq("enrichment_stage", enrichment_stage)
-    if email_state:
-        query = query.eq("email_state", email_state)
-        count_query = count_query.eq("email_state", email_state)
-    if email_sub_state:
-        query = query.eq("email_sub_state", email_sub_state)
-        count_query = count_query.eq("email_sub_state", email_sub_state)
-    if email_status:
-        query = query.eq("email_status", email_status)
-        count_query = count_query.eq("email_status", email_status)
-    if min_stars is not None:
-        query = query.gte("google_stars", min_stars)
-        count_query = count_query.gte("google_stars", min_stars)
-    if max_stars is not None:
-        query = query.lte("google_stars", max_stars)
-        count_query = count_query.lte("google_stars", max_stars)
-    if min_reviews is not None:
-        query = query.gte("google_review_count", min_reviews)
-        count_query = count_query.gte("google_review_count", min_reviews)
-    if max_reviews is not None:
-        query = query.lte("google_review_count", max_reviews)
-        count_query = count_query.lte("google_review_count", max_reviews)
-    if source:
-        query = query.eq("source", source)
-        count_query = count_query.eq("source", source)
-    if has_facebook is not None:
-        if has_facebook:
-            query = query.not_.is_("facebook", "null")
-            count_query = count_query.not_.is_("facebook", "null")
-        else:
-            query = query.is_("facebook", "null")
-            count_query = count_query.is_("facebook", "null")
-    if has_instagram is not None:
-        if has_instagram:
-            query = query.not_.is_("instagram", "null")
-            count_query = count_query.not_.is_("instagram", "null")
-        else:
-            query = query.is_("instagram", "null")
-            count_query = count_query.is_("instagram", "null")
-    if has_linkedin is not None:
-        if has_linkedin:
-            query = query.not_.is_("linkedin", "null")
-            count_query = count_query.not_.is_("linkedin", "null")
-        else:
-            query = query.is_("linkedin", "null")
-            count_query = count_query.is_("linkedin", "null")
-    if has_website is not None:
-        if has_website:
-            query = query.not_.is_("website", "null")
-            count_query = count_query.not_.is_("website", "null")
-        else:
-            query = query.is_("website", "null")
-            count_query = count_query.is_("website", "null")
-    if ssl is not None:
-        if ssl:
-            query = query.like("website", "https://%")
-            count_query = count_query.like("website", "https://%")
-        else:
-            query = query.like("website", "http://%")
-            count_query = count_query.like("website", "http://%")
-    if has_chatbot is not None:
-        query = query.eq("has_chatbot", _b(has_chatbot))
-        count_query = count_query.eq("has_chatbot", _b(has_chatbot))
-    if mobile_friendly is not None:
-        query = query.eq("mobile_friendly", _b(mobile_friendly))
-        count_query = count_query.eq("mobile_friendly", _b(mobile_friendly))
-    if parked is not None:
-        query = query.eq("is_parked", _b(parked))
-        count_query = count_query.eq("is_parked", _b(parked))
-    if has_schema_markup is not None:
-        query = query.eq("has_schema_markup", _b(has_schema_markup))
-        count_query = count_query.eq("has_schema_markup", _b(has_schema_markup))
-    if g_maps_claimed == "claimed":
-        cond = "g_maps_claimed.eq.claimed,g_maps_claimed.like.http%"
-        query = query.or_(cond)
-        count_query = count_query.or_(cond)
-    elif g_maps_claimed == "unclaimed":
-        cond = "g_maps_claimed.is.null,g_maps_claimed.eq.unclaimed,g_maps_claimed.eq.false"
-        query = query.or_(cond)
-        count_query = count_query.or_(cond)
-
-    if min_word_count is not None:
-        query = query.gte("website_word_count", min_word_count)
-        count_query = count_query.gte("website_word_count", min_word_count)
-    if min_internal_pages is not None:
-        query = query.gte("website_internal_page_count", min_internal_pages)
-        count_query = count_query.gte("website_internal_page_count", min_internal_pages)
-    if email_provider:
-        providers = [p.strip() for p in email_provider.split(",") if p.strip()]
-        if len(providers) == 1:
-            query = query.eq("email_provider", providers[0])
-            count_query = count_query.eq("email_provider", providers[0])
-        elif len(providers) > 1:
-            query = query.in_("email_provider", providers)
-            count_query = count_query.in_("email_provider", providers)
-    if email_trust:
-        trusts = [t.strip() for t in email_trust.split(",") if t.strip()]
-        if len(trusts) == 1:
-            query = query.eq("email_trust", trusts[0])
-            count_query = count_query.eq("email_trust", trusts[0])
-        elif len(trusts) > 1:
-            query = query.in_("email_trust", trusts)
-            count_query = count_query.in_("email_trust", trusts)
-
-    # Dynamic whitelisted filters (additive; applied to both queries)
-    if filters:
-        query = _apply_dynamic_filters(query, filters)
-        count_query = _apply_dynamic_filters(count_query, filters)
+    query = apply_filters(
+        db.table("leads").select(
+            "id, business_name, phone, email, website, city, state, niche_slug, "
+            "pain_score, fit_demoenginez, fit_reputation, fit_schema_ranker, fit_voicedrop, "
+            "google_stars, google_review_count, g_maps_claimed, "
+            "facebook, instagram, twitter, linkedin, timezone, "
+            "enrichment_stage, "
+            "data_quality_score, email_state, email_sub_state, email_status, email_valid, is_active, created_at, "
+            "has_chatbot, mobile_friendly, is_parked, has_schema_markup, "
+            "website_word_count, website_internal_page_count, email_provider, email_trust, name_website_verified"
+        ).eq("is_active", is_active)
+    )
 
     # Email suppression count: base_count minus suppressed_match_count.
     # NOT IN drops NULL-email rows (SQL NULL NOT IN (...) = NULL = excluded).
     # Instead: count rows matching all filters (base), then subtract those whose
     # email is actually in the suppressed list (IN never drops NULLs).
+    # CRITICAL: each count uses a FRESH builder via apply_filters() — reusing the
+    # same builder after .execute() gives non-deterministic counts (flapping).
     try:
-        count_result = count_query.range(0, 0).execute()
+        count_result = apply_filters(
+            db.table("leads").select("id", count="exact").eq("is_active", is_active)
+        ).range(0, 0).execute()
         base_count = count_result.count if count_result.count is not None else 0
     except Exception as exc:
         _logger.warning("count_query failed: %s — total set to 0", exc)
@@ -360,7 +323,14 @@ async def list_leads(
     total = base_count
     if suppressed_list and not suppress_overflow:
         try:
-            sup_match = count_query.in_("email", suppressed_list).execute()
+            sup_match = (
+                apply_filters(
+                    db.table("leads").select("id", count="exact").eq("is_active", is_active)
+                )
+                .in_("email", suppressed_list)
+                .range(0, 0)
+                .execute()
+            )
             suppressed_match_count = sup_match.count if sup_match.count is not None else 0
             total = base_count - suppressed_match_count
         except Exception as exc:
