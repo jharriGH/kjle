@@ -636,16 +636,27 @@ def transform_row(raw: dict, niche_slug: str, source_file: str) -> dict:
 # ─── Deduplication ───────────────────────────────────────────────────────────
 
 def get_existing_fingerprints() -> set:
-    """Load all existing fingerprints from DB for dedup check."""
-    log.info("Loading existing fingerprints from database...")
+    """Load all existing fingerprints from DB for dedup check (keyset pagination).
+
+    Uses cursor-based paging (fingerprint > last_cursor ORDER BY fingerprint)
+    instead of OFFSET so cost is O(n) regardless of table size. OFFSET was
+    timing out at ~779k on the 1.25M-row leads table because Postgres must
+    scan and discard all prior rows on each page.
+
+    fingerprint is a 32-char hex string with a unique index (the upsert
+    conflict target), so keyset seeks are index-only and fast.
+    """
+    log.info("Loading existing fingerprints from database (keyset pagination)...")
     existing = set()
     page_size = 1000
-    start = 0
+    last_cursor = ""  # "" sorts before any hex character, so first page has no lower bound
     while True:
         result = (
             supabase.table('leads')
             .select('fingerprint')
-            .range(start, start + page_size - 1)
+            .gt('fingerprint', last_cursor)
+            .order('fingerprint')
+            .limit(page_size)
             .execute()
         )
         batch = result.data
@@ -656,7 +667,7 @@ def get_existing_fingerprints() -> set:
                 existing.add(record['fingerprint'])
         if len(batch) < page_size:
             break
-        start += page_size
+        last_cursor = batch[-1]['fingerprint']
     log.info(f"Loaded {len(existing):,} existing fingerprints")
     return existing
 
