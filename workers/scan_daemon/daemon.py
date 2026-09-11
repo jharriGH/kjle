@@ -99,6 +99,38 @@ STALL_THRESHOLD_S = int(os.environ.get("STALL_THRESHOLD_S", "300"))
 AXE_VERSION = "4.10.2"
 AXE_PATH = Path(__file__).parent / "axe.min.js"
 
+# ── Chatbot detection (keep in sync with _CHATBOT_SIGS in api/routes/website_audit.py) ──
+# Applied against RENDERED page HTML (page.content() after networkidle) so
+# JS-injected widgets that aren't in raw HTML are caught.
+_CHATBOT_SIGS = [
+    # Named platform vendors
+    "intercom",    "drift.com",      "tawk.to",        "crisp.chat",
+    "livechatinc", "zendesk",        "tidio",           "olark",
+    "jivochat",    "smartsupp",      "hubspot",         "__lc",
+    "liveagent",   "chatra",         "freshdesk",       "helpscout",
+    "kayako",      "userlike",       "liveperson",      "gorgias",
+    # Expanded vendor list
+    "livechat",    "freshchat",      "freshworks",      "chatwoot",
+    "manychat",    "botpress",       "landbot",         "formilla",
+    "purechat",    "pure-chat",      "kommunicate",     "chaport",
+    "chatlio",     "helpcrunch",     "snapengage",      "boldchat",
+    "comm100",     "salesiq",        "tars",            "collect.chat",
+    "gubagoo",     "podium",         "birdeye.com",     "thryv",
+    "ada.support", "ubotstudio",     "verloop",         "engati",
+    "wati",        "respond.io",
+    # Widget DOM markers (class/ID-level specificity)
+    "chatbot",     "chatbotid",      "chat-widget",     "chatwidget",
+    "live-chat",   "livechat-widget","data-chat",       "chat-bubble",
+    "chatbubble",  "widget-chat",    "lc_text_widget",  "woot-widget",
+    # Phrase-level signals
+    "chat with us", "ask me anything", "live chat",
+]
+
+
+def _detect_chatbot(html: str) -> bool:
+    lower = html.lower()
+    return any(sig in lower for sig in _CHATBOT_SIGS)
+
 # ── Stall watchdog state (module-level, GIL-safe for scalar writes) ──────────
 _last_job_completed_at: float = 0.0    # monotonic; updated on every terminal job state
 _queue_had_jobs: bool = False           # True if last poll returned queued jobs
@@ -379,6 +411,11 @@ def _scan_url(url: str, axe_js: str) -> dict:
                     page.wait_for_load_state("networkidle", timeout=8_000)
                 except Exception:
                     pass
+                rendered_html = ""
+                try:
+                    rendered_html = page.content()
+                except Exception:
+                    pass
                 # Inject vendored axe — never CDN-load.
                 page.evaluate(axe_js)
                 raw = page.evaluate(
@@ -440,6 +477,7 @@ def _scan_url(url: str, axe_js: str) -> dict:
             "incomplete": incomplete,
             "accessibility_score": round(score, 2),
             "score_formula_version": SCORE_FORMULA_VERSION,
+            "has_chatbot": _detect_chatbot(rendered_html),
             "error": None,
         }
 
@@ -549,6 +587,8 @@ def _update_lead_summary(db: Client, job: dict, scan: dict) -> None:
         update["accessibility_score"] = scan.get("accessibility_score")
         update["accessibility_violations"] = len(scan.get("violations", []))
         update["accessibility_critical"] = scan.get("critical_count", 0)
+        if scan.get("has_chatbot") is True:
+            update["has_chatbot"] = True
     try:
         db.table("leads").update(update).eq("id", lead_id).execute()
     except Exception as e:

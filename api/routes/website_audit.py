@@ -86,13 +86,30 @@ async def _check_robots_allowed(host: str, url: str, cache: dict) -> bool:
 
 
 # ── Chatbot widget signatures ─────────────────────────────────────────────────
-# Matched case-insensitively against raw page HTML.
+# Matched case-insensitively against raw page HTML (and rendered DOM in the scan daemon).
+# Keep in sync with _CHATBOT_SIGS in workers/scan_daemon/daemon.py.
 _CHATBOT_SIGS = [
-    "intercom",    "drift.com",     "tawk.to",       "crisp.chat",
-    "livechatinc", "zendesk",       "tidio",          "olark",
-    "jivochat",    "smartsupp",     "hubspot",        "__lc",
-    "liveagent",   "chatra",        "freshdesk",      "helpscout",
-    "kayako",      "userlike",      "liveperson",      "gorgias",
+    # Named platform vendors (specific, low false-positive risk)
+    "intercom",    "drift.com",      "tawk.to",        "crisp.chat",
+    "livechatinc", "zendesk",        "tidio",           "olark",
+    "jivochat",    "smartsupp",      "hubspot",         "__lc",
+    "liveagent",   "chatra",         "freshdesk",       "helpscout",
+    "kayako",      "userlike",       "liveperson",      "gorgias",
+    # Expanded vendor list
+    "livechat",    "freshchat",      "freshworks",      "chatwoot",
+    "manychat",    "botpress",       "landbot",         "formilla",
+    "purechat",    "pure-chat",      "kommunicate",     "chaport",
+    "chatlio",     "helpcrunch",     "snapengage",      "boldchat",
+    "comm100",     "salesiq",        "tars",            "collect.chat",
+    "gubagoo",     "podium",         "birdeye.com",     "thryv",
+    "ada.support", "ubotstudio",     "verloop",         "engati",
+    "wati",        "respond.io",
+    # Widget DOM markers (class/ID-level specificity — safe in context)
+    "chatbot",     "chatbotid",      "chat-widget",     "chatwidget",
+    "live-chat",   "livechat-widget","data-chat",       "chat-bubble",
+    "chatbubble",  "widget-chat",    "lc_text_widget",  "woot-widget",
+    # Phrase-level signals common to embedded chat widgets
+    "chat with us", "ask me anything", "live chat",
 ]
 
 # ── Parked / broken domain signatures ────────────────────────────────────────
