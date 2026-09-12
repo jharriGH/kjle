@@ -69,6 +69,7 @@ from .routes import mail_suppressions
 from .routes import scan
 from .routes import reverify
 from .routes import campaign_prep
+from .routes import contacts
 from .routes.scheduler import setup_scheduler
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -199,6 +200,7 @@ app.include_router(mail_suppressions.router,      prefix=PREFIX,                
 app.include_router(scan.router,                   prefix=PREFIX,                  tags=["Scan"])
 app.include_router(reverify.router,               prefix=PREFIX,                  tags=["Reverify"])
 app.include_router(campaign_prep.router,          prefix=PREFIX,                  tags=["Campaign Prep"])
+app.include_router(contacts.router,               prefix=PREFIX,                  tags=["Contacts"])
 
 
 # ── Empire-wide notification endpoints (top-level, x-brain-key auth) ──────────
