@@ -2,6 +2,14 @@
 KJLE API — Contacts Routes
 GET /kjle/v1/contacts                     — list contacts (paginated, filterable)
 GET /kjle/v1/contacts/seniority-breakdown — decision-maker counts by seniority
+
+Business intel filters (money filters for campaign pulls):
+  has_business       — linked to a lead record (business_id IS NOT NULL)
+  linked_no_chatbot  — linked business has no chatbot (BizReply filter)
+  linked_low_a11y    — linked business accessibility_score < N (ComplianceMDs filter)
+
+Response enrichment: each contact with a business_id gets linked_* fields populated
+via a single batch lookup against leads (<=100 IDs per page, always fast).
 """
 import logging
 import os
@@ -22,11 +30,15 @@ def verify_api_key(x_api_key: str = Header(...)):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
+# business_id added so we can batch-lookup linked lead intel
 _SELECT_COLS = (
     "id, full_name, title, seniority, company, company_website, primary_email, "
     "niche_slug, city, state, email_provider, email_trust, email_status, "
-    "has_chatbot, accessibility_score, website_word_count, linkedin_url"
+    "has_chatbot, accessibility_score, website_word_count, linkedin_url, business_id"
 )
+
+# Fields fetched from leads for the linked_* response namespace
+_BIZ_SELECT_COLS = "id, business_name, has_chatbot, accessibility_score, website, pain_score"
 
 
 # seniority-breakdown MUST be defined before any future /{contact_id} route
@@ -88,6 +100,10 @@ async def list_contacts(
     email_status:        Optional[str]  = Query(None, description="valid|invalid|unknown"),
     state:               Optional[str]  = Query(None, description="Exact US state abbreviation"),
     min_word_count:      Optional[int]  = Query(None, description="Minimum website_word_count"),
+    # Business intel / money filters
+    has_business:        Optional[bool] = Query(None, description="True = linked to a business (business_id IS NOT NULL); False = unlinked"),
+    linked_no_chatbot:   Optional[bool] = Query(None, description="True = linked business has_chatbot=false. BizReply money filter. Uses idx_contacts_business_id + has_chatbot."),
+    linked_low_a11y:     Optional[int]  = Query(None, description="Linked business accessibility_score < value. ComplianceMDs filter."),
     page:                int            = Query(1, ge=1),
     page_size:           int            = Query(50, ge=1, le=100),
 ):
@@ -95,7 +111,7 @@ async def list_contacts(
     offset = (page - 1) * page_size
 
     # All filters applied via this closure — called separately for count and rows
-    # so each gets a FRESH builder (mutable builders must never be reused after execute)
+    # so each gets a FRESH builder (mutable builders must never be reused after execute).
     def apply_filters(q):
         if niche_slug:
             q = q.eq("niche_slug", niche_slug)
@@ -132,16 +148,35 @@ async def list_contacts(
             q = q.eq("state", state.upper())
         if min_word_count is not None:
             q = q.gte("website_word_count", min_word_count)
+        # Business link filters — contacts.has_chatbot and accessibility_score are
+        # denormalized from the linked lead during contact-link, so filtering here
+        # is equivalent to a JOIN on leads and avoids a cross-table query.
+        # Uses idx_contacts_business_id + idx_contacts_niche_seniority (fast).
+        if has_business is not None:
+            if has_business:
+                q = q.not_.is_("business_id", "null")
+            else:
+                q = q.is_("business_id", "null")
+        if linked_no_chatbot is not None:
+            q = q.not_.is_("business_id", "null")
+            # .is_() required for boolean columns — .eq('false') bug in PostgREST
+            if linked_no_chatbot:
+                q = q.is_("has_chatbot", "false")
+            else:
+                q = q.is_("has_chatbot", "true")
+        if linked_low_a11y is not None:
+            q = q.not_.is_("business_id", "null")
+            q = q.lt("accessibility_score", linked_low_a11y)
         return q
 
-    # Count query — fresh builder, range(0,0) for count-only (no data transfer)
+    # Count query — fresh builder, range(0,0) transfers no rows
     try:
         count_result = apply_filters(
             db.table("contacts").select("id", count="exact")
         ).range(0, 0).execute()
         total = count_result.count if count_result.count is not None else 0
     except Exception as exc:
-        _logger.warning("contacts count_query failed: %s — total set to 0", exc)
+        _logger.warning("contacts count_query failed: %s -- total set to 0", exc)
         total = 0
 
     # Row query — fresh builder, never mutated after execute
@@ -152,10 +187,38 @@ async def list_contacts(
         .execute()
     )
 
+    # Batch-enrich with linked business intel.
+    # Page is <=100 rows, so this IN() lookup is always tiny and fast.
+    business_ids = [c["business_id"] for c in result.data if c.get("business_id")]
+    biz_map: dict = {}
+    if business_ids:
+        try:
+            biz_result = (
+                db.table("leads")
+                .select(_BIZ_SELECT_COLS)
+                .in_("id", business_ids)
+                .execute()
+            )
+            biz_map = {b["id"]: b for b in biz_result.data}
+        except Exception as exc:
+            _logger.warning("contacts biz_lookup failed: %s -- linked_* fields will be null", exc)
+
+    contacts_out = []
+    for c in result.data:
+        biz = biz_map.get(c.get("business_id"))
+        contacts_out.append({
+            **c,
+            "linked_business_name":       biz["business_name"]       if biz else None,
+            "linked_has_chatbot":         biz["has_chatbot"]          if biz else None,
+            "linked_accessibility_score": biz["accessibility_score"]  if biz else None,
+            "linked_website":             biz["website"]              if biz else None,
+            "linked_pain_score":          biz.get("pain_score")       if biz else None,
+        })
+
     return {
         "page":      page,
         "page_size": page_size,
         "total":     total,
-        "count":     len(result.data),
-        "contacts":  result.data,
+        "count":     len(contacts_out),
+        "contacts":  contacts_out,
     }
