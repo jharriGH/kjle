@@ -3513,10 +3513,15 @@ def setup_scheduler() -> AsyncIOScheduler:
     """
     scheduler = AsyncIOScheduler(timezone="UTC")
 
-    # Job 1: classify_segments — every 6 hours
+    # Job 1: classify_segments — every 6 hours, phased to :05 past the hour.
+    # Previously a bare IntervalTrigger(hours=6), which phases off app-boot
+    # time and had drifted onto the same :34-:36 minute as campaign_sync_hourly
+    # and email_clean_poll_batches. Concurrent heavy UPDATEs on `leads` at
+    # that shared minute caused repeated statement_timeout failures (2026-09-12
+    # incident). CronTrigger pins the minute so it can't drift back onto theirs.
     scheduler.add_job(
         job_classify_segments,
-        trigger=IntervalTrigger(hours=6),
+        trigger=CronTrigger(hour="0,6,12,18", minute=5),
         id="classify_segments",
         name="Auto-Classify Segments",
         replace_existing=True,
