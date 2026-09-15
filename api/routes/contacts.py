@@ -30,16 +30,14 @@ def verify_api_key(x_api_key: str = Header(...)):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-# Includes denormalized linked_* columns (backfilled from business_id joins)
+# business_id included so we can batch-lookup linked lead intel
 _SELECT_COLS = (
     "id, full_name, title, seniority, company, company_website, primary_email, "
     "niche_slug, city, state, email_provider, email_trust, email_status, "
-    "has_chatbot, accessibility_score, website_word_count, linkedin_url, business_id, "
-    "linked_business_name, linked_has_chatbot, linked_a11y_score"
+    "has_chatbot, accessibility_score, website_word_count, linkedin_url, business_id"
 )
 
-# Fields fetched from leads for the linked_* response namespace (website + pain_score
-# are not denormalized onto contacts — batch IN() for <=100 rows is still fast)
+# Fields fetched from leads for the linked_* response namespace (batch IN ≤100 rows)
 _BIZ_SELECT_COLS = "id, business_name, has_chatbot, accessibility_score, website, pain_score"
 
 
@@ -60,8 +58,6 @@ def _str_list(val: Optional[str]) -> Optional[list]:
 def _enrich_with_biz(contacts: list, db) -> list:
     """Batch-lookup linked business intel and add linked_* fields.
     Page is <=100 rows so the IN() is always tiny.
-    Denormalized columns (linked_business_name, linked_has_chatbot, linked_a11y_score)
-    are already on each row from _SELECT_COLS; this adds linked_website + linked_pain_score.
     """
     business_ids = [c["business_id"] for c in contacts if c.get("business_id")]
     biz_map: dict = {}
@@ -75,15 +71,18 @@ def _enrich_with_biz(contacts: list, db) -> list:
             )
             biz_map = {b["id"]: b for b in biz_result.data}
         except Exception as exc:
-            _logger.warning("contacts biz_lookup failed: %s -- linked_website/pain_score will be null", exc)
+            _logger.warning("contacts biz_lookup failed: %s -- linked_* fields will be null", exc)
 
     out = []
     for c in contacts:
         biz = biz_map.get(c.get("business_id"))
         out.append({
             **c,
-            "linked_website":    biz["website"]        if biz else None,
-            "linked_pain_score": biz.get("pain_score") if biz else None,
+            "linked_business_name":       biz["business_name"]      if biz else None,
+            "linked_has_chatbot":         biz["has_chatbot"]         if biz else None,
+            "linked_accessibility_score": biz["accessibility_score"] if biz else None,
+            "linked_website":             biz.get("website")         if biz else None,
+            "linked_pain_score":          biz.get("pain_score")      if biz else None,
         })
     return out
 
