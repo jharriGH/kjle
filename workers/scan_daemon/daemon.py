@@ -29,7 +29,7 @@ import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +95,12 @@ SCAN_TOTAL_TIMEOUT_S = int(os.environ.get("SCAN_TOTAL_TIMEOUT_S", "60"))
 # Stall threshold: if no jobs complete for this many seconds while the queue is
 # non-empty, the watchdog exits with code 1 so systemd restarts the daemon fresh.
 STALL_THRESHOLD_S = int(os.environ.get("STALL_THRESHOLD_S", "300"))
+# Per-job hard ceiling for the orphan reaper. Any job still status='running' after
+# this many seconds is presumed orphaned by a prior worker death and gets reaped.
+# Default 300s (5 min) — real scans take ~90s so this is 3x headroom.
+MAX_JOB_SECONDS = int(os.environ.get("MAX_JOB_SECONDS", "300"))
+# How often the main loop runs the periodic orphan reaper (seconds).
+REAP_INTERVAL_S = 300
 
 AXE_VERSION = "4.10.2"
 AXE_PATH = Path(__file__).parent / "axe.min.js"
@@ -577,6 +583,36 @@ def _finish_job(
         _log("finish_job_error", level=logging.ERROR, job_id=job_id, error=str(e))
 
 
+def _reap_orphans(db: Client) -> int:
+    """
+    Reap jobs orphaned by a prior worker death.
+    Any scan_job still status='running' with started_at older than MAX_JOB_SECONDS*2
+    is unreachable — mark it error so it never accumulates again.
+    Bounded UPDATE: only touches rows older than the age cutoff.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=MAX_JOB_SECONDS * 2)
+    try:
+        resp = (
+            db.table("scan_jobs")
+            .update({
+                "status": "error",
+                "error": "reaped_non_terminal",
+                "finished_at": _now_iso(),
+            })
+            .eq("status", "running")
+            .lt("started_at", cutoff.isoformat())
+            .execute()
+        )
+        count = len(resp.data or [])
+        if count:
+            _log("orphans_reaped", count=count, cutoff=cutoff.isoformat(),
+                 max_job_seconds=MAX_JOB_SECONDS)
+        return count
+    except Exception as e:
+        _log("reap_orphans_error", level=logging.ERROR, error=str(e))
+        return 0
+
+
 def _update_lead_summary(db: Client, job: dict, scan: dict) -> None:
     """Write accessibility summary back to leads. Isolated — never fails the scan job."""
     lead_id = job.get("lead_id")
@@ -643,116 +679,145 @@ def _process_job(job: dict, axe_js: str, db: Client) -> None:
     job_id = job["id"]
     url = job["url"]
     _log("job_start", job_id=job_id, url=url)
+    # Belt-and-suspenders: if ANY code path exits without writing a terminal state,
+    # the finally block catches it and writes error='no_terminal_status_bug' so the
+    # job never stays stuck in 'running'.
+    _job_finished = False
 
-    # SSRF guard: reject private/loopback/cloud-metadata targets before browser launch
-    _pre_safe, _pre_reason = is_url_safe(url)
-    if not _pre_safe:
-        _pre_scan: dict[str, Any]
-        if _pre_reason in UNREACHABLE_REASONS:
-            # Dead domain / DNS failure — not a security threat; label correctly.
-            _log("unreachable", level=logging.WARNING, url=url, reason=_pre_reason)
-            _pre_scan = {
-                "status": "unreachable",
-                "error": f"unreachable: {_pre_reason}",
-                "accessibility_score": None,
-                "critical_count": 0,
-                "serious_count": 0,
-                "moderate_count": 0,
-                "minor_count": 0,
-                "violations": [],
-                "incomplete_count": 0,
-                "incomplete": [],
-                "score_formula_version": SCORE_FORMULA_VERSION,
-            }
-        else:
-            # Genuine security block: loopback, private IP, cloud metadata, etc.
-            _log("ssrf_blocked", level=logging.WARNING, url=url, reason=_pre_reason)
-            _pre_scan = {
-                "status": "blocked",
-                "error": f"ssrf_blocked: {_pre_reason}",
-                "accessibility_score": None,
-                "critical_count": 0,
-                "serious_count": 0,
-                "moderate_count": 0,
-                "minor_count": 0,
-                "violations": [],
-                "incomplete_count": 0,
-                "incomplete": [],
-                "score_formula_version": SCORE_FORMULA_VERSION,
-            }
-        result_id = _insert_result(db, job, _pre_scan)
-        _finish_job(db, job_id, done=True, result_id=result_id)
-        _update_lead_summary(db, job, _pre_scan)
-        _mark_job_completed()
-        return
+    try:
+        # SSRF guard: reject private/loopback/cloud-metadata targets before browser launch
+        _pre_safe, _pre_reason = is_url_safe(url)
+        if not _pre_safe:
+            _pre_scan: dict[str, Any]
+            if _pre_reason in UNREACHABLE_REASONS:
+                # Dead domain / DNS failure — not a security threat; label correctly.
+                _log("unreachable", level=logging.WARNING, url=url, reason=_pre_reason)
+                _pre_scan = {
+                    "status": "unreachable",
+                    "error": f"unreachable: {_pre_reason}",
+                    "accessibility_score": None,
+                    "critical_count": 0,
+                    "serious_count": 0,
+                    "moderate_count": 0,
+                    "minor_count": 0,
+                    "violations": [],
+                    "incomplete_count": 0,
+                    "incomplete": [],
+                    "score_formula_version": SCORE_FORMULA_VERSION,
+                }
+            else:
+                # Genuine security block: loopback, private IP, cloud metadata, etc.
+                _log("ssrf_blocked", level=logging.WARNING, url=url, reason=_pre_reason)
+                _pre_scan = {
+                    "status": "blocked",
+                    "error": f"ssrf_blocked: {_pre_reason}",
+                    "accessibility_score": None,
+                    "critical_count": 0,
+                    "serious_count": 0,
+                    "moderate_count": 0,
+                    "minor_count": 0,
+                    "violations": [],
+                    "incomplete_count": 0,
+                    "incomplete": [],
+                    "score_formula_version": SCORE_FORMULA_VERSION,
+                }
+            result_id = _insert_result(db, job, _pre_scan)
+            _finish_job(db, job_id, done=True, result_id=result_id)
+            _update_lead_summary(db, job, _pre_scan)
+            _mark_job_completed()
+            _job_finished = True
+            return
 
-    # Per-scan ceiling: run _scan_url in a daemon thread so this worker slot is
-    # freed after SCAN_TOTAL_TIMEOUT_S even if the browser is still winding down.
-    # page.set_default_timeout (set inside _scan_url) ensures all Playwright ops
-    # time out on their own, so the daemon thread terminates and the browser context
-    # is closed via the existing finally block — no permanent leak.
-    _scan_result: list[dict] = []
-    _scan_exc: list[BaseException] = []
+        # Per-scan ceiling: run _scan_url in a daemon thread so this worker slot is
+        # freed after SCAN_TOTAL_TIMEOUT_S even if the browser is still winding down.
+        # page.set_default_timeout (set inside _scan_url) ensures all Playwright ops
+        # time out on their own, so the daemon thread terminates and the browser context
+        # is closed via the existing finally block — no permanent leak.
+        _scan_result: list[dict] = []
+        _scan_exc: list[BaseException] = []
 
-    def _run_scan() -> None:
-        try:
-            _scan_result.append(_scan_url(url, axe_js))
-        except BaseException as exc:
-            _scan_exc.append(exc)
+        def _run_scan() -> None:
+            try:
+                _scan_result.append(_scan_url(url, axe_js))
+            except BaseException as exc:
+                _scan_exc.append(exc)
 
-    _t = threading.Thread(target=_run_scan, daemon=True)
-    _t.start()
-    _t.join(timeout=SCAN_TOTAL_TIMEOUT_S)
+        _t = threading.Thread(target=_run_scan, daemon=True)
+        _t.start()
+        _t.join(timeout=SCAN_TOTAL_TIMEOUT_S)
 
-    if _t.is_alive():
-        # Ceiling hit: free the worker slot now; browser thread will clean up when
-        # Playwright ops time out (within SCAN_NAV_TIMEOUT_MS ms).
-        _log("scan_total_timeout", level=logging.WARNING, url=url,
-             timeout_s=SCAN_TOTAL_TIMEOUT_S, job_id=job_id)
-        _finish_job(db, job_id, done=False, error="scan_timeout")
-        _update_lead_summary(db, job, {"status": "error", "error": "scan_timeout"})
-        _mark_job_completed()
-        return
+        if _t.is_alive():
+            # Ceiling hit: free the worker slot now; browser thread will clean up when
+            # Playwright ops time out (within SCAN_NAV_TIMEOUT_MS ms).
+            _log("scan_total_timeout", level=logging.WARNING, url=url,
+                 timeout_s=SCAN_TOTAL_TIMEOUT_S, job_id=job_id)
+            _finish_job(db, job_id, done=False, error="scan_timeout")
+            _update_lead_summary(db, job, {"status": "error", "error": "scan_timeout"})
+            _mark_job_completed()
+            _job_finished = True
+            return
 
-    if _scan_exc:
-        raise _scan_exc[0]
+        if _scan_exc:
+            # Handle inline — do NOT re-raise so _job_finished is guaranteed set.
+            exc = _scan_exc[0]
+            _log("scan_unhandled_exception", level=logging.ERROR,
+                 job_id=job_id, url=url, error=str(exc)[:400])
+            _finish_job(db, job_id, done=False, error=f"unhandled: {str(exc)[:400]}")
+            _update_lead_summary(db, job, {"status": "error", "error": str(exc)[:400]})
+            _mark_job_completed()
+            _job_finished = True
+            return
 
-    scan = _scan_result[0] if _scan_result else {
-        "status": "error", "error": "scan_no_result", "violations": [],
-    }
+        scan = _scan_result[0] if _scan_result else {
+            "status": "error", "error": "scan_no_result", "violations": [],
+        }
 
-    if scan["status"] == "blocked":
-        # Redirect-to-internal SSRF block; already logged inside _scan_url.
+        if scan["status"] == "blocked":
+            # Redirect-to-internal SSRF block; already logged inside _scan_url.
+            result_id = _insert_result(db, job, scan)
+            _finish_job(db, job_id, done=True, result_id=result_id)
+            _update_lead_summary(db, job, scan)
+            _mark_job_completed()
+            _job_finished = True
+            return
+
+        if scan["status"] == "error":
+            # Never store a fake passing result — error path only.
+            _finish_job(db, job_id, done=False, error=scan.get("error"))
+            _log("job_error", job_id=job_id, url=url, error=(scan.get("error") or "")[:200])
+            _update_lead_summary(db, job, scan)
+            _mark_job_completed()
+            _job_finished = True
+            return
+
         result_id = _insert_result(db, job, scan)
+        if result_id is None:
+            _finish_job(db, job_id, done=False, error="scan_results insert failed")
+            _log("job_insert_failed", level=logging.ERROR, job_id=job_id, url=url)
+            _mark_job_completed()
+            _job_finished = True
+            return
+
         _finish_job(db, job_id, done=True, result_id=result_id)
+        _log(
+            "job_done", job_id=job_id, url=url,
+            score=scan.get("accessibility_score"),
+            critical=scan.get("critical_count"),
+            result_id=result_id,
+        )
         _update_lead_summary(db, job, scan)
         _mark_job_completed()
-        return
+        _job_finished = True
 
-    if scan["status"] == "error":
-        # Never store a fake passing result — error path only.
-        _finish_job(db, job_id, done=False, error=scan.get("error"))
-        _log("job_error", job_id=job_id, url=url, error=(scan.get("error") or "")[:200])
-        _update_lead_summary(db, job, scan)
-        _mark_job_completed()
-        return
-
-    result_id = _insert_result(db, job, scan)
-    if result_id is None:
-        _finish_job(db, job_id, done=False, error="scan_results insert failed")
-        _log("job_insert_failed", level=logging.ERROR, job_id=job_id, url=url)
-        _mark_job_completed()
-        return
-
-    _finish_job(db, job_id, done=True, result_id=result_id)
-    _log(
-        "job_done", job_id=job_id, url=url,
-        score=scan.get("accessibility_score"),
-        critical=scan.get("critical_count"),
-        result_id=result_id,
-    )
-    _update_lead_summary(db, job, scan)
-    _mark_job_completed()
+    finally:
+        if not _job_finished:
+            # Defensive backstop: should never fire in normal operation.
+            _log("no_terminal_status_bug", level=logging.ERROR, job_id=job_id, url=url)
+            try:
+                _finish_job(db, job_id, done=False, error="no_terminal_status_bug")
+            except Exception:
+                pass
+            _mark_job_completed()
 
 
 # ── Main poll loop ────────────────────────────────────────────────────────────
@@ -766,6 +831,7 @@ def main() -> int:
         axe_version=AXE_VERSION,
         scan_nav_timeout_ms=SCAN_NAV_TIMEOUT_MS,
         scan_total_timeout_s=SCAN_TOTAL_TIMEOUT_S,
+        max_job_seconds=MAX_JOB_SECONDS,
         stall_threshold_s=STALL_THRESHOLD_S,
     )
 
@@ -784,6 +850,11 @@ def main() -> int:
 
     db = _make_db()
 
+    # Startup reap: clear jobs orphaned by any prior worker death before entering poll loop.
+    reaped = _reap_orphans(db)
+    _log("startup_reap_complete", reaped=reaped, max_job_seconds=MAX_JOB_SECONDS)
+    _last_reap_at = time.monotonic()
+
     global _daemon_start_time, _queue_had_jobs
     _daemon_start_time = time.monotonic()
     _watchdog = threading.Thread(target=_watchdog_loop, daemon=True, name="stall-watchdog")
@@ -793,6 +864,11 @@ def main() -> int:
 
     while not _shutdown:
         try:
+            # Periodic orphan reaper — catches any jobs that slipped through mid-run.
+            if time.monotonic() - _last_reap_at >= REAP_INTERVAL_S:
+                _reap_orphans(db)
+                _last_reap_at = time.monotonic()
+
             jobs = _poll_queued(db, SCAN_BATCH_SIZE)
             _queue_had_jobs = bool(jobs)  # watchdog: non-empty = active work expected
 
@@ -835,6 +911,7 @@ def main() -> int:
                              job_id=job_id, error=str(e))
                         _finish_job(db, job_id, done=False,
                                     error=f"unhandled: {str(e)[:400]}")
+                        _mark_job_completed()
 
         except Exception as e:
             _log("main_loop_exception", level=logging.ERROR, error=str(e))
