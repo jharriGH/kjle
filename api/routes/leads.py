@@ -293,7 +293,7 @@ async def list_leads(
         if require_name_verified is not None:
             q = q.is_("name_website_verified", require_name_verified)
         if require_email_valid:
-            q = q.eq("email_status", "valid")
+            q = q.eq("email_status", "valid").eq("email_valid", _b(True))
         if filters:
             q = _apply_dynamic_filters(q, filters)
         return q
