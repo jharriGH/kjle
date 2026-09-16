@@ -160,6 +160,7 @@ async def list_leads(
     email_provider:     Optional[str]   = Query(None, description="Filter by email provider bucket(s). Single value or comma-separated list (e.g. 'google_workspace,office365,self_hosted'). Values: gmail_consumer|google_workspace|office365|ms_consumer|yahoo|apple|other|self_hosted|unknown"),
     email_trust:        Optional[str]   = Query(None, description="Filter by email trust value(s). Single value or comma-separated list. Values: valid|catch_all|role|unconfirmable|invalid"),
     require_name_verified: Optional[bool] = Query(None, description="When true, restrict to name_website_verified=true; when false, restrict to name_website_verified=false; None = no filter"),
+    require_email_valid: Optional[bool] = Query(None, description="When true, restrict to leads with email_status='valid'. When false or None, no filter."),
     page:           int             = Query(1, ge=1),
     page_size:      int             = Query(50, ge=1, le=500),
     order_by:       str             = Query("pain_score", description="Column to sort by"),
@@ -291,6 +292,8 @@ async def list_leads(
                 q = q.in_("email_trust", trusts)
         if require_name_verified is not None:
             q = q.is_("name_website_verified", require_name_verified)
+        if require_email_valid:
+            q = q.eq("email_status", "valid")
         if filters:
             q = _apply_dynamic_filters(q, filters)
         return q
