@@ -312,19 +312,20 @@ async def list_leads(
     )
 
     # Count query — fresh builder, same apply_filters() as the row query.
-    # head=True issues a HEAD request (no data, count via Content-Range header).
+    # GET + range(0,0) returns one row + exact count via Content-Range header.
+    # HEAD requests are not used: Render strips Content-Range from HEAD responses.
     # Suppressed emails applied as NOT IN here, mirroring the row query below,
     # so total is always consistent with the rows actually returned.
     try:
         count_q = apply_filters(
-            db.table("leads").select("*", count="exact", head=True).eq("is_active", is_active)
+            db.table("leads").select("id", count="exact").eq("is_active", is_active)
         )
         if suppressed_list and not suppress_overflow:
             count_q = count_q.not_.in_("email", suppressed_list)
-        count_result = count_q.execute()
+        count_result = count_q.range(0, 0).execute()
         total = count_result.count if count_result.count is not None else 0
     except Exception as exc:
-        _logger.warning("count_query failed: %s — total set to 0", exc)
+        _logger.warning("count_query failed (%s: %s) — total set to 0", type(exc).__name__, exc)
         total = 0
 
     # Apply suppression to row query before ordering/pagination (mirrors count_q).
