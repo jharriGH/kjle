@@ -24,10 +24,12 @@ import logging
 import math
 import os
 import signal
+import socket
 import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -101,6 +103,11 @@ STALL_THRESHOLD_S = int(os.environ.get("STALL_THRESHOLD_S", "300"))
 MAX_JOB_SECONDS = int(os.environ.get("MAX_JOB_SECONDS", "300"))
 # How often the main loop runs the periodic orphan reaper (seconds).
 REAP_INTERVAL_S = 300
+# Brain notify — called on stall detection and daily healthy heartbeat.
+BRAIN_URL = os.environ.get("BRAIN_URL", "https://jim-brain-production.up.railway.app").rstrip("/")
+BRAIN_KEY = os.environ.get("BRAIN_KEY", "jim-brain-kje-2026-kingjames").strip()
+# How often to send a "healthy" progress SMS (default: every 24 h). Set to 0 to disable.
+_HEALTHY_NOTIFY_INTERVAL_S = int(os.environ.get("HEALTHY_NOTIFY_INTERVAL_S", "86400"))
 
 AXE_VERSION = "4.10.2"
 AXE_PATH = Path(__file__).parent / "axe.min.js"
@@ -140,6 +147,7 @@ def _detect_chatbot(html: str) -> bool:
 # ── Stall watchdog state (module-level, GIL-safe for scalar writes) ──────────
 _last_job_completed_at: float = 0.0    # monotonic; updated on every terminal job state
 _queue_had_jobs: bool = False           # True if last poll returned queued jobs
+_queue_depth: int = 0                   # number of queued jobs at last poll (for notify context)
 _daemon_start_time: float = 0.0        # set in main() before watchdog starts
 _at_least_one_completion: bool = False  # prevents stall-detect before first job done
 _WATCHDOG_CHECK_S = 60
@@ -180,6 +188,40 @@ def _log(event: str, level: int = logging.INFO, **fields: Any) -> None:
     )
     rec.extra_fields = fields
     log.handle(rec)
+
+
+# ── systemd notify (sd_notify via NOTIFY_SOCKET — stdlib only, zero deps) ────
+# Sends "READY=1" once on startup and "WATCHDOG=1" each poll loop so that
+# WatchdogSec=120 in the unit can kill+restart a silently hung process.
+# Safe no-op when NOTIFY_SOCKET is absent (non-systemd or Type!=notify).
+def _sd_notify(msg: str) -> None:
+    sock_path = os.environ.get("NOTIFY_SOCKET", "")
+    if not sock_path:
+        return
+    try:
+        addr = "\0" + sock_path[1:] if sock_path.startswith("@") else sock_path
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect(addr)
+            s.sendall(msg.encode())
+    except Exception:
+        pass
+
+
+# ── Brain notify (Jim's SMS/email via Brain REST — stdlib urllib, no deps) ───
+def _brain_notify(message: str, channel: str = "sms") -> None:
+    try:
+        payload = json.dumps({"message": message, "channel": channel}).encode()
+        req = urllib.request.Request(
+            f"{BRAIN_URL}/notify",
+            data=payload,
+            headers={"Content-Type": "application/json", "x-brain-key": BRAIN_KEY},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+        _log("brain_notify_sent", channel=channel, message=message[:120])
+    except Exception as e:
+        _log("brain_notify_error", level=logging.WARNING, error=str(e)[:200])
 
 
 # ── Graceful shutdown ────────────────────────────────────────────────────────
@@ -643,25 +685,44 @@ def _mark_job_completed() -> None:
 def _watchdog_loop() -> None:
     """
     Wakes every 60 s. If no jobs have completed for > STALL_THRESHOLD_S while the
-    queue is non-empty, exits with code 1 so systemd (Restart=on-failure) restarts
-    the daemon fresh — the proven recovery for all-workers-wedged deadlock.
+    queue is non-empty, notifies Jim via Brain SMS then exits with code 1 so systemd
+    (Restart=always) restarts the daemon fresh.
+
+    Also sends a daily "healthy" SMS so Jim passively sees progress without asking.
 
     Conservative guards prevent false positives:
       - startup grace: skip first _STARTUP_GRACE_S seconds
       - at-least-one-completion: skip until the daemon has finished at least one job
       - queue guard: empty queue = idle (normal), not stalled
     """
+    _last_healthy_notify_at = 0.0
+
     while not _shutdown:
         time.sleep(_WATCHDOG_CHECK_S)
         if _shutdown:
             break
-        if time.monotonic() - _daemon_start_time < _STARTUP_GRACE_S:
+
+        now = time.monotonic()
+
+        # Daily healthy heartbeat — send SMS when queue is active and no stall.
+        if (
+            _HEALTHY_NOTIFY_INTERVAL_S > 0
+            and _at_least_one_completion
+            and _queue_had_jobs
+            and (now - _last_healthy_notify_at) >= _HEALTHY_NOTIFY_INTERVAL_S
+        ):
+            _brain_notify(
+                f"KJLE scan daemon healthy: {_queue_depth} jobs queued, daemon running normally."
+            )
+            _last_healthy_notify_at = now
+
+        if now - _daemon_start_time < _STARTUP_GRACE_S:
             continue
         if not _at_least_one_completion:
             continue
         if not _queue_had_jobs:
             continue
-        seconds_idle = time.monotonic() - _last_job_completed_at
+        seconds_idle = now - _last_job_completed_at
         if seconds_idle > STALL_THRESHOLD_S:
             _log(
                 "daemon_stall_detected",
@@ -669,8 +730,13 @@ def _watchdog_loop() -> None:
                 seconds_since_last_completion=int(seconds_idle),
                 stall_threshold_s=STALL_THRESHOLD_S,
             )
+            # Notify Jim BEFORE exiting so the SMS lands even if systemd restarts quickly.
+            _brain_notify(
+                f"URGENT: KJLE scan daemon STALLED — 0 progress in {int(seconds_idle)}s, "
+                f"{_queue_depth} jobs still queued. Restarting daemon now."
+            )
             # Hard exit — sys.exit raises SystemExit in this thread only; os._exit
-            # terminates the whole process so systemd actually restarts it.
+            # terminates the whole process so systemd (Restart=always) restarts it.
             os._exit(1)
 
 
@@ -855,14 +921,23 @@ def main() -> int:
     _log("startup_reap_complete", reaped=reaped, max_job_seconds=MAX_JOB_SECONDS)
     _last_reap_at = time.monotonic()
 
-    global _daemon_start_time, _queue_had_jobs
+    global _daemon_start_time, _queue_had_jobs, _queue_depth
     _daemon_start_time = time.monotonic()
     _watchdog = threading.Thread(target=_watchdog_loop, daemon=True, name="stall-watchdog")
     _watchdog.start()
     _log("watchdog_started", stall_threshold_s=STALL_THRESHOLD_S,
          startup_grace_s=_STARTUP_GRACE_S, check_interval_s=_WATCHDOG_CHECK_S)
 
+    # Signal systemd: daemon is fully initialized and ready to serve.
+    # With Type=notify in the unit, systemd waits for this before marking active.
+    # With WatchdogSec=120, systemd will kill+restart if WATCHDOG=1 stops arriving.
+    _sd_notify("READY=1")
+    _log("sd_notify_ready_sent")
+
     while not _shutdown:
+        # Liveness ping to systemd WatchdogSec — must arrive at least every 120s.
+        # If this loop hangs (silent deadlock), pings stop and systemd force-restarts.
+        _sd_notify("WATCHDOG=1")
         try:
             # Periodic orphan reaper — catches any jobs that slipped through mid-run.
             if time.monotonic() - _last_reap_at >= REAP_INTERVAL_S:
@@ -871,6 +946,7 @@ def main() -> int:
 
             jobs = _poll_queued(db, SCAN_BATCH_SIZE)
             _queue_had_jobs = bool(jobs)  # watchdog: non-empty = active work expected
+            _queue_depth = len(jobs)
 
             if not jobs:
                 for _ in range(POLL_INTERVAL_SEC):

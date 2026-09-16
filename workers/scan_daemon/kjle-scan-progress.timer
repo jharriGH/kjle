@@ -1,0 +1,12 @@
+[Unit]
+Description=KJLE Scan Progress Notifier — runs every 30 min
+Requires=kjle-scan-progress.service
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+AccuracySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,25 @@
+[Unit]
+Description=KJLE WebSignalz Scan Daemon (Phase 3)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=notify: systemd waits for READY=1 before marking service active.
+# WatchdogSec=120: systemd kills+restarts if WATCHDOG=1 stops arriving within 120s.
+# This catches silent hangs (hung event loop, deadlocked thread) that Restart=on-failure misses.
+Type=notify
+NotifyAccess=main
+User=ccrunner
+WorkingDirectory=/opt/kjle/workers/scan_daemon
+EnvironmentFile=/etc/kjle-scan-daemon.env
+ExecStart=/opt/kjle/workers/scan_daemon/venv/bin/python /opt/kjle/workers/scan_daemon/daemon.py
+Restart=always
+RestartSec=10
+WatchdogSec=120
+StandardOutput=journal
+StandardError=journal
+TimeoutStopSec=60
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
