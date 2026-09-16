@@ -1,0 +1,9 @@
+{
+  "day": 0,
+  "sent_lead_ids": [],
+  "runs": [],
+  "last_success_utc": null,
+  "last_error": "reset-20260916: Sep-5 pre-validation batch cleared (47% bounce), fresh day-1 start with valid-only leads",
+  "current_day": 0,
+  "last_bounce_rate": null
+}
