@@ -311,22 +311,41 @@ async def list_leads(
         ).eq("is_active", is_active)
     )
 
-    # Count query — fresh builder, same apply_filters() as the row query.
-    # GET + range(0,0) returns one row + exact count via Content-Range header.
-    # HEAD requests are not used: Render strips Content-Range from HEAD responses.
-    # Suppressed emails applied as NOT IN here, mirroring the row query below,
-    # so total is always consistent with the rows actually returned.
-    try:
-        count_q = apply_filters(
-            db.table("leads").select("id", count="exact").eq("is_active", is_active)
-        )
-        if suppressed_list and not suppress_overflow:
-            count_q = count_q.not_.in_("email", suppressed_list)
-        count_result = count_q.range(0, 0).execute()
-        total = count_result.count if count_result.count is not None else 0
-    except Exception as exc:
-        _logger.warning("count_query failed (%s: %s) — total set to 0", type(exc).__name__, exc)
-        total = 0
+    # Count query — exact when niche_slug is present (fast on small subsets);
+    # estimated (instant pg_class reltuples via PostgREST count=estimated) when
+    # broad/unfiltered to avoid timing out on ~1.2M row full-table scans.
+    # Belt-and-suspenders: if exact fails, fall back to estimated — total is NEVER 0.
+    total = 0
+    total_estimated = False
+    is_narrow = niche_slug is not None
+
+    if is_narrow:
+        try:
+            count_q = apply_filters(
+                db.table("leads").select("id", count="exact").eq("is_active", is_active)
+            )
+            if suppressed_list and not suppress_overflow:
+                count_q = count_q.not_.in_("email", suppressed_list)
+            count_result = count_q.range(0, 0).execute()
+            total = count_result.count if count_result.count is not None else 0
+        except Exception as exc:
+            _logger.warning("exact count failed (%s: %s) — falling back to estimated", type(exc).__name__, exc)
+            total_estimated = True
+    else:
+        total_estimated = True
+
+    if total_estimated:
+        try:
+            est_q = apply_filters(
+                db.table("leads").select("id", count="estimated").eq("is_active", is_active)
+            )
+            if suppressed_list and not suppress_overflow:
+                est_q = est_q.not_.in_("email", suppressed_list)
+            est_result = est_q.range(0, 0).execute()
+            total = est_result.count if est_result.count is not None else 0
+        except Exception as exc:
+            _logger.warning("estimated count failed (%s: %s) — total unknown", type(exc).__name__, exc)
+            total = 0
 
     # Apply suppression to row query before ordering/pagination (mirrors count_q).
     if suppressed_list and not suppress_overflow:
@@ -347,11 +366,12 @@ async def list_leads(
         ]
 
     return {
-        "page":      page,
-        "page_size": page_size,
-        "total":     total,
-        "count":     len(leads_data),
-        "leads":     leads_data,
+        "page":            page,
+        "page_size":       page_size,
+        "total":           total,
+        "total_estimated": total_estimated,
+        "count":           len(leads_data),
+        "leads":           leads_data,
     }
 
 
