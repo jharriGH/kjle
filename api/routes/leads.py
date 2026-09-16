@@ -311,36 +311,25 @@ async def list_leads(
         ).eq("is_active", is_active)
     )
 
-    # Email suppression count: base_count minus suppressed_match_count.
-    # NOT IN drops NULL-email rows (SQL NULL NOT IN (...) = NULL = excluded).
-    # Instead: count rows matching all filters (base), then subtract those whose
-    # email is actually in the suppressed list (IN never drops NULLs).
-    # CRITICAL: each count uses a FRESH builder via apply_filters() — reusing the
-    # same builder after .execute() gives non-deterministic counts (flapping).
+    # Count query — fresh builder, same apply_filters() as the row query.
+    # head=True issues a HEAD request (no data, count via Content-Range header).
+    # Suppressed emails applied as NOT IN here, mirroring the row query below,
+    # so total is always consistent with the rows actually returned.
     try:
-        count_result = apply_filters(
-            db.table("leads").select("id", count="exact").eq("is_active", is_active)
-        ).range(0, 0).execute()
-        base_count = count_result.count if count_result.count is not None else 0
+        count_q = apply_filters(
+            db.table("leads").select("*", count="exact", head=True).eq("is_active", is_active)
+        )
+        if suppressed_list and not suppress_overflow:
+            count_q = count_q.not_.in_("email", suppressed_list)
+        count_result = count_q.execute()
+        total = count_result.count if count_result.count is not None else 0
     except Exception as exc:
         _logger.warning("count_query failed: %s — total set to 0", exc)
-        base_count = 0
+        total = 0
 
-    total = base_count
+    # Apply suppression to row query before ordering/pagination (mirrors count_q).
     if suppressed_list and not suppress_overflow:
-        try:
-            sup_match = (
-                apply_filters(
-                    db.table("leads").select("id", count="exact").eq("is_active", is_active)
-                )
-                .in_("email", suppressed_list)
-                .range(0, 0)
-                .execute()
-            )
-            suppressed_match_count = sup_match.count if sup_match.count is not None else 0
-            total = base_count - suppressed_match_count
-        except Exception as exc:
-            _logger.warning("suppressed_match_count failed: %s — using base_count as total", exc)
+        query = query.not_.in_("email", suppressed_list)
 
     # Ordering + pagination
     query = query.order(order_by, desc=(order_dir == "desc"), nullsfirst=False)
@@ -349,9 +338,8 @@ async def list_leads(
     result = query.execute()
     leads_data = result.data
 
-    # Post-filter the page: remove any row whose email is in the suppressed set.
-    # Handles both the overflow case and the normal case (avoids NOT IN NULL bug).
-    if suppressed_set:
+    # Post-filter: overflow case only (list too large for NOT IN).
+    if suppress_overflow and suppressed_set:
         leads_data = [
             r for r in leads_data
             if (r.get("email") or "").strip().lower() not in suppressed_set
