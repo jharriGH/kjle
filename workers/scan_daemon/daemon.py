@@ -665,8 +665,10 @@ def _update_lead_summary(db: Client, job: dict, scan: dict) -> None:
         update["accessibility_score"] = scan.get("accessibility_score")
         update["accessibility_violations"] = len(scan.get("violations", []))
         update["accessibility_critical"] = scan.get("critical_count", 0)
-        if scan.get("has_chatbot") is True:
-            update["has_chatbot"] = True
+        update["last_audited_at"] = _now_iso()
+        hb = scan.get("has_chatbot")
+        if hb is not None:
+            update["has_chatbot"] = bool(hb)
     try:
         db.table("leads").update(update).eq("id", lead_id).execute()
     except Exception as e:
