@@ -90,7 +90,7 @@ async def _check_robots_allowed(host: str, url: str, cache: dict) -> bool:
 # Keep in sync with _CHATBOT_SIGS in workers/scan_daemon/daemon.py.
 _CHATBOT_SIGS = [
     # Named platform vendors (specific, low false-positive risk)
-    "intercom",    "drift.com",      "tawk.to",        "crisp.chat",
+    "intercom",    "drift",          "tawk",           "crisp",
     "livechatinc", "zendesk",        "tidio",           "olark",
     "jivochat",    "smartsupp",      "hubspot",         "__lc",
     "liveagent",   "chatra",         "freshdesk",       "helpscout",
@@ -101,9 +101,12 @@ _CHATBOT_SIGS = [
     "purechat",    "pure-chat",      "kommunicate",     "chaport",
     "chatlio",     "helpcrunch",     "snapengage",      "boldchat",
     "comm100",     "salesiq",        "tars",            "collect.chat",
-    "gubagoo",     "podium",         "birdeye.com",     "thryv",
+    "gubagoo",     "podium",         "birdeye",         "thryv",
     "ada.support", "ubotstudio",     "verloop",         "engati",
     "wati",        "respond.io",
+    # AI-native chatbots / newer platforms
+    "chatbase",    "voiceflow",      "fastbots",       "chatsimple",
+    "tidiochat",   "wpbot",          "botsonic",       "zohopublic",
     # Widget DOM markers (class/ID-level specificity — safe in context)
     "chatbot",     "chatbotid",      "chat-widget",     "chatwidget",
     "live-chat",   "livechat-widget","data-chat",       "chat-bubble",
