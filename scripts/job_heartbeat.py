@@ -144,9 +144,12 @@ def probe_contacts_cleaner(conn, row: dict) -> dict:
 
 
 def probe_contacts_classify(conn, row: dict) -> dict:
-    stall_min   = int(row.get("stall_minutes") or 120)
-    prev_backlog = int(row.get("backlog") or 0)
+    stall_min        = int(row.get("stall_minutes") or 120)
+    prev_backlog     = int(row.get("backlog") or 0)
     prev_last_output = row.get("last_output_at")
+    # Detect first-ever run: last_checked_at is NULL means no prior snapshot exists.
+    # Without a prior reading throughput_window is meaningless — never flag stalled.
+    has_prior_reading = row.get("last_checked_at") is not None
 
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM contacts WHERE email_trust IS NULL")
@@ -159,11 +162,16 @@ def probe_contacts_classify(conn, row: dict) -> dict:
     else:
         last_output_at_iso = _iso(prev_last_output)
 
-    secs_idle = seconds_since(last_output_at_iso)
-    stalled = backlog > 0 and throughput_window == 0 and (
-        secs_idle is None or secs_idle > stall_min * 60
-    )
-    status = "stalled" if stalled else ("healthy" if backlog == 0 else "ok")
+    if not has_prior_reading:
+        # First run — can't compute meaningful delta; never trigger stalled/restart.
+        status = "healthy" if backlog == 0 else "ok"
+    else:
+        secs_idle = seconds_since(last_output_at_iso)
+        stalled = backlog > 0 and throughput_window == 0 and (
+            secs_idle is None or secs_idle > stall_min * 60
+        )
+        status = "stalled" if stalled else ("healthy" if backlog == 0 else "ok")
+
     return {
         "status":            status,
         "throughput_window": throughput_window,
