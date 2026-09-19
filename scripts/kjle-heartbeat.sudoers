@@ -1,0 +1,5 @@
+# Drop this file at /etc/sudoers.d/kjle-heartbeat (mode 440, root:root)
+# Grants ccrunner passwordless systemctl restart for only these two units.
+# Validate with: visudo -c -f /etc/sudoers.d/kjle-heartbeat
+ccrunner ALL=(root) NOPASSWD: /usr/bin/systemctl restart contacts-waterfall.service
+ccrunner ALL=(root) NOPASSWD: /usr/bin/systemctl restart kjle-scan-daemon.service

@@ -1,0 +1,12 @@
+[Unit]
+Description=KJLE Job Heartbeat — fires every 15 minutes
+Requires=kjle-heartbeat.service
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+AccuracySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target

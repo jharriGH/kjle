@@ -1,0 +1,23 @@
+[Unit]
+Description=KJLE Job Heartbeat (one-shot, run by kjle-heartbeat.timer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ccrunner
+Group=ccrunner
+WorkingDirectory=/opt/kjle
+# flock -n ensures only one instance runs at a time even if previous is slow
+ExecStart=/usr/bin/flock -n /tmp/kjle-heartbeat.lock \
+    /usr/bin/python3 /opt/kjle/scripts/job_heartbeat.py
+# Exit status 1 = flock couldn't acquire lock (another instance running) — OK
+SuccessExitStatus=0 1
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kjle-heartbeat
+# 14-minute hard ceiling (timer fires every 15 min)
+TimeoutStartSec=840
+
+[Install]
+WantedBy=multi-user.target
