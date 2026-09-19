@@ -395,8 +395,8 @@ async def eligible_for_campaign(
         count_result = count_query.execute()
         total = count_result.count if count_result.count is not None else 0
     except Exception as e:
-        logger.error(f"eligible_for_campaign count failed: {e}")
-        raise HTTPException(status_code=500, detail=f"count_query_failed: {e}")
+        logger.warning(f"eligible_for_campaign count degraded (non-fatal): {e}")
+        total = None
 
     # ── fetch page ─────────────────────────────────────────────────────────────
     try:
@@ -557,6 +557,7 @@ async def eligible_for_campaign(
     return {
         "total": total,
         "count": len(leads_out),
+        "count_degraded": total is None,
         "leads": leads_out,
         "skipped_filters": skipped_filters,
         "segment_id": segment_id,
