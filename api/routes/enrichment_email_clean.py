@@ -69,9 +69,10 @@ router = APIRouter()
 TRUELIST_BATCHES_URL  = "https://api.truelist.io/api/v1/batches"
 TRUELIST_VERIFY_URL   = "https://api.truelist.io/api/v1/verify_inline"  # retained for single endpoint
 
-INGEST_CHUNK_SIZE     = 500   # lead-id chunks for CSV ingestion UPDATE
-                              # (well under PostgREST URL-length cap — see
-                              # memory/project_postgrest_in_url_cap.md)
+INGEST_CHUNK_SIZE     = 500   # lead-id chunks for CSV ingestion SELECT paging
+STAMP_CHUNK_SIZE      = 100   # lead-id chunks for UPDATE .in_() calls
+                              # 100 UUIDs × 37 chars = ~3.7KB URL, safe under Supabase's
+                              # 8KB PATCH URL limit (500 × 37 = 18KB → hit 414 silently)
 SUBMIT_TIMEOUT_SEC    = 60.0
 POLL_TIMEOUT_SEC      = 30.0
 CSV_DOWNLOAD_TIMEOUT  = 300.0
@@ -259,11 +260,15 @@ async def submit_batch(
         logger.error(f"[truelist.submit_batch] audit insert failed for {batch_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to record batch {batch_id}: {e}")
 
-    # Mark leads pending_batch in chunks of INGEST_CHUNK_SIZE (URL-length cap)
+    # Mark leads pending_batch in chunks of STAMP_CHUNK_SIZE.
+    # CRITICAL: ingest_batch_result finds leads via WHERE email_truelist_batch_id=batch_id.
+    # If stamping fails silently, ingest returns processed=0 and the leads get re-submitted
+    # the next night to a different batch. Use STAMP_CHUNK_SIZE=100 to stay under Supabase's
+    # 8KB PATCH URL limit (500 UUIDs × 37 chars = 18KB → silent 414, was the root-cause bug).
     ids = [l["id"] for l in leads]
     updated = 0
-    for i in range(0, len(ids), INGEST_CHUNK_SIZE):
-        chunk = ids[i:i + INGEST_CHUNK_SIZE]
+    for i in range(0, len(ids), STAMP_CHUNK_SIZE):
+        chunk = ids[i:i + STAMP_CHUNK_SIZE]
         try:
             db.table("leads").update({
                 "email_status":            "pending_batch",
@@ -271,8 +276,20 @@ async def submit_batch(
             }).in_("id", chunk).execute()
             updated += len(chunk)
         except Exception as e:
-            logger.error(f"[truelist.submit_batch] lead mark-pending chunk failed: {e}")
-            # Continue — partial marks are recoverable; CSV ingest scopes by batch_id
+            logger.error(
+                f"[truelist.submit_batch] lead mark-pending chunk failed for batch {batch_id} "
+                f"(offset={i}, chunk_size={len(chunk)}): {e}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to stamp leads for batch {batch_id} at offset {i}: {e}",
+            )
+
+    if updated != len(ids):
+        logger.warning(
+            f"[truelist.submit_batch] stamp count mismatch for {batch_id}: "
+            f"expected={len(ids)}, stamped={updated}"
+        )
 
     return {
         "submitted":   len(payload_data),
@@ -623,6 +640,128 @@ async def ingest_batch_result(db, api_key: str, batch_id: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Stamp recovery — re-stamp leads by email match when a batch has 0 tagged leads
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def recover_batch_stamps(db, api_key: str, batch_id: str) -> dict:
+    """
+    Recovery path for batches where submit_batch's stamp step silently failed
+    (root cause: PostgREST 414 from too-large .in_() URL with 500 UUIDs).
+
+    Algorithm:
+      1. Verify 0 leads currently carry this batch_id (safety guard).
+      2. Download the annotated CSV from Truelist (or re-poll if URL missing).
+      3. For each email in the CSV, find leads with that email that are
+         still untagged (email_truelist_batch_id IS NULL, email_cleaned_at IS NULL).
+      4. Stamp matching leads with batch_id + 'pending_batch'.
+      5. Run ingest_batch_result to apply the CSV results.
+
+    Safe to re-run: if leads are already stamped or already ingested the
+    relevant checks inside ingest_batch_result exit cleanly.
+    """
+    # Step 1: check current tag count
+    tagged_res = (
+        db.table("leads")
+        .select("id", count="exact")
+        .eq("email_truelist_batch_id", batch_id)
+        .execute()
+    )
+    already_tagged = tagged_res.count or 0
+    logger.info(f"[recover_batch_stamps] batch={batch_id} already_tagged={already_tagged}")
+
+    if already_tagged > 0:
+        logger.info(f"[recover_batch_stamps] {already_tagged} leads already tagged — skipping re-stamp, proceeding to ingest")
+    else:
+        # Step 2: get CSV URL
+        res = db.table("truelist_batches").select("*").eq("id", batch_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail=f"Batch {batch_id} not in truelist_batches")
+        batch_row = res.data[0]
+
+        csv_url = batch_row.get("annotated_csv_url")
+        if not csv_url:
+            raw = await poll_batch(api_key, batch_id)
+            csv_url = raw.get("annotated_csv_url")
+            if not csv_url:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Batch {batch_id} has no annotated_csv_url (state={raw.get('batch_state')}) — cannot re-stamp",
+                )
+            db.table("truelist_batches").update({
+                "annotated_csv_url":     csv_url,
+                "safest_bet_csv_url":    raw.get("safest_bet_csv_url"),
+                "highest_reach_csv_url": raw.get("highest_reach_csv_url"),
+                "only_invalid_csv_url":  raw.get("only_invalid_csv_url"),
+                "status":                raw.get("batch_state") or "completed",
+            }).eq("id", batch_id).execute()
+
+        # Step 3: parse CSV for email list
+        csv_text = await fetch_annotated_csv(api_key, csv_url)
+        email_map = _parse_annotated_csv(csv_text)
+        if not email_map:
+            raise HTTPException(status_code=502, detail=f"CSV for {batch_id} parsed to 0 emails")
+
+        emails = list(email_map.keys())
+        logger.info(f"[recover_batch_stamps] {len(emails)} emails in CSV — looking up untagged leads")
+
+        # Step 4: find and stamp leads by email in chunks
+        stamped_total = 0
+        not_found = 0
+        for i in range(0, len(emails), STAMP_CHUNK_SIZE):
+            email_chunk = emails[i:i + STAMP_CHUNK_SIZE]
+            try:
+                rows = (
+                    db.table("leads")
+                    .select("id")
+                    .in_("email", email_chunk)
+                    .is_("email_truelist_batch_id", "null")
+                    .is_("email_cleaned_at", "null")
+                    .execute()
+                    .data or []
+                )
+            except Exception as e:
+                logger.error(f"[recover_batch_stamps] email lookup chunk failed: {e}")
+                continue
+
+            if not rows:
+                not_found += len(email_chunk)
+                continue
+
+            lead_ids = [r["id"] for r in rows]
+            for j in range(0, len(lead_ids), STAMP_CHUNK_SIZE):
+                id_chunk = lead_ids[j:j + STAMP_CHUNK_SIZE]
+                try:
+                    db.table("leads").update({
+                        "email_status":            "pending_batch",
+                        "email_truelist_batch_id": batch_id,
+                    }).in_("id", id_chunk).execute()
+                    stamped_total += len(id_chunk)
+                except Exception as e:
+                    logger.error(f"[recover_batch_stamps] stamp chunk failed: {e}")
+
+        logger.info(
+            f"[recover_batch_stamps] batch={batch_id} stamped={stamped_total} not_found={not_found}"
+        )
+
+        if stamped_total == 0:
+            logger.warning(
+                f"[recover_batch_stamps] 0 leads stamped for {batch_id} — "
+                "leads may have already been cleaned by a later batch"
+            )
+            # Mark the batch ingested with 0 so it won't be re-processed
+            db.table("truelist_batches").update({
+                "status":      "ingested",
+                "ingested_at": _now_iso(),
+                "notes":       (batch_row.get("notes") or "") + " | recover_stamps: 0 untagged leads found (already cleaned)",
+            }).eq("id", batch_id).execute()
+            return {"batch_id": batch_id, "status": "recovery_noop", "stamped": 0}
+
+    # Step 5: ingest
+    result = await ingest_batch_result(db, api_key, batch_id)
+    return {"batch_id": batch_id, "status": "recovered", "stamped": already_tagged or stamped_total if already_tagged == 0 else already_tagged, "ingest": result}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HTTP API
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -760,6 +899,18 @@ async def poll_endpoint(batch_id: str, ingest_if_done: bool = True, db=Depends(g
         return {"batch_id": batch_id, "state": state, "raw": raw, "ingest": ingest}
 
     return {"batch_id": batch_id, "state": state, "raw": raw}
+
+
+@router.post("/email-clean/recover-stamps/{batch_id}")
+async def recover_stamps_endpoint(batch_id: str, db=Depends(get_db)):
+    """
+    Recovery endpoint for batches where stamp step silently failed (processed=0 bug).
+    Re-stamps leads by email match from the Truelist annotated CSV, then re-ingests.
+    Safe to call on a batch that was already ingested — returns early with no-op.
+    """
+    api_key = _get_truelist_api_key(db)
+    result = await recover_batch_stamps(db, api_key, batch_id)
+    return result
 
 
 @router.get("/email-clean/batches")
