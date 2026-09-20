@@ -595,7 +595,10 @@ async def ingest_batch_result(
             detail="DATABASE_URL not set — cannot perform email-match ingest",
         )
 
-    conn = psycopg2.connect(db_url, connect_timeout=15, options="-c statement_timeout=30000")
+    # 60s per chunk — normal 500-email batches fit in <5s; allow headroom for
+    # large adopted batches. A lower(email) functional index on leads would help
+    # if timeouts recur: CREATE INDEX idx_leads_lower_email ON leads (lower(email)).
+    conn = psycopg2.connect(db_url, connect_timeout=15, options="-c statement_timeout=60000")
     conn.autocommit = False
     try:
         for (status, valid, sub), emails_lower in verdict_groups.items():
