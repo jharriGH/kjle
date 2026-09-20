@@ -56,6 +56,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
+import psycopg2
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
@@ -70,6 +71,7 @@ TRUELIST_BATCHES_URL  = "https://api.truelist.io/api/v1/batches"
 TRUELIST_VERIFY_URL   = "https://api.truelist.io/api/v1/verify_inline"  # retained for single endpoint
 
 INGEST_CHUNK_SIZE     = 500   # lead-id chunks for CSV ingestion SELECT paging
+EMAIL_INGEST_CHUNK    = 300   # email-list chunks for lower(email)=ANY() UPDATE
 STAMP_CHUNK_SIZE      = 100   # lead-id chunks for UPDATE .in_() calls
                               # 100 UUIDs × 37 chars = ~3.7KB URL, safe under Supabase's
                               # 8KB PATCH URL limit (500 × 37 = 18KB → hit 414 silently)
@@ -511,31 +513,44 @@ async def fetch_annotated_csv(api_key: str, url: str) -> str:
     return r.text
 
 
-async def ingest_batch_result(db, api_key: str, batch_id: str) -> dict:
+async def ingest_batch_result(
+    db, api_key: str, batch_id: str, *, force_reingest: bool = False
+) -> dict:
     """
     Idempotent ingestion of a completed batch's annotated CSV into the leads
-    table. Page through leads where email_truelist_batch_id=batch_id (cursor
-    by id), look up each email's classification, UPDATE by id chunks.
+    table. Matches leads by EMAIL from the CSV (lower(email) = ANY(chunk))
+    rather than by email_truelist_batch_id — so it works even when the stamp
+    step in submit_batch silently failed (root cause of processed=0 batches).
 
-    Safe to re-run: if a batch row is already status='ingested', returns the
-    cached summary instead of re-downloading.
+    Uses psycopg2 directly for the lower(email)=ANY() predicate since the
+    Supabase client cannot perform column-transform filters.
+
+    Idempotency: the WHERE clause includes `AND email_cleaned_at IS NULL` so
+    re-running the same batch a second time touches 0 rows.
+
+    force_reingest: skip the already_ingested early-exit so a previously
+    zero-processed batch can be re-run after this fix.
     """
+    print(f"[HB] ingest_batch_result start: batch={batch_id} force={force_reingest}", flush=True)
+
     # Look up batch row
     res = db.table("truelist_batches").select("*").eq("id", batch_id).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail=f"Batch {batch_id} not in truelist_batches")
     batch = res.data[0]
 
-    if batch.get("status") == "ingested":
+    if batch.get("status") == "ingested" and not force_reingest:
+        print(f"[HB] ingest_batch_result {batch_id}: already_ingested, skipping", flush=True)
         return {
-            "batch_id":  batch_id,
-            "status":    "already_ingested",
+            "batch_id":    batch_id,
+            "status":      "already_ingested",
             "ingested_at": batch.get("ingested_at"),
         }
 
     csv_url = batch.get("annotated_csv_url")
     if not csv_url:
         # Re-poll Truelist to populate URLs
+        print(f"[HB] ingest_batch_result {batch_id}: no csv_url, re-polling Truelist", flush=True)
         raw = await poll_batch(api_key, batch_id)
         csv_url = raw.get("annotated_csv_url")
         if not csv_url:
@@ -553,89 +568,92 @@ async def ingest_batch_result(db, api_key: str, batch_id: str) -> dict:
             "completed_at":          _now_iso() if (raw.get("batch_state") == "completed") else batch.get("completed_at"),
         }).eq("id", batch_id).execute()
 
+    print(f"[HB] ingest_batch_result {batch_id}: downloading CSV", flush=True)
     csv_text = await fetch_annotated_csv(api_key, csv_url)
     email_map = _parse_annotated_csv(csv_text)
     if not email_map:
         raise HTTPException(status_code=502, detail=f"Annotated CSV for {batch_id} parsed to 0 rows")
+    print(f"[HB] ingest_batch_result {batch_id}: CSV has {len(email_map)} emails", flush=True)
 
-    # Cursor-paginate the leads scoped to this batch_id
-    counts = {"valid": 0, "invalid": 0, "unknown": 0, "error": 0, "no_csv_match": 0}
+    # Group CSV entries by verdict so each UPDATE targets one status value
+    verdict_groups: dict[tuple, list] = {}
     sub_state_seen: dict[str, int] = {}
-    last_id: Optional[str] = None
+    for em_lower, mapped in email_map.items():
+        status, valid = parse_truelist_state(mapped["state"])
+        sub = mapped.get("sub_state", "") or ""
+        sub_state_seen[sub] = sub_state_seen.get(sub, 0) + 1
+        verdict_groups.setdefault((status, valid, sub), []).append(em_lower)
+
+    counts: dict[str, int] = {"valid": 0, "invalid": 0, "unknown": 0, "error": 0}
     total_processed = 0
     now_iso = _now_iso()
 
-    while True:
-        q = (
-            db.table("leads")
-            .select("id, email")
-            .eq("email_truelist_batch_id", batch_id)
-            .order("id", desc=False)
-            .limit(INGEST_CHUNK_SIZE)
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        raise HTTPException(
+            status_code=500,
+            detail="DATABASE_URL not set — cannot perform email-match ingest",
         )
-        if last_id is not None:
-            q = q.gt("id", last_id)
-        try:
-            rows = q.execute().data or []
-        except Exception as e:
-            logger.error(f"[ingest_batch_result] lead-page fetch failed: {e}")
-            raise
 
-        if not rows:
-            break
-
-        # Bucket by target email_status for grouped UPDATE-by-id chunks
-        groups: dict[tuple[str, Optional[bool], str], list[str]] = {}
-        for r_lead in rows:
-            em = (r_lead.get("email") or "").strip().lower()
-            mapped = email_map.get(em)
-            if not mapped:
-                counts["no_csv_match"] += 1
-                # Leave at pending_batch — recovery will pick it up next poll/run
-                continue
-            status, valid = parse_truelist_state(mapped["state"])
-            sub = mapped.get("sub_state", "") or ""
-            sub_state_seen[sub] = sub_state_seen.get(sub, 0) + 1
-            counts[status] = counts.get(status, 0) + 1
-            key = (status, valid, sub)
-            groups.setdefault(key, []).append(r_lead["id"])
-
-        for (status, valid, sub), id_list in groups.items():
-            for i in range(0, len(id_list), INGEST_CHUNK_SIZE):
-                chunk = id_list[i:i + INGEST_CHUNK_SIZE]
+    conn = psycopg2.connect(db_url, connect_timeout=15, options="-c statement_timeout=30000")
+    conn.autocommit = False
+    try:
+        for (status, valid, sub), emails_lower in verdict_groups.items():
+            for i in range(0, len(emails_lower), EMAIL_INGEST_CHUNK):
+                chunk = emails_lower[i:i + EMAIL_INGEST_CHUNK]
                 try:
-                    db.table("leads").update({
-                        "email_status":     status,
-                        "email_valid":      valid,
-                        "email_sub_state":  sub or None,
-                        "email_cleaned_at": now_iso,
-                    }).in_("id", chunk).execute()
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE leads
+                               SET email_status    = %s,
+                                   email_valid     = %s,
+                                   email_sub_state = NULLIF(%s, ''),
+                                   email_cleaned_at = %s
+                             WHERE lower(email) = ANY(%s::text[])
+                               AND email_cleaned_at IS NULL
+                            """,
+                            (status, valid, sub, now_iso, chunk),
+                        )
+                        n = cur.rowcount
+                    conn.commit()
+                    total_processed += n
+                    counts[status] = counts.get(status, 0) + n
+                    print(
+                        f"[HB] ingest_batch_result {batch_id}: "
+                        f"chunk offset={i} status={status} matched={n}",
+                        flush=True,
+                    )
                 except Exception as e:
-                    logger.error(f"[ingest_batch_result] update chunk failed ({status}): {e}")
+                    conn.rollback()
+                    logger.error(f"[ingest_batch_result] email-match UPDATE failed ({status}): {e}")
                     counts["error"] = counts.get("error", 0) + len(chunk)
+    finally:
+        conn.close()
 
-        total_processed += len(rows)
-        last_id = rows[-1]["id"]
-        if len(rows) < INGEST_CHUNK_SIZE:
-            break
+    print(
+        f"[HB] ingest_batch_result {batch_id}: done "
+        f"total_processed={total_processed} counts={counts}",
+        flush=True,
+    )
 
     # Finalize batch row
     db.table("truelist_batches").update({
         "status":      "ingested",
         "ingested_at": _now_iso(),
         "notes":       (batch.get("notes") or "") + (
-            f" | ingest: processed={total_processed}, valid={counts['valid']}, "
+            f" | ingest(email-match): processed={total_processed}, valid={counts['valid']}, "
             f"invalid={counts['invalid']}, unknown={counts['unknown']}, "
-            f"no_csv_match={counts['no_csv_match']}, errors={counts['error']}"
+            f"errors={counts['error']}"
         ),
     }).eq("id", batch_id).execute()
 
     return {
-        "batch_id":         batch_id,
-        "status":           "ingested",
-        "leads_processed":  total_processed,
-        "counts":           counts,
-        "sub_states_top":   sorted(sub_state_seen.items(), key=lambda x: -x[1])[:10],
+        "batch_id":        batch_id,
+        "status":          "ingested",
+        "leads_processed": total_processed,
+        "counts":          counts,
+        "sub_states_top":  sorted(sub_state_seen.items(), key=lambda x: -x[1])[:10],
     }
 
 
@@ -911,6 +929,68 @@ async def recover_stamps_endpoint(batch_id: str, db=Depends(get_db)):
     api_key = _get_truelist_api_key(db)
     result = await recover_batch_stamps(db, api_key, batch_id)
     return result
+
+
+@router.post("/email-clean/recover-zero-batches")
+async def recover_zero_batches_endpoint(
+    hours_back: int = Query(default=48, ge=1, le=168),
+    dry_run: bool = False,
+    db=Depends(get_db),
+):
+    """
+    Find recently-ingested batches whose notes show processed=0 and re-ingest
+    them using the email-match path. Recovers leads lost to the stamp-timeout bug.
+
+    hours_back: how far back to scan (default 48h, max 168h/7d).
+    dry_run: list matching batches without re-ingesting.
+    """
+    api_key = _get_truelist_api_key(db)
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).isoformat()
+
+    res = (
+        db.table("truelist_batches")
+        .select("id, notes, submitted_at, ingested_at, annotated_csv_url")
+        .eq("status", "ingested")
+        .gt("submitted_at", cutoff)
+        .execute()
+    )
+    all_recent = res.data or []
+    zero_batches = [r for r in all_recent if r.get("notes") and "processed=0" in r["notes"]]
+    print(
+        f"[HB] recover-zero-batches: scanned {len(all_recent)} batches in last {hours_back}h, "
+        f"{len(zero_batches)} have processed=0",
+        flush=True,
+    )
+
+    if dry_run:
+        return {"dry_run": True, "hours_back": hours_back, "zero_batches": zero_batches}
+
+    results = []
+    for row in zero_batches:
+        bid = row["id"]
+        has_csv = bool(row.get("annotated_csv_url"))
+        print(f"[HB] recover-zero-batches: re-ingesting {bid} (has_csv={has_csv})", flush=True)
+        try:
+            result = await ingest_batch_result(db, api_key, bid, force_reingest=True)
+            recovered = result.get("leads_processed", 0)
+            print(f"[HB] recover-zero-batches: {bid} → recovered={recovered}", flush=True)
+            results.append({"batch_id": bid, "recovered": recovered, "result": result})
+        except Exception as e:
+            logger.error(f"[recover_zero_batches] {bid} failed: {e}")
+            results.append({"batch_id": bid, "recovered": 0, "error": str(e)})
+
+    total_recovered = sum(r.get("recovered", 0) for r in results)
+    print(
+        f"[HB] recover-zero-batches: complete — {len(results)} batches, total_recovered={total_recovered}",
+        flush=True,
+    )
+    return {
+        "status":          "complete",
+        "batches_found":   len(zero_batches),
+        "batches_tried":   len(results),
+        "total_recovered": total_recovered,
+        "results":         results,
+    }
 
 
 @router.get("/email-clean/batches")
