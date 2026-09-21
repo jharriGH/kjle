@@ -36,6 +36,7 @@ TRUELIST_BATCHES_URL = "https://api.truelist.io/api/v1/batches"
 LOG_FILE = "/tmp/contacts_waterfall.log"
 REPORT_FILE = "/tmp/kjle_contacts_waterfall.txt"
 BATCH_ID_FILE = "/tmp/contacts_truelist_batch_id.txt"
+MAX_INFLIGHT = 3  # stop submitting new batches when this many are still pending/processing/finalizing
 
 logging.basicConfig(
     level=logging.INFO,
@@ -179,6 +180,7 @@ def _classify_and_update_domain(domain: str) -> int:
 
 def step1_provider() -> int:
     log.info("=== STEP 1: Email Provider Classification ===")
+    print("[HB] step1: provider classification starting", flush=True)
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute("""
@@ -207,6 +209,7 @@ def step1_provider() -> int:
             log.info(f"  progress {done}/{len(domains)} domains | {total_updated} contacts updated")
 
     log.info(f"Step 1 done — {total_updated} contacts provider-classified")
+    print(f"[HB] step1: done — {total_updated} contacts provider-classified", flush=True)
     return total_updated
 
 
@@ -255,6 +258,7 @@ def _derive_trust(primary_email: str, emails_jsonb, email_provider: str) -> str:
 
 def step2_trust() -> int:
     log.info("=== STEP 2: Email Trust Derivation ===")
+    print("[HB] step2: trust derivation starting", flush=True)
     conn = get_conn()
     with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("""
@@ -283,6 +287,7 @@ def step2_trust() -> int:
             log.info(f"  trust={trust}: {cur.rowcount} contacts")
 
     log.info(f"Step 2 done — {updated} contacts got email_trust")
+    print(f"[HB] step2: done — {updated} contacts got email_trust", flush=True)
     conn.close()
     return updated
 
@@ -377,7 +382,6 @@ def _ingest_csv_into_contacts(conn, batch_id: str, csv_url: str, api_key: str) -
                             ELSE email_trust
                         END
                     WHERE lower(primary_email) = ANY(%s::text[])
-                      AND email_status = 'unvalidated'
                 """, (status, valid, now_ts, status, status, chunk))
                 counts[status] = counts.get(status, 0) + cur.rowcount
 
@@ -398,6 +402,7 @@ def _resume_contacts_batches(conn, api_key: str) -> int:
             FROM truelist_batches
             WHERE submitted_by = 'contacts_waterfall'
               AND annotated_csv_url IS NOT NULL
+              AND notes NOT ILIKE '%%contacts_resume_done%%'
               AND (
                     status = 'completed'
                 OR (status = 'ingested' AND notes ILIKE '%%ingest: processed=0%%')
@@ -430,7 +435,8 @@ def _resume_contacts_batches(conn, api_key: str) -> int:
                 WHERE id = %s
             """, (
                 f" | contacts_resume: valid={counts.get('valid', 0)},"
-                f"invalid={counts.get('invalid', 0)},unknown={counts.get('unknown', 0)},total={total}",
+                f"invalid={counts.get('invalid', 0)},unknown={counts.get('unknown', 0)},total={total}"
+                f" | contacts_resume_done",
                 batch_id,
             ))
         log.info(f"  [resume] Recovered batch {batch_id} → {total} contacts updated")
@@ -440,15 +446,132 @@ def _resume_contacts_batches(conn, api_key: str) -> int:
 
 # ── STEP 3: Truelist Validation ───────────────────────────────────────────────
 
+def _drain_inflight_batches(conn, api_key: str) -> int:
+    """
+    Poll Truelist for every contacts_waterfall batch that is still
+    pending/processing/finalizing. For each that has completed, download
+    the annotated CSV and ingest into contacts via email-match.
+    One batch failure does not abort the whole pass. Returns total contacts updated.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, annotated_csv_url
+            FROM truelist_batches
+            WHERE submitted_by = 'contacts_waterfall'
+              AND status IN ('pending', 'processing', 'finalizing')
+            ORDER BY submitted_at
+        """)
+        inflight = cur.fetchall()
+
+    if not inflight:
+        print("[HB] drain: no in-flight batches", flush=True)
+        log.info("  [drain] no in-flight batches")
+        return 0
+
+    print(f"[HB] drain: {len(inflight)} batch(es) to poll", flush=True)
+    log.info(f"  [drain] {len(inflight)} in-flight batch(es) — polling Truelist")
+    total_updated = 0
+
+    for batch_id, _ in inflight:
+        try:
+            time.sleep(1)  # avoid rate-limit on bulk polling
+            with httpx.Client(timeout=30.0) as client:
+                pr = client.get(
+                    f"{TRUELIST_BATCHES_URL}/{batch_id}",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+            if pr.status_code == 429:
+                print(f"[HB] drain: {batch_id} rate-limited — sleeping 60s then continuing", flush=True)
+                log.warning(f"  [drain] {batch_id} rate-limited")
+                time.sleep(60)
+                continue
+            if pr.status_code != 200:
+                print(f"[HB] drain: {batch_id} poll HTTP {pr.status_code} — skipping", flush=True)
+                log.warning(f"  [drain] {batch_id} poll HTTP {pr.status_code}")
+                continue
+
+            raw = pr.json()
+            state = raw.get("batch_state", "unknown")
+            csv_url = raw.get("annotated_csv_url")
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE truelist_batches SET status=%s, annotated_csv_url=%s WHERE id=%s",
+                    (state, csv_url, batch_id),
+                )
+
+            print(f"[HB] drain: {batch_id} state={state}", flush=True)
+            log.info(f"  [drain] {batch_id}: state={state}")
+
+            if state != "completed" or not csv_url:
+                continue
+
+            # Completed — ingest CSV into contacts by email match
+            result = _ingest_csv_into_contacts(conn, batch_id, csv_url, api_key)
+            total = result.get("total", 0)
+            counts = result.get("counts", {})
+            total_updated += total
+
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE truelist_batches
+                    SET status      = 'ingested',
+                        ingested_at = COALESCE(ingested_at, NOW()),
+                        notes       = notes || %s
+                    WHERE id = %s
+                """, (
+                    f" | drain_ingest: valid={counts.get('valid', 0)},"
+                    f"invalid={counts.get('invalid', 0)},unknown={counts.get('unknown', 0)},"
+                    f"total={total} | contacts_resume_done",
+                    batch_id,
+                ))
+            print(f"[HB] drain: {batch_id} ingested — {total} contacts updated", flush=True)
+            log.info(f"  [drain] {batch_id}: ingested {total} contacts {counts}")
+
+        except Exception as e:
+            print(f"[HB] drain: {batch_id} error — {e}, continuing", flush=True)
+            log.error(f"  [drain] {batch_id} error: {e}")
+
+    print(f"[HB] drain: pass complete — {total_updated} contacts updated from {len(inflight)} batch(es)", flush=True)
+    log.info(f"  [drain] pass complete: {total_updated} contacts updated")
+    return total_updated
+
+
 def step3_truelist(api_key: str) -> dict:
     log.info("=== STEP 3: Truelist Email Validation ===")
+    print("[HB] step3: start", flush=True)
     conn = get_conn()
 
-    # Resume any contacts_waterfall batches from prior timed-out runs.
-    # Truelist webhook calls ingest_batch_result (leads table) on these batches
-    # and logs processed=0 — this recovers them into contacts before submitting new ones.
+    # DRAIN PASS — poll every in-flight contacts_waterfall batch; ingest any completed ones.
+    # Runs every cycle so previously timed-out batches are reclaimed regardless of submit.
+    print("[HB] step3: drain pass starting", flush=True)
+    drain_updated = _drain_inflight_batches(conn, api_key)
+    print(f"[HB] step3: drain pass done — {drain_updated} contacts updated", flush=True)
+
+    # Resume any missed-webhook batches (completed status that ingested 0 via leads path).
     _resume_contacts_batches(conn, api_key)
 
+    # CAP CHECK — count still-pending/processing/finalizing batches after draining.
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*) FROM truelist_batches
+            WHERE submitted_by = 'contacts_waterfall'
+              AND status IN ('pending', 'processing', 'finalizing')
+        """)
+        inflight_count = cur.fetchone()[0]
+
+    print(f"[HB] step3: in-flight={inflight_count} cap={MAX_INFLIGHT}", flush=True)
+    log.info(f"  In-flight batches: {inflight_count} (cap={MAX_INFLIGHT})")
+
+    if inflight_count >= MAX_INFLIGHT:
+        log.info(f"  Skipping submit — {inflight_count} batches still in-flight (cap={MAX_INFLIGHT})")
+        print(f"[HB] step3: skipping submit — inflight={inflight_count} >= cap={MAX_INFLIGHT}", flush=True)
+        conn.close()
+        return {"skipped": True, "reason": "inflight_cap", "inflight": inflight_count,
+                "drained": drain_updated}
+
+    # SELECT contacts to validate
+    print("[HB] step3: querying unvalidated contacts", flush=True)
     with conn.cursor() as cur:
         cur.execute("""
             SELECT id::text, primary_email
@@ -463,6 +586,7 @@ def step3_truelist(api_key: str) -> dict:
 
     if not rows:
         log.info("  Nothing to validate — no unvalidated contacts (or all are catch_all)")
+        print("[HB] step3: nothing to validate", flush=True)
         conn.close()
         return {"submitted": 0, "reason": "all_already_validated"}
 
@@ -476,6 +600,7 @@ def step3_truelist(api_key: str) -> dict:
             payload.append([e])
 
     log.info(f"  Submitting {len(payload)} unique emails to Truelist ({len(rows)} contacts)")
+    print(f"[HB] step3: submitting {len(payload)} emails to Truelist", flush=True)
     batch_name = f"kjle_contacts_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
 
     with httpx.Client(timeout=60.0) as client:
@@ -505,6 +630,8 @@ def step3_truelist(api_key: str) -> dict:
         batch_id = body.get("id")
         log.info(f"  Batch submitted: {batch_id} (state={body.get('batch_state')})")
 
+    print(f"[HB] step3: batch {batch_id} submitted", flush=True)
+
     # Persist batch ID for recovery if the script is interrupted
     with open(BATCH_ID_FILE, "w") as f:
         f.write(batch_id)
@@ -525,6 +652,7 @@ def step3_truelist(api_key: str) -> dict:
     csv_url = None
 
     log.info(f"  Polling {batch_id} (up to {MAX_WAIT//60} min, every {POLL_INTERVAL}s)...")
+    print(f"[HB] step3: polling {batch_id} (up to 45min)", flush=True)
     while state != "completed" and elapsed < MAX_WAIT:
         time.sleep(POLL_INTERVAL)
         elapsed += POLL_INTERVAL
@@ -536,6 +664,7 @@ def step3_truelist(api_key: str) -> dict:
                 )
             if pr.status_code == 429:
                 log.warning("  Poll rate-limited — waiting extra 120s")
+                print("[HB] step3: poll rate-limited — extra 120s", flush=True)
                 time.sleep(120)
                 elapsed += 120
                 continue
@@ -546,6 +675,7 @@ def step3_truelist(api_key: str) -> dict:
             state = raw.get("batch_state", "unknown")
             csv_url = raw.get("annotated_csv_url")
             log.info(f"  Poll at {elapsed}s: state={state}")
+            print(f"[HB] step3: poll {elapsed}s state={state}", flush=True)
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE truelist_batches SET status=%s, annotated_csv_url=%s WHERE id=%s",
@@ -557,13 +687,15 @@ def step3_truelist(api_key: str) -> dict:
     if state != "completed":
         log.warning(
             f"  Batch not completed after {elapsed}s (state={state}). "
-            f"Batch ID saved to {BATCH_ID_FILE} for manual resume."
+            f"Batch ID saved to {BATCH_ID_FILE}. Drain pass will recover it next cycle."
         )
+        print(f"[HB] step3: poll timeout after {elapsed}s state={state} — drain pass will recover next cycle", flush=True)
         conn.close()
         return {"batch_id": batch_id, "state": state, "note": "poll_timeout"}
 
     # Download annotated CSV
     log.info("  Downloading annotated CSV...")
+    print(f"[HB] step3: batch completed — downloading CSV", flush=True)
     try:
         with httpx.Client(timeout=300.0, follow_redirects=True) as client:
             cr = client.get(csv_url, headers={"Authorization": f"Bearer {api_key}"})
@@ -578,6 +710,7 @@ def step3_truelist(api_key: str) -> dict:
         return {"batch_id": batch_id, "error": str(e)}
 
     log.info(f"  Parsed {len(email_map)} email results from CSV")
+    print(f"[HB] step3: CSV parsed — {len(email_map)} email results", flush=True)
 
     # Ingest results into contacts
     now_ts = datetime.now(timezone.utc).isoformat()
@@ -641,6 +774,7 @@ def step3_truelist(api_key: str) -> dict:
             batch_id,
         ))
 
+    print(f"[HB] step3: done — {counts}", flush=True)
     log.info(f"Step 3 done — {counts}")
     conn.close()
     return {"batch_id": batch_id, "state": "ingested", "counts": counts}
@@ -667,9 +801,12 @@ def main():
     args = parser.parse_args()
 
     log.info("contacts_waterfall.py starting")
+    print("[HB] contacts_waterfall starting", flush=True)
     t0 = time.time()
 
+    print("[HB] main: step1 (provider)", flush=True)
     step1_provider()
+    print("[HB] main: step2 (trust)", flush=True)
     step2_trust()
 
     truelist_result: dict = {"status": "skipped"}
@@ -683,7 +820,9 @@ def main():
             log.error("Truelist API key not found in admin_settings — skipping step 3")
             truelist_result = {"status": "skipped", "reason": "no_api_key"}
         else:
+            print("[HB] main: step3 (truelist)", flush=True)
             truelist_result = step3_truelist(row[0].strip())
+            print(f"[HB] main: step3 returned {truelist_result.get('skipped') and 'skipped' or truelist_result.get('state','done')}", flush=True)
     else:
         log.info("Step 3 (Truelist) skipped via --skip-truelist")
 
@@ -714,6 +853,7 @@ def main():
         f.write(report)
     log.info("\n" + report)
     log.info("contacts_waterfall.py DONE")
+    print("[HB] contacts_waterfall DONE", flush=True)
 
 
 if __name__ == "__main__":
