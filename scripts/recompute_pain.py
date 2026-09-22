@@ -80,7 +80,7 @@ CHECKPOINT_PATH = os.path.join(
 # Server-side column filter — match leads NOT yet on the current formula.
 # Bump the .lt.<n> when shipping a new formula version (compute_pain_score_v1
 # already writes pain_score_version=N).
-VERSION_FILTER_OR = "pain_score_version.is.null,pain_score_version.lt.2"
+VERSION_FILTER_OR = "pain_score_version.is.null,pain_score_version.lt.3"
 
 # Fields the formula reads. We don't pull the whole row (100+ columns).
 SELECT_FIELDS = ", ".join([
@@ -95,6 +95,7 @@ SELECT_FIELDS = ", ".join([
     "ads_facebook", "ads_adwords", "facebook_stars",
     # website
     "website", "uses_wordpress", "uses_shopify", "domain_expired",
+    "is_parked", "website_has_ssl", "website_reachable", "website_status_code",
     # bizintel
     "domain_expiring_soon", "email_state",
 ])
