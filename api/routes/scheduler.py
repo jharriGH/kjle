@@ -2865,6 +2865,187 @@ async def job_website_audit_nightly() -> dict:
     return result
 
 
+async def job_recompute_pain_backfill() -> dict:
+    """
+    Manual-trigger backfill: recomputes pain_score (v3) for active leads that
+    either haven't been scored under v3 yet, or carry a broken-website signal
+    (is_parked / no SSL / unreachable / 4xx+) that the v3 formula now weighs.
+
+    - NOT on the APScheduler cron list — manual trigger only, via
+      POST /kjle/v1/scheduler/run/recompute_pain_backfill
+    - Targets: is_active = true
+        AND (pain_score_version IS NULL OR pain_score_version < 3)
+        AND (is_parked = true OR website_has_ssl = false OR website_reachable = false
+             OR website_status_code >= 400)
+    - Cursor pagination by id (id > last_id ORDER BY id LIMIT chunk) — no OFFSET
+    - Chunk size from admin_settings 'recompute_pain_chunk' (default 500)
+    - Per-run cap from admin_settings 'recompute_pain_limit' (default 100000)
+    - Hard time ceiling from admin_settings 'recompute_pain_max_seconds' (default 3600)
+    - DB-gentle: one chunk at a time, no concurrent fan-out
+    - A chunk UPDATE that fails with 57014/timeout is logged and treated as
+      non-fatal (that lead is skipped, the run continues)
+    - _log_job() fires started/checkpoint(each chunk)/success rows, mirroring
+      job_website_audit_nightly
+    """
+    job_name = "recompute_pain_backfill"
+    logger.info(f"[{job_name}] Starting...")
+    t_start = time.monotonic()
+
+    chunk_size  = int(await _get_admin_setting("recompute_pain_chunk", 500))
+    run_limit   = int(await _get_admin_setting("recompute_pain_limit", 100000))
+    max_seconds = float(await _get_admin_setting("recompute_pain_max_seconds", 3600))
+
+    # Lazy import — mirrors scripts/recompute_pain.py's sibling-path resolution
+    import sys
+    _scripts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts")
+    if _scripts_dir not in sys.path:
+        sys.path.insert(0, _scripts_dir)
+    from ingest import compute_pain_score_v1  # type: ignore
+
+    db = get_db()
+
+    # Same fields the formula reads as scripts/recompute_pain.py's SELECT_FIELDS,
+    # including the 4 broken-website columns + niche_slug.
+    SELECT_FIELDS = ", ".join([
+        "id", "niche_slug",
+        # reputation
+        "google_stars", "google_review_count", "g_maps_claimed",
+        # seo
+        "seo_schema_present", "mobile_friendly",
+        "google_analytics", "google_pixel", "google_rank",
+        # social
+        "facebook_url", "instagram_url",
+        "ads_facebook", "ads_adwords", "facebook_stars",
+        # website
+        "website", "uses_wordpress", "uses_shopify", "domain_expired",
+        "is_parked", "website_has_ssl", "website_reachable", "website_status_code",
+        # bizintel
+        "domain_expiring_soon", "email_state",
+    ])
+
+    updated          = 0
+    failed           = 0
+    total_seen       = 0
+    chunks_processed = 0
+    last_id          = None
+
+    await _log_job(
+        job_name,
+        leads_processed=0,
+        duration_seconds=0.0,
+        status="started",
+        notes=f"chunk_size={chunk_size}, run_limit={run_limit}, max_seconds={max_seconds}",
+    )
+
+    try:
+        while True:
+            if time.monotonic() - t_start >= max_seconds:
+                logger.info(f"[{job_name}] Time ceiling reached ({max_seconds}s) — stopping cleanly")
+                break
+
+            if total_seen >= run_limit:
+                logger.info(f"[{job_name}] Run limit reached ({run_limit}) — stopping cleanly")
+                break
+
+            this_chunk = min(chunk_size, run_limit - total_seen)
+
+            try:
+                q = (
+                    db.table("leads")
+                    .select(SELECT_FIELDS)
+                    .eq("is_active", True)
+                    .or_("pain_score_version.is.null,pain_score_version.lt.3")
+                    .or_("is_parked.eq.true,website_has_ssl.eq.false,website_reachable.eq.false,website_status_code.gte.400")
+                    .order("id")
+                    .limit(this_chunk)
+                )
+                if last_id is not None:
+                    q = q.gt("id", last_id)
+                leads = q.execute().data or []
+            except Exception as e:
+                logger.error(f"[{job_name}] Chunk query failed (chunk {chunks_processed + 1}): {e}")
+                break
+
+            if not leads:
+                logger.info(f"[{job_name}] No more eligible leads — done")
+                break
+
+            for lead in leads:
+                lead_id = lead["id"]
+                last_id = lead_id
+                try:
+                    scores = compute_pain_score_v1(lead, lead.get("niche_slug") or "other")
+                    payload = {
+                        "pain_score":             scores["pain_score"],
+                        "pain_score_website":     scores["pain_score_website"],
+                        "pain_score_reputation":  scores["pain_score_reputation"],
+                        "pain_score_seo":         scores["pain_score_seo"],
+                        "pain_score_social":      scores["pain_score_social"],
+                        "pain_score_bizintel":    scores["pain_score_bizintel"],
+                        "pain_score_version":     scores["pain_score_version"],
+                        "pain_score_computed_at": scores["pain_score_computed_at"],
+                    }
+                    try:
+                        db.table("leads").update(payload).eq("id", lead_id).execute()
+                        updated += 1
+                    except Exception as e:
+                        if any(p in repr(e) for p in ("57014", "timeout", "Timeout", "503", "504")):
+                            logger.warning(f"[{job_name}] Lead {lead_id} UPDATE timed out (non-fatal, skipping): {e}")
+                            failed += 1
+                        else:
+                            raise
+                except Exception as e:
+                    logger.error(f"[{job_name}] Lead {lead_id} failed: {type(e).__name__}: {e}")
+                    failed += 1
+                total_seen += 1
+
+            chunks_processed += 1
+            logger.info(
+                f"[{job_name}] chunk {chunks_processed} done: "
+                f"leads={len(leads)}, updated={updated}, failed={failed}, total_seen={total_seen}"
+            )
+            await _log_job(
+                job_name,
+                leads_processed=updated,
+                duration_seconds=time.monotonic() - t_start,
+                status="checkpoint",
+                notes=(
+                    f"chunk={chunks_processed}, updated={updated}, failed={failed}, "
+                    f"total_seen={total_seen}, last_id={last_id}"
+                ),
+            )
+
+    finally:
+        duration = time.monotonic() - t_start
+        status = (
+            "partial" if failed > 0 and updated > 0
+            else ("failed" if failed > 0 and updated == 0 else "success")
+        )
+        notes = (
+            f"updated={updated}, failed={failed}, total_seen={total_seen}, "
+            f"chunk_size={chunk_size}, run_limit={run_limit}, duration={duration:.1f}s, "
+            f"chunks_processed={chunks_processed}"
+        )
+        await _log_job(
+            job_name,
+            leads_processed=updated,
+            duration_seconds=duration,
+            status=status,
+            notes=notes,
+        )
+
+    result = {
+        "job":              job_name,
+        "updated":          updated,
+        "failed":           failed,
+        "total_seen":       total_seen,
+        "duration_seconds": round(duration, 3),
+        "status":           status,
+    }
+    logger.info(f"[{job_name}] Done. {result}")
+    return result
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PageSpeed helpers — used only by job_pagespeed_nightly
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3499,6 +3680,7 @@ JOB_FUNCTIONS = {
     "pagespeed_nightly":            job_pagespeed_nightly,
     "axe_scan_nightly":             job_axe_scan_nightly,
     "provider_classify_nightly":    job_provider_classify_nightly,
+    "recompute_pain_backfill":      job_recompute_pain_backfill,
 }
 
 
