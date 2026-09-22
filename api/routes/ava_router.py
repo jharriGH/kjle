@@ -60,7 +60,9 @@ def _is_missing_table(exc: Exception) -> bool:
         "could not find the table",
         "does not exist",
         "schema cache",
-        "pgrst205",
+        "pgrst205","
+        "pgrst106",
+        "invalid schema",
         "42p01",
         "3f000",
         "404",
