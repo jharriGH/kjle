@@ -18,7 +18,9 @@ Daily cap enforced per-lead via cost_guard.check_budget.
 Free path: $0.00 -- no cost_guard, no confirm required.
 """
 
+import asyncio
 import logging
+import random
 import re
 import urllib.parse
 import urllib.robotparser
@@ -44,12 +46,18 @@ FREE_FETCH_TIMEOUT = 15.0
 WEBSITE_AUDIT_RESPECT_ROBOTS = True  # overridable via admin_settings key "website_audit_respect_robots"
 ROBOTS_CACHE_MAX              = 5000  # max hosts cached per job run to bound memory
 
+_FREE_FETCH_UA_LIST = [
+    # Chrome 127 / Windows 10
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    # Chrome 127 / macOS Sonoma
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    # Safari 17.5 / macOS Sonoma
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+]
+
 _FREE_FETCH_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 # ── robots.txt politeness helper (bulk path only — NOT used in /reverify) ─────
@@ -64,7 +72,7 @@ async def _check_robots_allowed(host: str, url: str, cache: dict) -> bool:
     """
     if host in cache:
         rp = cache[host]
-        return True if rp is None else rp.can_fetch(_FREE_FETCH_HEADERS["User-Agent"], url)
+        return True if rp is None else rp.can_fetch(_FREE_FETCH_UA_LIST[0], url)
 
     if len(cache) >= ROBOTS_CACHE_MAX:
         return True  # cache full — fail-open rather than expanding unboundedly
@@ -73,7 +81,10 @@ async def _check_robots_allowed(host: str, url: str, cache: dict) -> bool:
     rp = None
     try:
         async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
-            resp = await client.get(robots_url, headers=_FREE_FETCH_HEADERS)
+            resp = await client.get(
+                robots_url,
+                headers={**_FREE_FETCH_HEADERS, "User-Agent": _FREE_FETCH_UA_LIST[0]},
+            )
             if resp.status_code == 200:
                 parser = urllib.robotparser.RobotFileParser()
                 parser.parse(resp.text.splitlines())  # parse() not read() — avoids sync fetch
@@ -283,51 +294,78 @@ async def _fetch_audit_signals(website: str, lead_id: str) -> Optional[dict]:
 
 async def _fetch_html_free(website: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Fetch raw HTML via httpx with a real browser UA. FREE -- no Firecrawl, no cost_guard.
+    Fetch raw HTML via httpx with a rotated browser UA. FREE -- no Firecrawl, no cost_guard.
+    Retries once with a different UA on 403/429/5xx or timeout/connect error.
     Returns (html, final_url) on success, (None, None) on any failure or non-200.
     final_url is the resolved URL after redirects; used for SSL detection.
-    Returns a tuple rather than Optional[str] to expose the post-redirect URL.
     """
     url = website if website.startswith(("http://", "https://")) else f"https://{website}"
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=15.0, read=15.0, write=10.0, pool=5.0),
-            follow_redirects=True,
-        ) as client:
-            resp = await client.get(url, headers=_FREE_FETCH_HEADERS)
-            if resp.status_code != 200:
+    ua1 = random.choice(_FREE_FETCH_UA_LIST)
+    ua2 = random.choice([u for u in _FREE_FETCH_UA_LIST if u != ua1] or _FREE_FETCH_UA_LIST)
+    for attempt, ua in enumerate([ua1, ua2]):
+        headers = {**_FREE_FETCH_HEADERS, "User-Agent": ua}
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=15.0, read=15.0, write=10.0, pool=5.0),
+                follow_redirects=True,
+            ) as client:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 200:
+                    return resp.text, str(resp.url)
+                if attempt == 0 and (resp.status_code in (403, 429) or resp.status_code >= 500):
+                    await asyncio.sleep(2)
+                    continue
                 return None, None
-            return resp.text, str(resp.url)
-    except Exception as e:
-        logger.debug(
-            f"[website_audit_free] fetch failed for {url}: {type(e).__name__}: {e}"
-        )
-        return None, None
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            if attempt == 0:
+                logger.debug(f"[website_audit_free] attempt 1 error for {url}: {type(e).__name__}")
+                await asyncio.sleep(2)
+                continue
+            logger.debug(f"[website_audit_free] fetch failed for {url}: {type(e).__name__}: {e}")
+            return None, None
+        except Exception as e:
+            logger.debug(f"[website_audit_free] fetch failed for {url}: {type(e).__name__}: {e}")
+            return None, None
+    return None, None
 
 
 async def _fetch_html_free_with_status(website: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
     """
     Like _fetch_html_free but returns (html, final_url, status_code).
+    Retries once with a different UA on 403/429/5xx or timeout/connect error.
     On 200: (html, final_url, 200).
     On non-200 server response: (None, final_url, status_code) — server reached, error code preserved.
     On exception (DNS/timeout/connection): (None, None, None) — genuinely unreachable.
     _fetch_html_free is kept unchanged for scheduler.py / reverify.py callers (2-tuple contract).
     """
     url = website if website.startswith(("http://", "https://")) else f"https://{website}"
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=15.0, read=15.0, write=10.0, pool=5.0),
-            follow_redirects=True,
-        ) as client:
-            resp = await client.get(url, headers=_FREE_FETCH_HEADERS)
-            if resp.status_code != 200:
+    ua1 = random.choice(_FREE_FETCH_UA_LIST)
+    ua2 = random.choice([u for u in _FREE_FETCH_UA_LIST if u != ua1] or _FREE_FETCH_UA_LIST)
+    for attempt, ua in enumerate([ua1, ua2]):
+        headers = {**_FREE_FETCH_HEADERS, "User-Agent": ua}
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=15.0, read=15.0, write=10.0, pool=5.0),
+                follow_redirects=True,
+            ) as client:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 200:
+                    return resp.text, str(resp.url), 200
+                if attempt == 0 and (resp.status_code in (403, 429) or resp.status_code >= 500):
+                    await asyncio.sleep(2)
+                    continue
                 return None, str(resp.url), resp.status_code
-            return resp.text, str(resp.url), 200
-    except Exception as e:
-        logger.debug(
-            f"[website_audit_free] fetch failed for {url}: {type(e).__name__}: {e}"
-        )
-        return None, None, None
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            if attempt == 0:
+                logger.debug(f"[website_audit_free] attempt 1 error for {url}: {type(e).__name__}")
+                await asyncio.sleep(2)
+                continue
+            logger.debug(f"[website_audit_free] fetch failed for {url}: {type(e).__name__}: {e}")
+            return None, None, None
+        except Exception as e:
+            logger.debug(f"[website_audit_free] fetch failed for {url}: {type(e).__name__}: {e}")
+            return None, None, None
+    return None, None, None
 
 
 # ── New signal detectors (pure -- no I/O) ────────────────────────────────────
