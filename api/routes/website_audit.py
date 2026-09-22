@@ -681,6 +681,62 @@ def _internal_link_count(html: str, final_url: str) -> int:
     return len(seen)
 
 
+# Utility/nav/legal/asset paths excluded from content-page estimate.
+# Matches path segments like /privacy, /login, /tag/foo, /wp-admin, and asset extensions.
+_NONCONTENT_PATH_RE = re.compile(
+    r'/(?:privacy|terms|login|signin|sign-in|cart|account|tag|tags|category|categories'
+    r'|author|feed|rss)(?:/|$)'
+    r'|/wp-'
+    r'|\.(jpg|jpeg|png|gif|svg|webp|pdf|css|js|ico|woff2?|ttf|eot)(?:[?#]|$)',
+    re.IGNORECASE,
+)
+
+
+def _content_page_estimate(html: str, final_url: str) -> int:
+    """
+    Like _internal_link_count but excludes obvious utility/nav/legal/asset paths,
+    leaving a tighter estimate of real content pages linked from the homepage.
+    Does NOT replace or modify website_internal_page_count.
+    Pure function -- no I/O.
+    """
+    def _strip_www(netloc: str) -> str:
+        return netloc[4:] if netloc.startswith("www.") else netloc
+
+    try:
+        base = urllib.parse.urlparse(final_url)
+        base_core = _strip_www(base.netloc.lower())
+    except Exception:
+        return 0
+
+    hrefs = re.findall(r'<a\b[^>]+\bhref=["\']([^"\']*)["\']', html, re.IGNORECASE)
+
+    seen: set = set()
+    for href in hrefs:
+        href = href.strip()
+        if not href:
+            continue
+        low = href.lower()
+        if any(low.startswith(s) for s in ("tel:", "mailto:", "javascript:", "ftp:", "data:", "#")):
+            continue
+        try:
+            resolved = urllib.parse.urljoin(final_url, href)
+            parsed = urllib.parse.urlparse(resolved)
+        except Exception:
+            continue
+        if parsed.scheme not in ("http", "https"):
+            continue
+        if _strip_www(parsed.netloc.lower()) != base_core:
+            continue
+        path = parsed.path.rstrip("/") or "/"
+        if path == "/":
+            continue
+        if _NONCONTENT_PATH_RE.search(path):
+            continue
+        seen.add(path)
+
+    return len(seen)
+
+
 def _detect_phone_on_page(html: str) -> bool:
     if "tel:" in html.lower():
         return True
@@ -740,6 +796,10 @@ def _parse_signals_full(html: str, final_url: str) -> dict:
 
         # WebSignalz page-depth signal -- added by websignalz_pagecount.sql migration
         "website_internal_page_count": _internal_link_count(html, final_url),
+
+        # Content-yield estimate: internal links minus utility/nav/legal/asset paths.
+        # Tighter signal than website_internal_page_count for BizReply depth gating.
+        "website_content_page_estimate": _content_page_estimate(html, final_url),
     }
 
 
@@ -768,6 +828,7 @@ _FULL_AUDIT_COLUMNS = frozenset({
     "website_has_privacy_policy", "website_has_terms", "website_has_cookie_consent",
     "website_outdated_tech", "website_missing_lang", "website_has_skip_link",
     "website_internal_page_count",
+    "website_content_page_estimate",
     "name_website_verified", "name_match_score",
     "website_status_code",
     "last_audited_at",

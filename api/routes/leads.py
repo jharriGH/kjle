@@ -307,7 +307,8 @@ async def list_leads(
             "enrichment_stage, "
             "data_quality_score, email_state, email_sub_state, email_status, email_valid, is_active, created_at, "
             "has_chatbot, mobile_friendly, is_parked, has_schema_markup, "
-            "website_word_count, website_internal_page_count, email_provider, email_trust, name_website_verified"
+            "website_word_count, website_internal_page_count, website_content_page_estimate, "
+            "email_provider, email_trust, name_website_verified, last_audited_at"
         ).eq("is_active", is_active)
     )
 
