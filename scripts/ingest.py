@@ -398,6 +398,8 @@ def compute_pain_score_v1(row: dict, niche_slug: str) -> dict:
     forces every call site (ingest pipeline, recompute backfill scripts,
     any downstream tooling) to be updated in lockstep, which is a
     distribution-of-changes problem we explicitly avoid here.
+
+    v3 (2026-09-22): additive broken-website signals (reachable/parked/ssl/4xx) in website sub-score.
     """
     weights = {
         'website':    0.20,
@@ -475,6 +477,11 @@ def compute_pain_score_v1(row: dict, niche_slug: str) -> dict:
     if row.get('uses_wordpress') is False and _known_absent(row.get('uses_shopify')):
         web += 5
     if row.get('domain_expired'):                     web += 25  # truthy: known expired
+    if row.get('website_reachable') is False:         web += 30  # site down / unreachable
+    if row.get('is_parked') is True:                  web += 25  # parked/placeholder page
+    if row.get('website_has_ssl') is False:           web += 20  # "Not Secure" to every visitor
+    ws = row.get('website_status_code')
+    if isinstance(ws, (int, float)) and ws >= 400:    web += 20  # 4xx/5xx error page
     web = min(web, 100)
     scores['pain_score_website'] = web
 
@@ -499,7 +506,7 @@ def compute_pain_score_v1(row: dict, niche_slug: str) -> dict:
         scores['pain_score_bizintel']   * weights['bizintel']
     )
     scores['pain_score'] = round(composite, 1)
-    scores['pain_score_version'] = 2
+    scores['pain_score_version'] = 3
     scores['pain_score_computed_at'] = datetime.utcnow().isoformat()
 
     return scores
