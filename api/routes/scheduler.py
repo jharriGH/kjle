@@ -2692,7 +2692,7 @@ async def job_website_audit_nightly() -> dict:
                 return
 
         try:
-            html, final_url, status_code = await asyncio.wait_for(wa_fetch_html_free_with_status(website), timeout=35.0)
+            html, final_url, status_code, load_ms = await asyncio.wait_for(wa_fetch_html_free_with_status(website), timeout=35.0)
 
             if html is None:
                 db.table("leads").update({
@@ -2721,6 +2721,8 @@ async def job_website_audit_nightly() -> dict:
                 signals["name_website_verified"] = nv
                 signals["name_match_score"]      = nm_sc
                 signals["website_status_code"]   = status_code  # 200 on success path
+                if load_ms is not None:
+                    signals["website_load_ms"] = load_ms
                 safe_signals = {k: v for k, v in signals.items() if k in WA_FULL_AUDIT_COLUMNS}
                 safe_signals["last_audited_at"] = datetime.now(timezone.utc).isoformat()
                 db.table("leads").update(safe_signals).eq("id", lead_id).execute()

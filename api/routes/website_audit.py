@@ -22,6 +22,7 @@ import asyncio
 import logging
 import random
 import re
+import time
 import urllib.parse
 import urllib.robotparser
 from datetime import datetime, timezone
@@ -329,14 +330,15 @@ async def _fetch_html_free(website: str) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
-async def _fetch_html_free_with_status(website: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+async def _fetch_html_free_with_status(website: str) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[int]]:
     """
-    Like _fetch_html_free but returns (html, final_url, status_code).
+    Like _fetch_html_free but returns (html, final_url, status_code, load_ms).
     Retries once with a different UA on 403/429/5xx or timeout/connect error.
-    On 200: (html, final_url, 200).
-    On non-200 server response: (None, final_url, status_code) — server reached, error code preserved.
-    On exception (DNS/timeout/connection): (None, None, None) — genuinely unreachable.
+    On 200: (html, final_url, 200, load_ms_int).
+    On non-200 server response: (None, final_url, status_code, None).
+    On exception (DNS/timeout/connection): (None, None, None, None) — genuinely unreachable.
     _fetch_html_free is kept unchanged for scheduler.py / reverify.py callers (2-tuple contract).
+    load_ms = wall-clock milliseconds for the successful GET (time.monotonic); None on any failure.
     """
     url = website if website.startswith(("http://", "https://")) else f"https://{website}"
     ua1 = random.choice(_FREE_FETCH_UA_LIST)
@@ -348,24 +350,26 @@ async def _fetch_html_free_with_status(website: str) -> Tuple[Optional[str], Opt
                 timeout=httpx.Timeout(connect=15.0, read=15.0, write=10.0, pool=5.0),
                 follow_redirects=True,
             ) as client:
+                _t0 = time.monotonic()
                 resp = await client.get(url, headers=headers)
+                _load_ms = int((time.monotonic() - _t0) * 1000)
                 if resp.status_code == 200:
-                    return resp.text, str(resp.url), 200
+                    return resp.text, str(resp.url), 200, _load_ms
                 if attempt == 0 and (resp.status_code in (403, 429) or resp.status_code >= 500):
                     await asyncio.sleep(2)
                     continue
-                return None, str(resp.url), resp.status_code
+                return None, str(resp.url), resp.status_code, None
         except (httpx.TimeoutException, httpx.ConnectError) as e:
             if attempt == 0:
                 logger.debug(f"[website_audit_free] attempt 1 error for {url}: {type(e).__name__}")
                 await asyncio.sleep(2)
                 continue
             logger.debug(f"[website_audit_free] fetch failed for {url}: {type(e).__name__}: {e}")
-            return None, None, None
+            return None, None, None, None
         except Exception as e:
             logger.debug(f"[website_audit_free] fetch failed for {url}: {type(e).__name__}: {e}")
-            return None, None, None
-    return None, None, None
+            return None, None, None, None
+    return None, None, None, None
 
 
 # ── New signal detectors (pure -- no I/O) ────────────────────────────────────
@@ -869,6 +873,7 @@ _FULL_AUDIT_COLUMNS = frozenset({
     "website_content_page_estimate",
     "name_website_verified", "name_match_score",
     "website_status_code",
+    "website_load_ms",
     "last_audited_at",
 })
 
@@ -1123,7 +1128,7 @@ async def audit_batch_free(body: AuditBatchFreeRequest):
             unreachable += 1
             continue
 
-        html, final_url, status_code = await _fetch_html_free_with_status(website)
+        html, final_url, status_code, load_ms = await _fetch_html_free_with_status(website)
 
         if html is None:
             # Site unreachable or server returned non-200 -- mark parked, stamp audit time
@@ -1161,6 +1166,8 @@ async def audit_batch_free(body: AuditBatchFreeRequest):
         signals["name_website_verified"] = nv
         signals["name_match_score"]      = nm_sc
         signals["website_status_code"]   = status_code  # 200 on success path
+        if load_ms is not None:
+            signals["website_load_ms"] = load_ms
 
         # Paranoia guard: only write columns in our known allow-list
         safe_signals = {k: v for k, v in signals.items() if k in _FULL_AUDIT_COLUMNS}
