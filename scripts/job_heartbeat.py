@@ -284,6 +284,99 @@ PROBES = {
 }
 
 
+# ── API HTTP health probes ─────────────────────────────────────────────────────
+
+API_ENDPOINTS = [
+    {
+        "job_key":      "api_health_kjle_api",
+        "display_name": "KJLE API (kjle-api.onrender.com)",
+        "url":          "https://kjle-api.onrender.com/kjle/v1/health",
+    },
+    {
+        "job_key":      "api_health_kjle_sender",
+        "display_name": "KJLE Sender (kjle-sender.onrender.com)",
+        "url":          "https://kjle-sender.onrender.com/sender/v1/health",
+    },
+]
+
+
+def _probe_api_endpoint(url: str) -> dict:
+    """Non-fatal HTTP GET. Returns status/detail dict."""
+    try:
+        r = httpx.get(url, timeout=10.0, follow_redirects=True)
+        if r.status_code == 200:
+            return {"status": "ok", "detail": "HTTP 200"}
+        return {"status": "down", "detail": f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"status": "down", "detail": f"exception: {str(e)[:200]}"}
+
+
+def run_api_health_probes(conn, now):
+    """HTTP-probe each API endpoint; upsert job_health rows; alert on down."""
+    for ep in API_ENDPOINTS:
+        job_key      = ep["job_key"]
+        display_name = ep["display_name"]
+        url          = ep["url"]
+
+        print(f"[HB] probing {url}")
+        result = _probe_api_endpoint(url)
+        status = result["status"]
+        detail = result["detail"]
+
+        log.info(f"  {job_key}: {status}  {detail}")
+
+        # Read existing row for transition / alert-rate checks
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT status, last_alert_at FROM job_health WHERE job_key = %s",
+                (job_key,),
+            )
+            existing = cur.fetchone()
+
+        prev_status = (existing or {}).get("status")
+
+        # Upsert — insert on first run, update on subsequent runs
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO job_health
+                    (job_key, display_name, category, status, detail,
+                     last_checked_at, updated_at, enabled)
+                VALUES (%s, %s, 'api', %s, %s, %s, %s, TRUE)
+                ON CONFLICT (job_key) DO UPDATE SET
+                    status          = EXCLUDED.status,
+                    detail          = EXCLUDED.detail,
+                    last_checked_at = EXCLUDED.last_checked_at,
+                    updated_at      = EXCLUDED.updated_at
+                """,
+                (job_key, display_name, status, detail, now, now),
+            )
+
+        # Alert on down, rate-limited to 1/hour — mirrors main-loop alert pattern
+        if status == "down":
+            prev_alert_at     = (existing or {}).get("last_alert_at")
+            secs_since_alert  = seconds_since(prev_alert_at)
+            alert_due         = secs_since_alert is None or secs_since_alert >= 3600
+
+            if alert_due:
+                msg = (
+                    f"KJLE API DOWN: {display_name} — {detail} "
+                    f"(was: {prev_status or 'unknown'}, url={url})"
+                )
+                brain_notify(msg, severity="warn")
+                brain_log_entry(
+                    f"heartbeat alert: {msg}",
+                    tags=["heartbeat", job_key, "down"],
+                )
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE job_health SET last_alert_at = %s WHERE job_key = %s",
+                        (now, job_key),
+                    )
+                log.info(f"  alert sent for {job_key}")
+                print(f"[HB] ALERT sent: {job_key} is DOWN")
+
+
 # ── Systemd unit restart (rate-limited to 1/hour) ─────────────────────────────
 
 def maybe_restart(row: dict, conn) -> str | None:
@@ -399,8 +492,13 @@ def main():
                             (f"{detail} | {restart_note}", job_key),
                         )
 
+    # HTTP health probes (web-layer outage detection)
+    print(f"[HB] running API health probes")
+    run_api_health_probes(conn, now)
+
     summary = ", ".join(summary_parts)
     log.info(f"=== job_heartbeat done: {summary} ===")
+    print(f"[HB] done: {summary}")
     brain_log_entry(f"heartbeat run complete: {summary}", tags=["heartbeat"])
     conn.close()
 
