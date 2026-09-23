@@ -793,6 +793,31 @@ def _detect_address_on_page(html: str) -> bool:
     ))
 
 
+_COPYRIGHT_MARKER_RE = re.compile(r'©|&copy;|copyright', re.IGNORECASE)
+_COPYRIGHT_YEAR_RE   = re.compile(r'\b((?:19|20)\d{2})\b')
+
+
+def _detect_copyright_year(html: str) -> tuple:
+    """
+    Returns (year: int | None, stale: bool | None).
+    Scans whole HTML for 4-digit years (19xx/20xx) within 150 chars after a copyright
+    marker (©, &copy;, or the word 'copyright'). Takes the max plausible year that is
+    <= current_year. stale = True when year < current_year - 1; None when no year found.
+    """
+    current_year = datetime.now(timezone.utc).year
+    candidates = []
+    for m in _COPYRIGHT_MARKER_RE.finditer(html):
+        window = html[m.start(): min(len(html), m.end() + 150)]
+        for ym in _COPYRIGHT_YEAR_RE.finditer(window):
+            yr = int(ym.group(1))
+            if yr <= current_year:
+                candidates.append(yr)
+    if not candidates:
+        return (None, None)
+    best = max(candidates)
+    return (best, best < current_year - 1)
+
+
 # ── Full signal aggregator (free-path) ────────────────────────────────────────
 
 def _parse_signals_full(html: str, final_url: str) -> dict:
@@ -802,9 +827,8 @@ def _parse_signals_full(html: str, final_url: str) -> dict:
     Omitted (column uncertain): website_meta_title.
     Omitted (insufficient signal): website_is_franchise.
     Omitted (not in HTML): website_has_robots.
-    Pure -- no I/O, no side-effects.
     """
-    return {
+    signals = {
         # Original 4 signals (shared with Firecrawl path)
         "has_chatbot":                _detect_chatbot(html),
         "mobile_friendly":            _detect_mobile(html),
@@ -844,6 +868,17 @@ def _parse_signals_full(html: str, final_url: str) -> dict:
         "website_content_page_estimate": _content_page_estimate(html, final_url),
     }
 
+    try:
+        _cy, _cs = _detect_copyright_year(html)
+        signals["website_copyright_year"]  = _cy
+        signals["website_copyright_stale"] = _cs
+    except Exception as e:
+        logger.debug(f"[website_audit] copyright detector failed: {type(e).__name__}: {e}")
+        signals["website_copyright_year"]  = None
+        signals["website_copyright_stale"] = None
+
+    return signals
+
 
 # ── Models ───────────────────────────────────────────────────────────────────
 
@@ -874,6 +909,8 @@ _FULL_AUDIT_COLUMNS = frozenset({
     "name_website_verified", "name_match_score",
     "website_status_code",
     "website_load_ms",
+    "website_copyright_year",
+    "website_copyright_stale",
     "last_audited_at",
 })
 
