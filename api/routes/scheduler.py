@@ -122,6 +122,14 @@ PROVIDER_CLASSIFY_BATCH_SIZE   = 20_000   # rows per SELECT (bounded)
 PROVIDER_CLASSIFY_UPDATE_CHUNK = 500      # IDs per UPDATE .in_() call
 PROVIDER_CLASSIFY_MAX_ITER     = 20       # iteration guard (~400k rows max)
 
+# RDAP domain-expiry nightly — fills domain_expires/age/expired/expiring_soon
+RDAP_NIGHTLY_LIMIT       = 3_000   # leads per run; overridable via admin_settings 'rdap_nightly_limit'
+RDAP_CONCURRENCY         = 3       # keep LOW — RDAP servers rate-limit aggressively
+RDAP_NIGHTLY_MAX_SECONDS = 3_600   # 1h ceiling; overridable via admin_settings 'rdap_max_seconds'
+RDAP_FETCH_CHUNK         = 200     # leads fetched per chunk
+RDAP_HTTP_TIMEOUT        = 10.0    # seconds per request
+RDAP_EXPIRING_SOON_DAYS  = 60      # domain_expiring_soon = expires within this many days
+
 # Email trust derivation — role local-parts (applies when email_status='unknown')
 _TRUST_ROLE_LOCAL_PARTS: frozenset = frozenset({
     "info", "sales", "admin", "contact", "office", "support", "billing",
@@ -249,6 +257,11 @@ JOB_DEFINITIONS = {
     "provider_classify_nightly": {
         "description": "Nightly TIER-1 email provider classifier — string-match of consumer/ISP domains (no DNS) for valid leads with email_provider='unknown'",
         "schedule":    "Daily at 03:30 UTC",
+        "trigger":     "cron",
+    },
+    "rdap_domain_check": {
+        "description": "Nightly RDAP domain-expiry fill — populates domain_expires, domain_age_days, domain_expired, domain_expiring_soon for active leads with websites; deepens pain scoring at zero cost",
+        "schedule":    "Daily at 07:00 UTC",
         "trigger":     "cron",
     },
 }
@@ -2867,6 +2880,283 @@ async def job_website_audit_nightly() -> dict:
     return result
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 17 — Nightly RDAP Domain-Expiry Check (07:00 UTC)
+# Zero-cost: hits rdap.org public API. Fills domain_expires, domain_age_days,
+# domain_expired, domain_expiring_soon for active leads with websites.
+# These columns feed compute_pain_score_v1 (+25 domain_expired, +30
+# domain_expiring_soon) but were never populated — this job fixes that.
+# Candidate filter: domain_expires IS NULL AND domain_age_days IS NULL
+# (both NULL = truly unseen). On RDAP failure, domain_age_days = -1 (sentinel)
+# so the row is skipped on future runs and is_never retried forever.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def job_rdap_domain_check() -> dict:
+    """
+    Nightly bulk-fill of domain-expiry signals via rdap.org public API.
+
+    - Fires at 07:00 UTC (clear of 05:30 audit, 07:30 pagespeed)
+    - Up to rdap_nightly_limit leads per run (default 3000)
+    - Targets: is_active AND website IS NOT NULL AND domain_expires IS NULL AND domain_age_days IS NULL
+    - Concurrency: asyncio.Semaphore(rdap_concurrency, default 3) — RDAP servers rate-limit
+    - On RDAP unavailable/404/parse-fail: write domain_age_days = -1 (sentinel = skip next run)
+    - On expiration found: write domain_expires, domain_expired, domain_expiring_soon, domain_age_days
+    - _log_job() fires on EVERY exit path via try/finally
+    """
+    job_name = "rdap_domain_check"
+    logger.info(f"[HB] [{job_name}] Starting...")
+    t_start = time.monotonic()
+
+    run_limit   = int(await _get_admin_setting("rdap_nightly_limit",  RDAP_NIGHTLY_LIMIT))
+    max_seconds = float(await _get_admin_setting("rdap_max_seconds",  RDAP_NIGHTLY_MAX_SECONDS))
+    concurrency = int(await _get_admin_setting("rdap_concurrency",    RDAP_CONCURRENCY))
+
+    db = get_db()
+
+    processed       = 0
+    filled          = 0
+    sentinel_marked = 0
+    failed          = 0
+    total_seen      = 0
+    chunks_processed = 0
+
+    lock = asyncio.Lock()
+    sem  = asyncio.Semaphore(concurrency)
+
+    await _log_job(
+        job_name,
+        leads_processed=0,
+        duration_seconds=0.0,
+        status="started",
+        notes=(
+            f"run_limit={run_limit}, max_seconds={max_seconds}, "
+            f"concurrency={concurrency}"
+        ),
+    )
+
+    async def _do_one_lead(lead: dict) -> None:
+        nonlocal processed, filled, sentinel_marked, failed, total_seen
+
+        if time.monotonic() - t_start >= max_seconds:
+            return
+
+        lead_id = lead["id"]
+        website = (lead.get("website") or "").strip()
+        if not website:
+            async with lock:
+                total_seen += 1
+            return
+
+        # Extract registrable domain: strip scheme, leading www., path/query
+        try:
+            parsed = urllib.parse.urlparse(website if "://" in website else f"https://{website}")
+            host   = parsed.netloc or parsed.path.split("/")[0]
+            host   = host.split(":")[0].strip()  # drop port if present
+            domain = host.lower()
+            if domain.startswith("www."):
+                domain = domain[4:]
+            if not domain or "." not in domain:
+                raise ValueError(f"unparseable domain: {domain!r}")
+        except Exception as e:
+            logger.warning(f"[{job_name}] Lead {lead_id} domain parse failed: {e}")
+            try:
+                db.table("leads").update({"domain_age_days": -1}).eq("id", lead_id).execute()
+            except Exception:
+                pass
+            async with lock:
+                sentinel_marked += 1
+                total_seen += 1
+            return
+
+        rdap_url = f"https://rdap.org/domain/{domain}"
+
+        # Jitter to avoid thundering herd across concurrent slots
+        import random
+        await asyncio.sleep(random.uniform(0.0, 0.5))
+
+        try:
+            async with httpx.AsyncClient(timeout=RDAP_HTTP_TIMEOUT, follow_redirects=True) as client:
+                try:
+                    resp = await client.get(rdap_url)
+                except (httpx.TimeoutException, httpx.ConnectError):
+                    # One retry on timeout/connect error
+                    await asyncio.sleep(1.0)
+                    resp = await client.get(rdap_url)
+
+            if resp.status_code == 404:
+                # NXDOMAIN / not found in RDAP — mark sentinel, don't retry
+                db.table("leads").update({"domain_age_days": -1}).eq("id", lead_id).execute()
+                async with lock:
+                    sentinel_marked += 1
+                    total_seen += 1
+                return
+
+            if resp.status_code >= 400:
+                logger.warning(f"[{job_name}] Lead {lead_id} RDAP HTTP {resp.status_code} for {domain}")
+                db.table("leads").update({"domain_age_days": -1}).eq("id", lead_id).execute()
+                async with lock:
+                    sentinel_marked += 1
+                    total_seen += 1
+                return
+
+            data = resp.json()
+            events = data.get("events") or []
+
+            expiration_date   = None
+            registration_date = None
+            for ev in events:
+                action = (ev.get("eventAction") or "").lower()
+                ev_date_str = ev.get("eventDate") or ""
+                if not ev_date_str:
+                    continue
+                try:
+                    # ISO 8601 — may have timezone offset; parse to date only
+                    ev_date = datetime.fromisoformat(ev_date_str.replace("Z", "+00:00")).date()
+                except Exception:
+                    continue
+                if action == "expiration":
+                    expiration_date = ev_date
+                elif action == "registration":
+                    registration_date = ev_date
+
+            if expiration_date is None and registration_date is None:
+                # RDAP returned data but no useful dates — mark sentinel
+                db.table("leads").update({"domain_age_days": -1}).eq("id", lead_id).execute()
+                async with lock:
+                    sentinel_marked += 1
+                    total_seen += 1
+                return
+
+            today = date.today()
+            update: dict = {}
+
+            if registration_date is not None:
+                age_days = (today - registration_date).days
+                update["domain_age_days"] = max(age_days, 0)
+            else:
+                # We have expiration but not registration — set age to 0 placeholder (not -1 sentinel)
+                update["domain_age_days"] = 0
+
+            if expiration_date is not None:
+                update["domain_expires"]       = expiration_date.isoformat()
+                update["domain_expired"]       = expiration_date < today
+                update["domain_expiring_soon"] = (
+                    not update["domain_expired"]
+                    and expiration_date <= today + timedelta(days=RDAP_EXPIRING_SOON_DAYS)
+                )
+
+            db.table("leads").update(update).eq("id", lead_id).execute()
+            async with lock:
+                filled += 1
+                total_seen += 1
+            return
+
+        except Exception as e:
+            logger.error(f"[{job_name}] Lead {lead_id} ({domain}) error: {type(e).__name__}: {e}")
+            try:
+                db.table("leads").update({"domain_age_days": -1}).eq("id", lead_id).execute()
+            except Exception:
+                pass
+            async with lock:
+                sentinel_marked += 1
+                total_seen += 1
+            return
+
+        finally:
+            async with lock:
+                processed += 1
+
+    async def _process_lead_gated(lead: dict) -> None:
+        async with sem:
+            await _do_one_lead(lead)
+
+    try:
+        while True:
+            if time.monotonic() - t_start >= max_seconds:
+                logger.info(f"[HB] [{job_name}] Time ceiling reached ({max_seconds}s) — stopping cleanly")
+                break
+
+            if total_seen >= run_limit:
+                break
+
+            chunk_size = min(RDAP_FETCH_CHUNK, run_limit - total_seen)
+
+            try:
+                leads = (
+                    db.table("leads")
+                    .select("id, website")
+                    .eq("is_active", True)
+                    .not_.is_("website", "null")
+                    .is_("domain_expires", "null")
+                    .is_("domain_age_days", "null")
+                    .order("pain_score", desc=True, nullsfirst=False)
+                    .limit(chunk_size)
+                    .execute()
+                    .data or []
+                )
+            except Exception as e:
+                logger.error(f"[{job_name}] Chunk query failed (chunk {chunks_processed + 1}): {e}")
+                break
+
+            if not leads:
+                logger.info(f"[HB] [{job_name}] No more eligible leads — done")
+                break
+
+            await asyncio.gather(*[_process_lead_gated(lead) for lead in leads], return_exceptions=True)
+            chunks_processed += 1
+
+            logger.info(
+                f"[HB] [{job_name}] chunk {chunks_processed} done: "
+                f"leads={len(leads)}, filled={filled}, sentinel={sentinel_marked}, "
+                f"total_seen={total_seen}"
+            )
+            await _log_job(
+                job_name,
+                leads_processed=filled,
+                duration_seconds=time.monotonic() - t_start,
+                status="checkpoint",
+                notes=(
+                    f"chunk={chunks_processed}, filled={filled}, "
+                    f"sentinel_marked={sentinel_marked}, total_seen={total_seen}"
+                ),
+            )
+
+            del leads
+            gc.collect()
+
+    finally:
+        duration = time.monotonic() - t_start
+        status = (
+            "partial" if failed > 0 and filled > 0
+            else ("failed" if failed > 0 and filled == 0 else "success")
+        )
+        notes = (
+            f"filled={filled}, sentinel_marked={sentinel_marked}, failed={failed}, "
+            f"total_seen={total_seen}, limit={run_limit}, "
+            f"concurrency={concurrency}, duration={duration:.1f}s, "
+            f"chunks_processed={chunks_processed}"
+        )
+        await _log_job(
+            job_name,
+            leads_processed=filled,
+            duration_seconds=duration,
+            status=status,
+            notes=notes,
+        )
+
+    result = {
+        "job":              job_name,
+        "filled":           filled,
+        "sentinel_marked":  sentinel_marked,
+        "failed":           failed,
+        "total_seen":       total_seen,
+        "duration_seconds": round(duration, 3),
+        "status":           status,
+    }
+    logger.info(f"[HB] [{job_name}] Done. {result}")
+    return result
+
+
 async def job_recompute_pain_backfill() -> dict:
     """
     Manual-trigger backfill: recomputes pain_score (v3) for active leads that
@@ -3683,6 +3973,7 @@ JOB_FUNCTIONS = {
     "axe_scan_nightly":             job_axe_scan_nightly,
     "provider_classify_nightly":    job_provider_classify_nightly,
     "recompute_pain_backfill":      job_recompute_pain_backfill,
+    "rdap_domain_check":            job_rdap_domain_check,
 }
 
 
@@ -3889,6 +4180,23 @@ def setup_scheduler() -> AsyncIOScheduler:
         name="Nightly Email Provider Classify (TIER-1)",
         replace_existing=True,
         misfire_grace_time=1800,
+    )
+
+    # Job 17: rdap_domain_check — daily at 07:00 UTC
+    # Zero-cost RDAP fill: populates domain_expires, domain_age_days,
+    # domain_expired, domain_expiring_soon for active leads with websites.
+    # 07:00 is clear of all daily crons (audit=05:30, pagespeed=07:30).
+    # max_instances=1, coalesce=True: only one run at a time; misfired
+    # runs collapse to one so a deploy gap never causes double-run.
+    scheduler.add_job(
+        job_rdap_domain_check,
+        trigger=CronTrigger(hour=7, minute=0),
+        id="rdap_domain_check",
+        name="Nightly RDAP Domain-Expiry Check",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
     )
 
     logger.info(f"⏰ APScheduler configured: {len(scheduler.get_jobs())} jobs registered")
