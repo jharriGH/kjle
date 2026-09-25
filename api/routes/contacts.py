@@ -55,6 +55,25 @@ def _str_list(val: Optional[str]) -> Optional[list]:
     return vals if vals else None
 
 
+def _stats_cache_read(db, key: str) -> dict:
+    """Read one stats_cache row. Returns {} on miss or error — never raises,
+    never triggers a live fallback scan. Populated by refresh_stats_cache()
+    (pg_cron, every 30 min)."""
+    try:
+        res = (
+            db.table("stats_cache")
+            .select("data,refreshed_at")
+            .eq("key", key)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            return res.data[0]
+    except Exception as exc:
+        _logger.warning("stats_cache read failed for key=%s: %s", key, exc)
+    return {}
+
+
 def _enrich_with_biz(contacts: list, db) -> list:
     """Batch-lookup linked business intel and add linked_* fields.
     Page is <=100 rows so the IN() is always tiny.
@@ -124,7 +143,7 @@ async def contacts_seniority_breakdown(
     for level in levels:
         try:
             res = _apply(
-                db.table("contacts").select("id", count="exact").eq("seniority", level)
+                db.table("contacts").select("id", count="estimated").eq("seniority", level)
             ).range(0, 0).execute()
             breakdown[level] = res.count if res.count is not None else 0
         except Exception as exc:
@@ -132,6 +151,29 @@ async def contacts_seniority_breakdown(
             breakdown[level] = 0
 
     return breakdown
+
+
+@router.get("/contacts/category-breakdown")
+async def contacts_category_breakdown():
+    """Cached email_status / email_trust / email_provider breakdowns across all
+    contacts, plus an email_cleaned_at recent-count. Served entirely from
+    stats_cache (refreshed by refresh_stats_cache(), pg_cron every 30 min) —
+    never a live GROUP BY / full-table scan. Missing or not-yet-seeded keys
+    return empty — the endpoint never falls back to a live query.
+    """
+    db = get_db()
+
+    def _data(key: str) -> dict:
+        return _stats_cache_read(db, key).get("data") or {}
+
+    return {
+        "email_status":   _data("contacts_email_status"),
+        "email_trust":    _data("contacts_email_trust"),
+        "email_provider": _data("contacts_email_provider"),
+        "cleaned_recent": _data("contacts_cleaned_recent") or {
+            "cleaned_total": 0, "cleaned_last_24h": 0, "cleaned_last_7d": 0,
+        },
+    }
 
 
 @router.get("/contacts")
@@ -217,10 +259,12 @@ async def list_contacts(
             q = q.lt("linked_a11y_score", linked_low_a11y)
         return q
 
-    # Count query — fresh builder, range(0,0) transfers no rows
+    # Count query — fresh builder, range(0,0) transfers no rows.
+    # "estimated" uses the query planner's row estimate instead of a live
+    # COUNT(*) scan — same fix already applied to GET /leads for this table size.
     try:
         count_result = apply_filters(
-            db.table("contacts").select("id", count="exact")
+            db.table("contacts").select("id", count="estimated")
         ).range(0, 0).execute()
         total = count_result.count if count_result.count is not None else 0
     except Exception as exc:
