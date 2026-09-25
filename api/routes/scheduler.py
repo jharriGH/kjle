@@ -411,6 +411,7 @@ async def job_classify_segments() -> dict:
         while True:
             sel = db.table("leads").select("id").eq("is_active", True)
             sel = _apply_pain_filter(sel, label)
+            sel = sel.or_(f"segment_label.is.null,segment_label.neq.{label}")
             if last_id_cursor is not None:
                 sel = sel.gt("id", last_id_cursor)
             sel = sel.order("id", desc=False).limit(CHUNK_SIZE)
@@ -430,6 +431,7 @@ async def job_classify_segments() -> dict:
                     .eq("is_active", True)
                 )
                 upd = _apply_pain_filter(upd, label)
+                upd = upd.or_(f"segment_label.is.null,segment_label.neq.{label}")
                 upd = upd.gte("id", first_id).lte("id", last_id)
                 upd.execute()
             except Exception as e:
@@ -4077,16 +4079,17 @@ def setup_scheduler() -> AsyncIOScheduler:
         misfire_grace_time=1800,
     )
 
+    # DISABLED 2026-09-25: ReachInbox retired; repoint to CampaignEnginez when its stats API is ready.
     # Job 9: campaign_sync_hourly — every 60 minutes
     # Pulls campaign stats from RI for configured (project, server) pairs
-    scheduler.add_job(
-        job_campaign_sync_hourly,
-        trigger=IntervalTrigger(minutes=60),
-        id="campaign_sync_hourly",
-        name="Hourly Campaign Stats Sync",
-        replace_existing=True,
-        misfire_grace_time=600,
-    )
+    # scheduler.add_job(
+    #     job_campaign_sync_hourly,
+    #     trigger=IntervalTrigger(minutes=60),
+    #     id="campaign_sync_hourly",
+    #     name="Hourly Campaign Stats Sync",
+    #     replace_existing=True,
+    #     misfire_grace_time=600,
+    # )
 
     # Job 10: fed_dnc_refresh_monthly — 1st of every month @ 04:00 UTC
     # Rebuilds fed_dnc_list from /opt/fed_dnc_latest.zip. Until Jim's FCC
