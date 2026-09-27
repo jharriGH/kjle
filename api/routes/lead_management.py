@@ -238,7 +238,7 @@ _ELIGIBLE_KNOWN_PARAMS = frozenset({
     "vertical", "niche", "segment_id", "pain_min", "limit", "offset",
     "require_email_valid", "require_name_verified", "audited_after",
     "min_word_count", "min_internal_pages", "email_provider", "email_trust",
-    "product", "exclude_already_contacted", "cooldown_days",
+    "product", "exclude_already_contacted", "cooldown_days", "include_total",
 })
 
 
@@ -261,6 +261,7 @@ async def eligible_for_campaign(
     product: Optional[str] = Query(None, description="Product slug (e.g. compliancemds, bizreply). Used with exclude_already_contacted."),
     exclude_already_contacted: bool = Query(False, description="When true and product is set, exclude leads with a lead_campaign_history row for that product."),
     cooldown_days: Optional[int] = Query(None, description="Exclude leads whose last_contacted_at is within this many days."),
+    include_total: bool = Query(False, description="Compute the total count (expensive on broad filters); default False returns total=null"),
     x_api_key: str = Header(...),
 ):
     verify_api_key(x_api_key)
@@ -390,13 +391,15 @@ async def eligible_for_campaign(
         query = query.or_(attached_or)
         count_query = count_query.or_(attached_or)
 
-    # ── count ──────────────────────────────────────────────────────────────────
-    try:
-        count_result = count_query.execute()
-        total = count_result.count if count_result.count is not None else 0
-    except Exception as e:
-        logger.warning(f"eligible_for_campaign count degraded (non-fatal): {e}")
-        total = None
+    # ── count (opt-in only — skipped by default to avoid full-scan timeout) ────
+    total = None
+    if include_total:
+        try:
+            count_result = count_query.execute()
+            total = count_result.count if count_result.count is not None else 0
+        except Exception as e:
+            logger.warning(f"eligible_for_campaign count degraded (non-fatal): {e}")
+            total = None
 
     # ── fetch page ─────────────────────────────────────────────────────────────
     try:
@@ -556,6 +559,7 @@ async def eligible_for_campaign(
 
     return {
         "total": total,
+        "total_included": include_total,
         "count": len(leads_out),
         "count_degraded": total is None,
         "leads": leads_out,
