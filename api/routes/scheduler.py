@@ -376,7 +376,7 @@ async def job_classify_segments() -> dict:
     these chunks too. See the landmine breadcrumb in segments_engine.py.
     """
     job_name = "classify_segments"
-    CHUNK_SIZE = 1000
+    CHUNK_SIZE = int(os.getenv("CLASSIFY_CHUNK_SIZE", "250"))
     logger.info(f"[{job_name}] Starting (chunked-UPDATE mode, chunk={CHUNK_SIZE})...")
     t_start = time.monotonic()
 
