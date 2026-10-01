@@ -275,12 +275,71 @@ def probe_chatbot_reaudit(conn, row: dict) -> dict:
     }
 
 
+def probe_scan_daemon(conn, row: dict) -> dict:
+    """
+    Unhealthy when: kjle-scan-daemon is not active, OR queued_total>0 and
+    last_output_at is older than 3*stall_minutes (default stall_minutes=5 → 15min).
+    """
+    stall_min = int(row.get("stall_minutes") or 5)
+
+    unit_active = False
+    unit_state  = "unknown"
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "kjle-scan-daemon"],
+            capture_output=True, text=True, timeout=10,
+        )
+        unit_state  = result.stdout.strip()
+        unit_active = unit_state == "active"
+    except Exception as e:
+        log.warning(f"systemctl is-active kjle-scan-daemon: {e}")
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+              COUNT(*) FILTER (WHERE status = 'queued') AS queued_total,
+              COUNT(*) FILTER (WHERE status = 'running') AS running_total,
+              MAX(finished_at) FILTER (WHERE status = 'done') AS last_output_at
+            FROM scan_jobs
+        """)
+        queued_total, running_total, last_output_at = cur.fetchone()
+
+    queued_total  = int(queued_total  or 0)
+    running_total = int(running_total or 0)
+    secs_idle     = seconds_since(last_output_at)
+
+    stall_threshold_s = stall_min * 60 * 3
+    daemon_stalled    = queued_total > 0 and (secs_idle is None or secs_idle > stall_threshold_s)
+
+    if not unit_active:
+        status = "stalled"
+        detail = f"kjle-scan-daemon unit_state={unit_state!r} (not active), queued={queued_total}"
+    elif daemon_stalled:
+        status = "stalled"
+        detail = (
+            f"queued={queued_total}, idle={int(secs_idle or 0)}s "
+            f"> {stall_min*3}min threshold, unit=active"
+        )
+    else:
+        status = "healthy" if queued_total == 0 else "ok"
+        detail = f"queued={queued_total}, running={running_total}, unit={unit_state}"
+
+    return {
+        "status":            status,
+        "throughput_window": running_total,
+        "backlog":           queued_total,
+        "last_output_at":    _iso(last_output_at),
+        "detail":            detail,
+    }
+
+
 PROBES = {
     "contacts_cleaner":    probe_contacts_cleaner,
     "contacts_classify":   probe_contacts_classify,
     "leads_nightly_clean": probe_leads_nightly_clean,
     "leads_ingest":        probe_leads_ingest,
     "chatbot_reaudit":     probe_chatbot_reaudit,
+    "scan_daemon":         probe_scan_daemon,
 }
 
 

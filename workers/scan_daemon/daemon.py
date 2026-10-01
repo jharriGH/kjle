@@ -16,6 +16,7 @@ Required env vars:
   SCAN_NAV_TIMEOUT_MS    per-navigation Playwright timeout ms (default: 30000)
   SCAN_TOTAL_TIMEOUT_S   per-lead overall scan ceiling seconds (default: 60)
   STALL_THRESHOLD_S      idle-with-queue threshold before self-restart (default: 300)
+  RESERVED_HIPRI_SLOTS   worker slots reserved for priority>=9 jobs (default: 2, max: SCAN_CONCURRENCY)
 """
 from __future__ import annotations
 
@@ -85,6 +86,9 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
 SCAN_CONCURRENCY = min(int(os.environ.get("SCAN_CONCURRENCY", "4")), 16)
 POLL_INTERVAL_SEC = int(os.environ.get("POLL_INTERVAL_SEC", "15"))
 SCAN_BATCH_SIZE = int(os.environ.get("SCAN_BATCH_SIZE", str(SCAN_CONCURRENCY)))
+# Slots reserved for priority>=9 jobs. Reserved slots MUST claim hipri when any are queued;
+# they fall back to normal work only when the hipri queue is empty (never idle during bulk).
+RESERVED_HIPRI_SLOTS = min(int(os.environ.get("RESERVED_HIPRI_SLOTS", "2")), SCAN_CONCURRENCY)
 WORKER_ID = os.environ.get("WORKER_ID", "scan-daemon").strip()
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
@@ -562,6 +566,27 @@ def _poll_queued(db: Client, batch: int) -> list[dict]:
         return []
 
 
+def _poll_hipri(db: Client, batch: int) -> list[dict]:
+    """Poll only priority>=9 queued jobs for the reserved-slot claiming path."""
+    if batch <= 0:
+        return []
+    try:
+        resp = (
+            db.table("scan_jobs")
+            .select("id,url,lead_id,client_id,priority,attempts,metadata")
+            .eq("status", "queued")
+            .gte("priority", 9)
+            .order("priority", desc=True)
+            .order("enqueued_at", desc=False)
+            .limit(batch)
+            .execute()
+        )
+        return resp.data or []
+    except Exception as e:
+        _log("poll_hipri_error", level=logging.ERROR, error=str(e))
+        return []
+
+
 def _claim_job(db: Client, job_id: int, attempts: int) -> bool:
     """Optimistic claim — only succeeds if status is still 'queued' at update time."""
     try:
@@ -949,33 +974,57 @@ def main() -> int:
                 _reap_orphans(db)
                 _last_reap_at = time.monotonic()
 
-            jobs = _poll_queued(db, SCAN_BATCH_SIZE)
-            _queue_had_jobs = bool(jobs)  # watchdog: non-empty = active work expected
-            _queue_depth = len(jobs)
+            # ── Priority-aware batch claiming ────────────────────────────────────
+            # Re-poll hipri (priority>=9) fresh every cycle so a new high-priority
+            # job is seen by a reserved slot within ~one job cycle (~90s bound).
+            hipri_candidates = _poll_hipri(db, RESERVED_HIPRI_SLOTS)
+            # Normal poll: SCAN_CONCURRENCY slots max; deduplicate against hipri pool.
+            hipri_all_ids: set[int] = {j["id"] for j in hipri_candidates}
+            normal_candidates = _poll_queued(db, SCAN_CONCURRENCY)
+            normal_candidates = [j for j in normal_candidates if j["id"] not in hipri_all_ids]
 
-            if not jobs:
+            _queue_had_jobs = bool(hipri_candidates or normal_candidates)
+            _queue_depth = len(hipri_candidates) + len(normal_candidates)
+
+            if not _queue_had_jobs:
                 for _ in range(POLL_INTERVAL_SEC):
                     if _shutdown:
                         break
                     time.sleep(1)
                 continue
 
-            _log("jobs_fetched", count=len(jobs))
+            _log("jobs_fetched", count=_queue_depth,
+                 hipri_queued=len(hipri_candidates), normal_queued=len(normal_candidates))
 
-            claimed = []
-            for job in jobs:
+            # Reserved slots MUST take hipri; fall back to normal only when hipri queue empty.
+            hipri_claimed: list[dict] = []
+            hipri_ids: set[int] = set()
+            for job in hipri_candidates:
                 if _shutdown:
                     break
                 if _claim_job(db, job["id"], job.get("attempts", 0)):
-                    claimed.append(job)
+                    hipri_claimed.append(job)
+                    hipri_ids.add(job["id"])
                 else:
                     _log("claim_skipped", job_id=job["id"])
 
+            # Remaining capacity: non-reserved slots + reserved slots with no hipri to take.
+            remaining = SCAN_CONCURRENCY - len(hipri_claimed)
+            normal_claimed: list[dict] = []
+            for job in normal_candidates:
+                if _shutdown or len(normal_claimed) >= remaining:
+                    break
+                if _claim_job(db, job["id"], job.get("attempts", 0)):
+                    normal_claimed.append(job)
+                else:
+                    _log("claim_skipped", job_id=job["id"])
+
+            claimed = hipri_claimed + normal_claimed
             if not claimed:
                 time.sleep(1)
                 continue
 
-            _log("jobs_claimed", count=len(claimed))
+            _log("jobs_claimed", count=len(claimed), hipri=len(hipri_claimed))
 
             with ThreadPoolExecutor(max_workers=SCAN_CONCURRENCY) as ex:
                 futs = {
