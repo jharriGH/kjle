@@ -77,7 +77,7 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
 _ENV_CONCURRENCY     = int(os.environ.get("ENRICH_CONCURRENCY", "25"))
 CHUNK_SIZE           = int(os.environ.get("ENRICH_CHUNK_SIZE", "100"))   # was 500
 POLL_INTERVAL_SEC    = int(os.environ.get("POLL_INTERVAL_SEC", "30"))
-WORKER_ID            = os.environ.get("WORKER_ID", "enrich-daemon").strip()
+WORKER_ID            = "enrich-daemon"
 LOG_LEVEL            = os.environ.get("LOG_LEVEL", "INFO").upper()
 BRAIN_URL            = os.environ.get(
     "BRAIN_URL", "https://jim-brain-production.up.railway.app"
@@ -298,19 +298,12 @@ def _reclaim_stale_locks_sync(db: Client) -> int:
     total = 0
     while True:
         try:
-            res = (
-                db.table("leads")
-                .select("id")
-                .eq("enrichment_locked", True)
-                .limit(_STALE_LOCK_BATCH)
-                .execute()
-            )
-            ids = [r["id"] for r in (res.data or [])]
-            if not ids:
+            res = db.rpc("reclaim_stale_enrichment_locks", {"p_batch": _STALE_LOCK_BATCH}).execute()
+            n = res.data if isinstance(res.data, int) else (res.data or 0)
+            if not n:
                 break
-            db.table("leads").update({"enrichment_locked": False}).in_("id", ids).execute()
-            total += len(ids)
-            _log("stale_lock_batch_reclaimed", batch=len(ids), total_so_far=total)
+            total += n
+            _log("stale_lock_batch_reclaimed", batch=n, total_so_far=total)
             time.sleep(_STALE_LOCK_SLEEP_S)
         except Exception as e:
             _log("stale_lock_reclaim_error", level=logging.ERROR, error=str(e)[:300])
