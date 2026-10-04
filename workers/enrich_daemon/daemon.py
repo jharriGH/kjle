@@ -25,13 +25,17 @@ Required env vars (shared with kjle-api, sourced from EnvironmentFile):
 
 Optional env vars:
   ENRICH_CONCURRENCY     max parallel fetches (default: 25)
-  ENRICH_CHUNK_SIZE      leads claimed per cycle (default: 500)
+  ENRICH_CHUNK_SIZE      leads claimed per cycle (default: 100)
   POLL_INTERVAL_SEC      sleep when queue empty, seconds (default: 30)
   WORKER_ID              label in structured logs (default: enrich-daemon)
   LOG_LEVEL              default: INFO
   BRAIN_URL              Brain REST base URL
   BRAIN_KEY              Brain auth key
   HEALTHY_NOTIFY_INTERVAL_S  daily-healthy SMS cadence (default: 86400; 0=off)
+
+Admin settings keys (overridden at runtime without restart):
+  enrich_daemon_concurrency   override ENRICH_CONCURRENCY
+  enrich_daemon_chunk_size    override ENRICH_CHUNK_SIZE
 """
 from __future__ import annotations
 
@@ -71,7 +75,7 @@ except Exception as _ie:
 SUPABASE_URL         = os.environ.get("SUPABASE_URL", "").strip()
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
 _ENV_CONCURRENCY     = int(os.environ.get("ENRICH_CONCURRENCY", "25"))
-CHUNK_SIZE           = int(os.environ.get("ENRICH_CHUNK_SIZE", "500"))
+CHUNK_SIZE           = int(os.environ.get("ENRICH_CHUNK_SIZE", "100"))   # was 500
 POLL_INTERVAL_SEC    = int(os.environ.get("POLL_INTERVAL_SEC", "30"))
 WORKER_ID            = os.environ.get("WORKER_ID", "enrich-daemon").strip()
 LOG_LEVEL            = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -90,7 +94,9 @@ _ENRICH_MIN_PAIN = 0
 # (2 attempts = up to 32s); this outer ceiling is a belt-and-suspenders backstop.
 _FETCH_TIMEOUT_S = 35
 
-# Watchdog
+# Watchdog -- ping interval must be well under WatchdogSec=120 in the unit file.
+# Timer-based: fires from an independent asyncio task, NOT tied to chunk progress.
+_WATCHDOG_PING_S   = 30
 _STARTUP_GRACE_S   = 120
 _WATCHDOG_CHECK_S  = 60
 _STALL_THRESHOLD_S = 600   # 10 min idle with backlog = stall
@@ -100,8 +106,22 @@ _STALL_THRESHOLD_S = 600   # 10 min idle with backlog = stall
 _BACKOFF_SLEEP_S = 60
 _BACKOFF_MIN     = 2   # never go below 2 concurrent
 
-# Admin settings key that overrides _ENV_CONCURRENCY at runtime
+# Startup stale-lock reclaimer -- batch size kept small to avoid full-table scan
+# on unindexed enrichment_locked column (SC adds partial index post-deploy).
+_STALE_LOCK_BATCH   = 2000
+_STALE_LOCK_SLEEP_S = 0.5
+
+# Write retry: on dropped-connection errors recreate the client and retry up to 3x.
+_WRITE_RETRYABLE = (
+    "Server disconnected",
+    "ConnectionTerminated",
+    "RemoteProtocolError",
+    "ConnectError",
+)
+
+# Admin settings keys that override env vars at runtime
 _ADMIN_CONCURRENCY_KEY = "enrich_daemon_concurrency"
+_ADMIN_CHUNK_KEY       = "enrich_daemon_chunk_size"
 
 
 # ── Structured JSON logger (mirrors scan_daemon pattern) ──────────────────────
@@ -175,11 +195,26 @@ def _brain_notify(message: str, channel: str = "sms") -> None:
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
 _shutdown = False
 
+# Tracks the IDs locked by the in-flight chunk so the SIGTERM handler can unlock
+# them synchronously before the process exits (covers graceful kills; the startup
+# stale-lock reclaimer handles SIGKILL where no handler runs).
+_current_chunk_ids: list[int] = []
+_db_ref: Client | None = None
+
 
 def _sigterm(signum, frame):
     global _shutdown
     _shutdown = True
-    _log("sigterm_received", signum=signum)
+    _log("sigterm_received", signum=signum,
+         current_chunk_size=len(_current_chunk_ids))
+    # Best-effort sync unlock of in-flight chunk on SIGTERM.
+    # The async finally block will also fire if the event loop continues;
+    # this is an additional safety net for cases where it doesn't.
+    if _current_chunk_ids and _db_ref is not None:
+        try:
+            _unlock_chunk_sync(_db_ref, list(_current_chunk_ids))
+        except Exception:
+            pass
 
 
 signal.signal(signal.SIGTERM, _sigterm)
@@ -215,7 +250,7 @@ class _PgTimeoutError(Exception):
     pass
 
 
-# ── Admin setting override ────────────────────────────────────────────────────
+# ── Admin setting overrides ───────────────────────────────────────────────────
 def _get_admin_concurrency(db: Client, default: int) -> int:
     """Read enrich_daemon_concurrency from admin_settings. Returns default on error."""
     try:
@@ -232,7 +267,56 @@ def _get_admin_concurrency(db: Client, default: int) -> int:
     return default
 
 
+def _get_admin_chunk_size(db: Client, default: int) -> int:
+    """Read enrich_daemon_chunk_size from admin_settings. Returns default on error."""
+    try:
+        res = (
+            db.table("admin_settings")
+            .select("value")
+            .eq("key", _ADMIN_CHUNK_KEY)
+            .execute()
+        )
+        if res.data and res.data[0].get("value") is not None:
+            return int(res.data[0]["value"])
+    except Exception:
+        pass
+    return default
+
+
 # ── DB helpers (sync, run via asyncio.to_thread from async context) ───────────
+
+def _reclaim_stale_locks_sync(db: Client) -> int:
+    """
+    Release orphaned enrichment_locked=true rows left by a prior crash or SIGKILL.
+    Called once at daemon startup, before the main loop begins.
+
+    Runs in bounded batches of _STALE_LOCK_BATCH rows to avoid a full-table scan
+    on the (initially unindexed) boolean column. A partial index on
+    (enrichment_locked) WHERE enrichment_locked=true makes each batch instant;
+    even without the index the SELECT + UPDATE on 2000 rows is manageable.
+    """
+    total = 0
+    while True:
+        try:
+            res = (
+                db.table("leads")
+                .select("id")
+                .eq("enrichment_locked", True)
+                .limit(_STALE_LOCK_BATCH)
+                .execute()
+            )
+            ids = [r["id"] for r in (res.data or [])]
+            if not ids:
+                break
+            db.table("leads").update({"enrichment_locked": False}).in_("id", ids).execute()
+            total += len(ids)
+            _log("stale_lock_batch_reclaimed", batch=len(ids), total_so_far=total)
+            time.sleep(_STALE_LOCK_SLEEP_S)
+        except Exception as e:
+            _log("stale_lock_reclaim_error", level=logging.ERROR, error=str(e)[:300])
+            break
+    return total
+
 
 def _claim_chunk_sync(db: Client, chunk_size: int) -> list[dict]:
     """
@@ -291,23 +375,35 @@ def _unlock_chunk_sync(db: Client, ids: list[int]) -> None:
 def _write_result_sync(db: Client, lead_id: int, payload: dict) -> None:
     """
     Write enrichment result for one lead.
+    Retries up to 3x (with exponential backoff and a fresh client) on dropped-
+    connection errors ("Server disconnected", "ConnectionTerminated", etc.).
     Raises _PgTimeoutError if Postgres returns SQLSTATE 57014.
     """
-    t0 = time.monotonic()
-    try:
-        db.table("leads").update(payload).eq("id", lead_id).execute()
-        elapsed = time.monotonic() - t0
-        if elapsed > 5.0:
-            _log("slow_write", level=logging.WARNING,
-                 lead_id=lead_id, elapsed_s=round(elapsed, 2))
-    except Exception as e:
-        err = str(e)
-        if "57014" in err:
-            _log("pg_statement_timeout", level=logging.WARNING,
-                 lead_id=lead_id, error=err[:200])
-            raise _PgTimeoutError(err)
-        _log("write_error", level=logging.ERROR, lead_id=lead_id, error=err[:300])
-        raise
+    for attempt in range(3):
+        _db = _make_db() if attempt > 0 else db
+        try:
+            t0 = time.monotonic()
+            _db.table("leads").update(payload).eq("id", lead_id).execute()
+            elapsed = time.monotonic() - t0
+            if elapsed > 5.0:
+                _log("slow_write", level=logging.WARNING,
+                     lead_id=lead_id, elapsed_s=round(elapsed, 2))
+            return
+        except Exception as e:
+            err = str(e)
+            if "57014" in err:
+                _log("pg_statement_timeout", level=logging.WARNING,
+                     lead_id=lead_id, error=err[:200])
+                raise _PgTimeoutError(err)
+            if any(s in err for s in _WRITE_RETRYABLE) and attempt < 2:
+                delay = 2 ** attempt   # 1s, 2s
+                _log("write_retry", level=logging.WARNING,
+                     lead_id=lead_id, attempt=attempt + 1,
+                     backoff_s=delay, error=err[:200])
+                time.sleep(delay)
+                continue
+            _log("write_error", level=logging.ERROR, lead_id=lead_id, error=err[:300])
+            raise
 
 
 def _log_cost_zero_sync(db: Client, lead_id: int) -> None:
@@ -414,6 +510,21 @@ async def _enrich_lead(lead: dict, db: Client, sem: asyncio.Semaphore) -> str:
             return "error"
 
 
+# ── Independent systemd watchdog ping (asyncio task) ─────────────────────────
+
+async def _watchdog_ping_task() -> None:
+    """
+    Send WATCHDOG=1 to systemd every _WATCHDOG_PING_S seconds.
+    Runs as an independent asyncio task so the ping continues even while a chunk
+    is mid-processing -- decoupled from chunk/loop progress.
+    A live event loop is sufficient evidence the process is healthy; genuine stalls
+    are detected by the _watchdog_loop thread which exits via os._exit(1).
+    """
+    while not _shutdown:
+        _sd_notify("WATCHDOG=1")
+        await asyncio.sleep(_WATCHDOG_PING_S)
+
+
 # ── Stall watchdog thread ─────────────────────────────────────────────────────
 
 def _watchdog_loop() -> None:
@@ -475,9 +586,18 @@ async def _run(db: Client) -> None:
     import threading
 
     global _daemon_start_time, _queue_had_leads, _queue_backlog
+    global _current_chunk_ids, _db_ref
 
     _daemon_start_time = time.monotonic()
+    _db_ref = db
 
+    # ── Startup: clear orphaned locks from prior crash / SIGKILL ─────────────
+    # Batched to avoid a full-table timeout on the unindexed boolean column.
+    _log("stale_lock_reclaim_start")
+    reclaimed = await asyncio.to_thread(_reclaim_stale_locks_sync, db)
+    _log("stale_lock_reclaim_done", reclaimed=reclaimed)
+
+    # ── Stall watchdog (separate thread -- stall detection via os._exit) ─────
     watchdog = threading.Thread(target=_watchdog_loop, daemon=True, name="stall-watchdog")
     watchdog.start()
     _log("watchdog_started",
@@ -486,32 +606,41 @@ async def _run(db: Client) -> None:
 
     # Signal systemd: daemon is fully initialized.
     # Type=notify in the unit makes systemd wait for this before marking active.
-    # WatchdogSec=120: systemd force-restarts if WATCHDOG=1 stops arriving.
     _sd_notify("READY=1")
     _log("sd_notify_ready_sent")
+
+    # ── Independent watchdog ping (asyncio task, fires every _WATCHDOG_PING_S) ─
+    # Decoupled from chunk progress: a 100-lead chunk of slow sites can take
+    # minutes; this task keeps WATCHDOG=1 arriving regardless.
+    asyncio.ensure_future(_watchdog_ping_task())
+    _log("watchdog_ping_task_started", interval_s=_WATCHDOG_PING_S)
 
     effective_concurrency = await asyncio.to_thread(
         _get_admin_concurrency, db, _ENV_CONCURRENCY
     )
+    effective_chunk_size = await asyncio.to_thread(
+        _get_admin_chunk_size, db, CHUNK_SIZE
+    )
     _log("daemon_started",
          effective_concurrency=effective_concurrency,
-         chunk_size=CHUNK_SIZE,
+         effective_chunk_size=effective_chunk_size,
          poll_interval_sec=POLL_INTERVAL_SEC)
 
     cycle = 0
     while not _shutdown:
-        # Liveness ping to systemd WatchdogSec -- must arrive at least every 120s.
-        _sd_notify("WATCHDOG=1")
         cycle += 1
 
-        # Refresh admin override every 50 cycles (~25 min at default poll interval)
+        # Refresh admin overrides every 50 cycles (~25 min at default poll interval)
         if cycle % 50 == 1 and cycle > 1:
             effective_concurrency = await asyncio.to_thread(
                 _get_admin_concurrency, db, _ENV_CONCURRENCY
             )
+            effective_chunk_size = await asyncio.to_thread(
+                _get_admin_chunk_size, db, CHUNK_SIZE
+            )
 
         # Claim next chunk
-        leads = await asyncio.to_thread(_claim_chunk_sync, db, CHUNK_SIZE)
+        leads = await asyncio.to_thread(_claim_chunk_sync, db, effective_chunk_size)
 
         if not leads:
             _queue_had_leads = False
@@ -522,10 +651,12 @@ async def _run(db: Client) -> None:
                 await asyncio.sleep(1)
             continue
 
-        _queue_had_leads = True
-        _queue_backlog   = len(leads)
-        claimed_ids      = [l["id"] for l in leads]
-        _log("chunk_claimed", count=len(leads), concurrency=effective_concurrency)
+        _queue_had_leads   = True
+        _queue_backlog     = len(leads)
+        claimed_ids        = [l["id"] for l in leads]
+        _current_chunk_ids = claimed_ids   # visible to SIGTERM handler
+        _log("chunk_claimed", count=len(leads), concurrency=effective_concurrency,
+             chunk_size=effective_chunk_size)
 
         sem = asyncio.Semaphore(effective_concurrency)
         succeeded = failed = unreachable = 0
@@ -558,7 +689,9 @@ async def _run(db: Client) -> None:
                     failed += 1
 
         finally:
-            # Always release locks -- even on shutdown or exception
+            # Always release locks -- even on shutdown or exception.
+            # SIGTERM handler also unlocks synchronously for belt-and-suspenders.
+            _current_chunk_ids = []
             await asyncio.to_thread(_unlock_chunk_sync, db, claimed_ids)
 
         _log(
@@ -596,6 +729,7 @@ def main() -> int:
         chunk_size=CHUNK_SIZE,
         poll_interval_sec=POLL_INTERVAL_SEC,
         fetch_timeout_s=_FETCH_TIMEOUT_S,
+        watchdog_ping_s=_WATCHDOG_PING_S,
     )
 
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
