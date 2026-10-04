@@ -4005,15 +4005,18 @@ def setup_scheduler() -> AsyncIOScheduler:
         misfire_grace_time=300,
     )
 
-    # Job 2: enrich_stage1 — every 12 hours
-    scheduler.add_job(
-        job_enrich_stage1,
-        trigger=IntervalTrigger(hours=12),
-        id="enrich_stage1",
-        name="Auto-Enrich Stage 1",
-        replace_existing=True,
-        misfire_grace_time=600,
-    )
+    # Job 2: enrich_stage1 -- DISABLED: replaced by workers/enrich_daemon/daemon.py
+    # The standalone always-on daemon processes the backlog concurrently (25 parallel
+    # fetches vs serial) and uses enrichment_locked for race safety. Disabling here
+    # prevents double-processing; the daemon is the sole Stage-1 writer.
+    # scheduler.add_job(
+    #     job_enrich_stage1,
+    #     trigger=IntervalTrigger(hours=12),
+    #     id="enrich_stage1",
+    #     name="Auto-Enrich Stage 1",
+    #     replace_existing=True,
+    #     misfire_grace_time=600,
+    # )
 
     # Job 3: cost_digest — daily at 08:00 UTC
     scheduler.add_job(
