@@ -565,7 +565,7 @@ def transform_row(raw: dict, niche_slug: str, source_file: str) -> dict:
     row = {}
     for raw_col, value in raw.items():
         norm = str(raw_col).strip().lower().replace(' ', '_')
-        canonical = COLUMN_MAP.get(norm, COLUMN_MAP.get(raw_col, norm))
+        canonical = COLUMN_MAP.get(norm, COLUMN_MAP.get(raw_col, '_ignore'))
         row[canonical] = value if not (isinstance(value, float) and pd.isna(value)) else None
 
     # Safe-cast all numeric fields that might come in as strings
