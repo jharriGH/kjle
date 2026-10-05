@@ -166,6 +166,14 @@ COLUMN_MAP = {
     # Search metadata
     'search_keyword':           'search_keyword',
     'search_city':              'search_city',
+
+    # Leadsays CSV aliases (Title-Case headers, normalized to snake_case before lookup)
+    'corporate_email':          'email',
+    'generic_email':            'email_generic',
+    'contact_person':           '_ignore',
+    'number_of_employees':      '_ignore',
+    'phone_type':               '_ignore',
+    'id':                       '_ignore',
 }
 
 # Boolean fields that come in as 'y'/'n' strings
@@ -552,9 +560,12 @@ def transform_row(raw: dict, niche_slug: str, source_file: str) -> dict:
     """Transform a raw CSV row into a KJLE lead record."""
 
     # Map columns to canonical names
+    # Normalize raw_col to lowercase_snake so Title-Case headers (e.g. "Business Name")
+    # match the same COLUMN_MAP keys as snake_case headers ("business_name").
     row = {}
     for raw_col, value in raw.items():
-        canonical = COLUMN_MAP.get(raw_col, raw_col)
+        norm = str(raw_col).strip().lower().replace(' ', '_')
+        canonical = COLUMN_MAP.get(norm, COLUMN_MAP.get(raw_col, norm))
         row[canonical] = value if not (isinstance(value, float) and pd.isna(value)) else None
 
     # Safe-cast all numeric fields that might come in as strings
@@ -626,6 +637,14 @@ def transform_row(raw: dict, niche_slug: str, source_file: str) -> dict:
 
     # Data quality score
     row['data_quality_score'] = compute_data_quality_score(row)
+
+    # Email fallback: prefer Corporate Email; fall back to Generic Email
+    if not str(row.get('email') or '').strip():
+        row['email'] = row.get('email_generic')
+    row.pop('email_generic', None)
+
+    # Drop the sentinel key used to discard unwanted columns
+    row.pop('_ignore', None)
 
     # Clean up fields not in schema
     row.pop('phone_raw', None)
