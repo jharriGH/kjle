@@ -25,6 +25,9 @@ _PROVIDER_BUCKETS = [
     "yahoo", "apple", "other", "self_hosted", "unknown",
 ]
 
+BIZREPLY_MIN_PAGES = 5
+BIZREPLY_MIN_WORDS = 1500
+
 
 def get_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
@@ -123,6 +126,11 @@ class MarkContactedRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     # Batch form
     updates: Optional[List[MarkContactedItem]] = None
+
+
+class BizReplyFeedbackItem(BaseModel):
+    lead_id: str
+    unbuildable_reason: str
 
 
 # ─────────────────────────────────────────────────
@@ -373,6 +381,24 @@ async def eligible_for_campaign(
         elif len(trusts) > 1:
             query = query.in_("email_trust", trusts)
             count_query = count_query.in_("email_trust", trusts)
+
+    # ── BizReply site-quality pre-screen ──────────────────────────────────────
+    if product and product.lower() == "bizreply":
+        # page/word counts: exclude only when count is known and below threshold (null passes through)
+        br_page_or = f"website_internal_page_count.is.null,website_internal_page_count.gte.{BIZREPLY_MIN_PAGES}"
+        query = query.or_(br_page_or)
+        count_query = count_query.or_(br_page_or)
+        br_word_or = f"website_word_count.is.null,website_word_count.gte.{BIZREPLY_MIN_WORDS}"
+        query = query.or_(br_word_or)
+        count_query = count_query.or_(br_word_or)
+        # parked/dead sites — these exclusions apply regardless of null
+        query = query.or_("is_parked.is.null,is_parked.is.false")
+        count_query = count_query.or_("is_parked.is.null,is_parked.is.false")
+        query = query.or_("website_reachable.is.null,website_reachable.is.true")
+        count_query = count_query.or_("website_reachable.is.null,website_reachable.is.true")
+        # already failed a prior BizReply build
+        query = query.is_("bizreply_unbuildable_reason", "null")
+        count_query = count_query.is_("bizreply_unbuildable_reason", "null")
 
     # ── cooldown_days: exclude leads contacted within N days ───────────────────
     if cooldown_days is not None and cooldown_days > 0:
@@ -792,6 +818,65 @@ async def mark_contacted(payload: MarkContactedRequest, x_api_key: str = Header(
         "skipped": skipped,
         "errors": errors,
     }
+
+
+# ─────────────────────────────────────────────────
+# POST /kjle/v1/leads/bizreply-feedback
+# Ingest BizReply build-failure signals.
+# Body: single {lead_id, unbuildable_reason} or a list thereof.
+# ─────────────────────────────────────────────────
+
+@router.post("/leads/bizreply-feedback")
+async def bizreply_feedback(request: Request, x_api_key: str = Header(...)):
+    verify_api_key(x_api_key)
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    if isinstance(body, dict):
+        raw_items = [body]
+    elif isinstance(body, list):
+        raw_items = body
+    else:
+        raise HTTPException(status_code=400, detail="Body must be a JSON object or array")
+
+    if len(raw_items) > 1000:
+        raise HTTPException(status_code=400, detail="Max 1000 items per call")
+
+    supabase = get_supabase()
+    updated = 0
+    not_found = 0
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for item in raw_items:
+        if not isinstance(item, dict):
+            not_found += 1
+            continue
+        lead_id = item.get("lead_id")
+        reason = item.get("unbuildable_reason")
+        if not lead_id or not reason or not str(reason).strip():
+            continue
+        try:
+            res = (
+                supabase.table("leads")
+                .update({
+                    "bizreply_unbuildable_reason": str(reason).strip(),
+                    "bizreply_feedback_at": now_iso,
+                })
+                .eq("id", str(lead_id))
+                .execute()
+            )
+            if res.data:
+                updated += 1
+            else:
+                not_found += 1
+        except Exception as e:
+            logger.error(f"bizreply_feedback lead_id={lead_id}: {e}")
+            not_found += 1
+
+    return {"updated": updated, "not_found": not_found}
 
 
 # ─────────────────────────────────────────────────
