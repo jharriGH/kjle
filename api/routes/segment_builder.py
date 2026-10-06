@@ -45,6 +45,9 @@ class SegmentFilters(BaseModel):
     state: Optional[str] = None
     city: Optional[str] = None
     enrichment_stage: Optional[int] = None
+    has_chatbot: Optional[bool] = None
+    website_reachable: Optional[bool] = None
+    quality_tier: Optional[str] = None   # "bizreply_buildable" applies the buildable compound gate
 
 
 class SegmentCreate(BaseModel):
@@ -97,6 +100,16 @@ def apply_filters(query, filters: SegmentFilters):
         query = query.ilike("city", f"%{filters.city}%")
     if filters.enrichment_stage is not None:
         query = query.eq("enrichment_stage", filters.enrichment_stage)
+    if filters.has_chatbot is not None:
+        query = query.eq("has_chatbot", filters.has_chatbot)
+    if filters.website_reachable is not None:
+        query = query.eq("website_reachable", filters.website_reachable)
+    if filters.quality_tier == "bizreply_buildable":
+        query = (query.eq("website_reachable", True)
+                      .eq("is_parked", False)
+                      .gte("website_internal_page_count", 5)
+                      .gte("website_word_count", 1500)
+                      .is_("bizreply_unbuildable_reason", "null"))
     return query
 
 

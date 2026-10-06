@@ -264,6 +264,9 @@ async def eligible_for_campaign(
     audited_after: Optional[str] = Query(None, description="ISO timestamp; restrict to last_audited_at > this value"),
     min_word_count: Optional[int] = Query(None, description="Minimum website_word_count"),
     min_internal_pages: Optional[int] = Query(None, description="Minimum website_internal_page_count"),
+    has_chatbot: Optional[bool] = Query(None, description="Filter by chatbot presence (false = no chatbot)"),
+    website_reachable: Optional[bool] = Query(None, description="Filter by website reachability (false = broken/unreachable)"),
+    quality_tier: Optional[str] = Query(None, description="bizreply_buildable = buildable compound gate"),
     email_provider: Optional[str] = Query(None, description="Filter by email provider bucket(s). Single value or comma-separated."),
     email_trust: Optional[str] = Query(None, description="Filter by email trust value(s). Single value or comma-separated. Values: valid|catch_all|role|unconfirmable|invalid"),
     product: Optional[str] = Query(None, description="Product slug (e.g. compliancemds, bizreply). Used with exclude_already_contacted."),
@@ -365,6 +368,21 @@ async def eligible_for_campaign(
     if min_internal_pages is not None:
         query = query.gte("website_internal_page_count", min_internal_pages)
         count_query = count_query.gte("website_internal_page_count", min_internal_pages)
+    if has_chatbot is not None:
+        query = query.eq("has_chatbot", has_chatbot)
+        count_query = count_query.eq("has_chatbot", has_chatbot)
+    if website_reachable is not None:
+        query = query.eq("website_reachable", website_reachable)
+        count_query = count_query.eq("website_reachable", website_reachable)
+    if quality_tier == "bizreply_buildable":
+        query = (query.eq("website_reachable", True).eq("is_parked", False)
+                      .gte("website_internal_page_count", BIZREPLY_MIN_PAGES)
+                      .gte("website_word_count", BIZREPLY_MIN_WORDS)
+                      .is_("bizreply_unbuildable_reason", "null"))
+        count_query = (count_query.eq("website_reachable", True).eq("is_parked", False)
+                      .gte("website_internal_page_count", BIZREPLY_MIN_PAGES)
+                      .gte("website_word_count", BIZREPLY_MIN_WORDS)
+                      .is_("bizreply_unbuildable_reason", "null"))
     if email_provider:
         providers = [p.strip() for p in email_provider.split(",") if p.strip()]
         if len(providers) == 1:
