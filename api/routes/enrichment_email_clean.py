@@ -56,7 +56,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
-import psycopg2
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
@@ -588,51 +587,29 @@ async def ingest_batch_result(
     total_processed = 0
     now_iso = _now_iso()
 
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        raise HTTPException(
-            status_code=500,
-            detail="DATABASE_URL not set — cannot perform email-match ingest",
-        )
-
-    # 60s per chunk — normal 500-email batches fit in <5s; allow headroom for
-    # large adopted batches. A lower(email) functional index on leads would help
-    # if timeouts recur: CREATE INDEX idx_leads_lower_email ON leads (lower(email)).
-    conn = psycopg2.connect(db_url, connect_timeout=15, options="-c statement_timeout=60000")
-    conn.autocommit = False
-    try:
-        for (status, valid, sub), emails_lower in verdict_groups.items():
-            for i in range(0, len(emails_lower), EMAIL_INGEST_CHUNK):
-                chunk = emails_lower[i:i + EMAIL_INGEST_CHUNK]
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            UPDATE leads
-                               SET email_status    = %s,
-                                   email_valid     = %s,
-                                   email_sub_state = NULLIF(%s, ''),
-                                   email_cleaned_at = %s
-                             WHERE lower(email) = ANY(%s::text[])
-                               AND email_cleaned_at IS NULL
-                            """,
-                            (status, valid, sub, now_iso, chunk),
-                        )
-                        n = cur.rowcount
-                    conn.commit()
-                    total_processed += n
-                    counts[status] = counts.get(status, 0) + n
-                    print(
-                        f"[HB] ingest_batch_result {batch_id}: "
-                        f"chunk offset={i} status={status} matched={n}",
-                        flush=True,
-                    )
-                except Exception as e:
-                    conn.rollback()
-                    logger.error(f"[ingest_batch_result] email-match UPDATE failed ({status}): {e}")
-                    counts["error"] = counts.get("error", 0) + len(chunk)
-    finally:
-        conn.close()
+    # Email-match ingest via Supabase RPC (ingest_email_verdict) — no direct
+    # DATABASE_URL / psycopg2 connection needed; runs over the REST service role.
+    for (status, valid, sub), emails_lower in verdict_groups.items():
+        for i in range(0, len(emails_lower), EMAIL_INGEST_CHUNK):
+            chunk = emails_lower[i:i + EMAIL_INGEST_CHUNK]
+            try:
+                res = db.rpc("ingest_email_verdict", {
+                    "p_emails": chunk,
+                    "p_status": status,
+                    "p_valid":  valid,
+                    "p_sub":    sub,
+                }).execute()
+                n = res.data if isinstance(res.data, int) else int(res.data or 0)
+                total_processed += n
+                counts[status] = counts.get(status, 0) + n
+                print(
+                    f"[HB] ingest_batch_result {batch_id}: "
+                    f"chunk offset={i} status={status} matched={n}",
+                    flush=True,
+                )
+            except Exception as e:
+                logger.error(f"[ingest_batch_result] email-match RPC failed ({status}): {e}")
+                counts["error"] = counts.get("error", 0) + len(chunk)
 
     print(
         f"[HB] ingest_batch_result {batch_id}: done "
