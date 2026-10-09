@@ -47,6 +47,7 @@ from .enrichment_email_clean import (
     ingest_batch_result as ec_ingest_batch_result,
     _get_truelist_api_key as ec_get_truelist_api_key,
 )
+from .health_watchdog import run_watchdog as _hw_run_watchdog
 from .website_audit import (
     _fetch_html_free as wa_fetch_html_free,
     _fetch_html_free_with_status as wa_fetch_html_free_with_status,
@@ -262,6 +263,16 @@ JOB_DEFINITIONS = {
     "rdap_domain_check": {
         "description": "Nightly RDAP domain-expiry fill — populates domain_expires, domain_age_days, domain_expired, domain_expiring_soon for active leads with websites; deepens pain scoring at zero cost",
         "schedule":    "Daily at 07:00 UTC",
+        "trigger":     "cron",
+    },
+    "pipeline_watchdog_hourly": {
+        "description": "Hourly pipeline health snapshot + alert on first-red transition",
+        "schedule":    "Hourly at :20",
+        "trigger":     "cron",
+    },
+    "pipeline_watchdog_digest": {
+        "description": "Daily pipeline health digest email (08:45 UTC, after all nightly jobs finish)",
+        "schedule":    "Daily at 08:45 UTC",
         "trigger":     "cron",
     },
 }
@@ -3955,6 +3966,36 @@ async def job_axe_scan_nightly() -> dict:
 # JOB DISPATCH MAP — maps name → async callable
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def job_pipeline_watchdog_hourly():
+    job_name = "pipeline_watchdog_hourly"
+    t0 = time.time()
+    try:
+        out = await _hw_run_watchdog(digest=False)
+        overall = out.get("result", {}).get("overall", "?")
+        await _log_job(job_name, duration_seconds=time.time() - t0, status="success",
+                       notes=f"overall={overall}")
+        return out
+    except Exception as e:
+        await _log_job(job_name, duration_seconds=time.time() - t0, status="failed",
+                       notes=str(e))
+        raise
+
+
+async def job_pipeline_watchdog_digest():
+    job_name = "pipeline_watchdog_digest"
+    t0 = time.time()
+    try:
+        out = await _hw_run_watchdog(digest=True)
+        overall = out.get("result", {}).get("overall", "?")
+        await _log_job(job_name, duration_seconds=time.time() - t0, status="success",
+                       notes=f"overall={overall} digest=True")
+        return out
+    except Exception as e:
+        await _log_job(job_name, duration_seconds=time.time() - t0, status="failed",
+                       notes=str(e))
+        raise
+
+
 JOB_FUNCTIONS = {
     "classify_segments":    job_classify_segments,
     "enrich_stage1":        job_enrich_stage1,
@@ -3976,6 +4017,8 @@ JOB_FUNCTIONS = {
     "provider_classify_nightly":    job_provider_classify_nightly,
     "recompute_pain_backfill":      job_recompute_pain_backfill,
     "rdap_domain_check":            job_rdap_domain_check,
+    "pipeline_watchdog_hourly":     job_pipeline_watchdog_hourly,
+    "pipeline_watchdog_digest":     job_pipeline_watchdog_digest,
 }
 
 
@@ -4203,6 +4246,39 @@ def setup_scheduler() -> AsyncIOScheduler:
         max_instances=1,
         coalesce=True,
         misfire_grace_time=3600,
+    )
+
+    # Job 18: pipeline_watchdog_hourly — every hour at :20
+    # Snapshots pipeline health and alerts on first-red transition. Pinned to
+    # :20 to avoid colliding with email_clean_poll_batches (:00/:30) and
+    # classify_segments (:05). misfire_grace_time=600 so a brief deploy gap
+    # doesn't cause a double-fire; max_instances=1 + coalesce prevents
+    # concurrent runs if a prior check is still waiting on the DB.
+    scheduler.add_job(
+        job_pipeline_watchdog_hourly,
+        trigger=CronTrigger(minute=20),
+        id="pipeline_watchdog_hourly",
+        name="Pipeline Health Watchdog (hourly)",
+        replace_existing=True,
+        misfire_grace_time=600,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Job 19: pipeline_watchdog_digest — daily at 08:45 UTC
+    # Sends the full health digest email. 08:45 lands after all nightly jobs
+    # finish (latest: pagespeed_nightly runs 07:30–~08:30) so the digest
+    # reflects a fully settled pipeline. misfire_grace_time=1800 handles a
+    # brief service restart around that window.
+    scheduler.add_job(
+        job_pipeline_watchdog_digest,
+        trigger=CronTrigger(hour=8, minute=45),
+        id="pipeline_watchdog_digest",
+        name="Pipeline Health Digest (daily 08:45 UTC)",
+        replace_existing=True,
+        misfire_grace_time=1800,
+        max_instances=1,
+        coalesce=True,
     )
 
     logger.info(f"⏰ APScheduler configured: {len(scheduler.get_jobs())} jobs registered")

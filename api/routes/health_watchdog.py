@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -135,16 +136,26 @@ def compute_health() -> dict:
             "detail":      detail,
         })
 
-    # Stage health via pipeline_stage_health() RPC
+    # Stage health via pipeline_stage_health() RPC — one retry on failure or null/empty
     stage: dict = {}
-    try:
-        raw = db.rpc("pipeline_stage_health", {}).execute().data
-        if isinstance(raw, list) and raw:
-            stage = raw[0] or {}
-        elif isinstance(raw, dict):
-            stage = raw
-    except Exception as e:
-        logger.warning(f"[watchdog] pipeline_stage_health RPC failed: {e}")
+    stages_unavailable = False
+    for _attempt in range(2):
+        try:
+            raw = db.rpc("pipeline_stage_health", {}).execute().data
+            if isinstance(raw, list) and raw:
+                stage = raw[0] or {}
+            elif isinstance(raw, dict) and raw:
+                stage = raw
+            else:
+                raise ValueError("null/empty response from pipeline_stage_health")
+            break  # success
+        except Exception as e:
+            logger.warning(f"[watchdog] pipeline_stage_health attempt {_attempt + 1} failed: {e}")
+            if _attempt == 0:
+                time.sleep(3)
+    else:
+        # both attempts failed or returned null/empty — stages unreadable
+        stages_unavailable = True
 
     ec_at   = _parse_ts(stage.get("last_email_clean_at"))
     enr_at  = _parse_ts(stage.get("last_enriched_at"))
@@ -158,82 +169,116 @@ def compute_health() -> dict:
     enr_h = _hours_ago(enr_at)
     cls_h = _hours_ago(cls_at)
 
-    # email_clean stage: RED if null or older than 26h
-    if ec_at is None or (ec_h is not None and ec_h > 26):
-        ec_color  = "red"
-        ec_detail = (
-            f"last_email_clean_at {ec_h:.1f}h ago (max 26h)" if ec_h is not None
-            else "last_email_clean_at null"
-        )
+    if stages_unavailable:
+        # RPC failed — report unknown so a transient read error never causes a false red.
+        # "unknown" items are excluded from red_count and never flip overall to red.
+        items.extend([
+            {
+                "name":        "stage_email_clean",
+                "label":       "Stage: Email Clean",
+                "color":       "unknown",
+                "last_ran":    None,
+                "last_status": None,
+                "detail":      "stage data unavailable (RPC failed after retry)",
+            },
+            {
+                "name":        "stage_enrichment",
+                "label":       "Stage: Enrichment",
+                "color":       "unknown",
+                "last_ran":    None,
+                "last_status": None,
+                "detail":      "stage data unavailable (RPC failed after retry)",
+            },
+            {
+                "name":        "stage_classify",
+                "label":       "Stage: Classify",
+                "color":       "unknown",
+                "last_ran":    None,
+                "last_status": None,
+                "detail":      "stage data unavailable (RPC failed after retry)",
+            },
+        ])
     else:
-        ec_color, ec_detail = "green", f"ok ({ec_h:.1f}h ago)"
-
-    # enrichment stage: RED only if backlog > 0 AND last_enriched_at older than 6h (daemon stalled)
-    if backlog > 0 and (enr_at is None or (enr_h is not None and enr_h > 6)):
-        enr_color  = "red"
-        enr_detail = (
-            f"daemon stalled: backlog={backlog}, last_enriched {enr_h:.1f}h ago"
-            if enr_h is not None else f"daemon stalled: backlog={backlog}, no enrichment run"
-        )
-    else:
-        enr_color, enr_detail = "green", f"ok (backlog={backlog})"
-
-    # classify stage: last_classified_at (segment_updated_at) is never populated by the
-    # RPC, so a null value means data is unavailable — not that classify is broken.
-    # When null, derive health from the classify_segments job result already in items.
-    if cls_at is None:
-        cls_job = next((i for i in items if i["name"] == "classify_segments"), None)
-        if cls_job and cls_job["color"] == "green":
-            cls_color  = "green"
-            cls_detail = "ok (segment_data unavailable; classify_segments job green)"
-        elif cls_job and cls_job["color"] == "yellow":
-            cls_color  = "yellow"
-            cls_detail = "segment_data unavailable; classify_segments job yellow"
+        # email_clean stage: RED only when value is present and breaches threshold
+        if ec_at is None or (ec_h is not None and ec_h > 26):
+            ec_color  = "red"
+            ec_detail = (
+                f"last_email_clean_at {ec_h:.1f}h ago (max 26h)" if ec_h is not None
+                else "last_email_clean_at null"
+            )
         else:
+            ec_color, ec_detail = "green", f"ok ({ec_h:.1f}h ago)"
+
+        # enrichment stage: RED only if backlog > 0 AND last_enriched_at older than 6h (daemon stalled)
+        if backlog > 0 and (enr_at is None or (enr_h is not None and enr_h > 6)):
+            enr_color  = "red"
+            enr_detail = (
+                f"daemon stalled: backlog={backlog}, last_enriched {enr_h:.1f}h ago"
+                if enr_h is not None else f"daemon stalled: backlog={backlog}, no enrichment run"
+            )
+        else:
+            enr_color, enr_detail = "green", f"ok (backlog={backlog})"
+
+        # classify stage: last_classified_at (segment_updated_at) is never populated by the
+        # RPC, so a null value means data is unavailable — not that classify is broken.
+        # When null, derive health from the classify_segments job result already in items.
+        if cls_at is None:
+            cls_job = next((i for i in items if i["name"] == "classify_segments"), None)
+            if cls_job and cls_job["color"] == "green":
+                cls_color  = "green"
+                cls_detail = "ok (segment_data unavailable; classify_segments job green)"
+            elif cls_job and cls_job["color"] == "yellow":
+                cls_color  = "yellow"
+                cls_detail = "segment_data unavailable; classify_segments job yellow"
+            else:
+                cls_color  = "red"
+                cls_detail = "last_classified_at null and classify_segments job not green"
+        elif cls_h is not None and cls_h > 12:
             cls_color  = "red"
-            cls_detail = "last_classified_at null and classify_segments job not green"
-    elif cls_h is not None and cls_h > 12:
-        cls_color  = "red"
-        cls_detail = f"last_classified_at {cls_h:.1f}h ago (max 12h)"
-    else:
-        cls_color, cls_detail = "green", f"ok ({cls_h:.1f}h ago)"
+            cls_detail = f"last_classified_at {cls_h:.1f}h ago (max 12h)"
+        else:
+            cls_color, cls_detail = "green", f"ok ({cls_h:.1f}h ago)"
 
-    items.extend([
-        {
-            "name":        "stage_email_clean",
-            "label":       "Stage: Email Clean",
-            "color":       ec_color,
-            "last_ran":    stage.get("last_email_clean_at"),
-            "last_status": None,
-            "detail":      ec_detail,
-        },
-        {
-            "name":        "stage_enrichment",
-            "label":       "Stage: Enrichment",
-            "color":       enr_color,
-            "last_ran":    stage.get("last_enriched_at"),
-            "last_status": None,
-            "detail":      enr_detail,
-        },
-        {
-            "name":        "stage_classify",
-            "label":       "Stage: Classify",
-            "color":       cls_color,
-            "last_ran":    stage.get("last_classified_at"),
-            "last_status": None,
-            "detail":      cls_detail,
-        },
-    ])
+        items.extend([
+            {
+                "name":        "stage_email_clean",
+                "label":       "Stage: Email Clean",
+                "color":       ec_color,
+                "last_ran":    stage.get("last_email_clean_at"),
+                "last_status": None,
+                "detail":      ec_detail,
+            },
+            {
+                "name":        "stage_enrichment",
+                "label":       "Stage: Enrichment",
+                "color":       enr_color,
+                "last_ran":    stage.get("last_enriched_at"),
+                "last_status": None,
+                "detail":      enr_detail,
+            },
+            {
+                "name":        "stage_classify",
+                "label":       "Stage: Classify",
+                "color":       cls_color,
+                "last_ran":    stage.get("last_classified_at"),
+                "last_status": None,
+                "detail":      cls_detail,
+            },
+        ])
 
+    # "unknown" items are intentionally excluded from both counts — they must not
+    # contribute to red or flip overall. overall is derived from jobs only when
+    # stages_unavailable, because all stage items will be "unknown" in that case.
     red_count    = sum(1 for i in items if i["color"] == "red")
     yellow_count = sum(1 for i in items if i["color"] == "yellow")
     overall      = "red" if red_count else ("yellow" if yellow_count else "green")
 
     return {
-        "overall":       overall,
-        "red_count":     red_count,
-        "yellow_count":  yellow_count,
-        "items":         items,
+        "overall":          overall,
+        "red_count":        red_count,
+        "yellow_count":     yellow_count,
+        "stages_available": not stages_unavailable,
+        "items":            items,
         "stage_numbers": {
             "backlog_unenriched": backlog,
             "backlog_uncleaned":  uc,
@@ -254,14 +299,11 @@ async def health_overview():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# POST /kjle/v1/health/run-watchdog — x-api-key protected
+# Core watchdog logic — called by the POST endpoint and the scheduler jobs
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.post("/health/run-watchdog")
-async def run_watchdog(
-    digest: bool = Query(False, description="If true, always send a full digest email"),
-    _auth: str = Depends(verify_api_key),
-):
+async def run_watchdog(digest: bool = False) -> dict:
+    """Compute health, insert snapshot, send alerts. Returns the full result dict."""
     db = get_db()
 
     result       = compute_health()
@@ -361,3 +403,15 @@ async def run_watchdog(
         "emails_sent": emails_sent,
         "alerted":     alerted,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /kjle/v1/health/run-watchdog — x-api-key protected
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/health/run-watchdog")
+async def run_watchdog_endpoint(
+    digest: bool = Query(False, description="If true, always send a full digest email"),
+    _auth: str = Depends(verify_api_key),
+):
+    return await run_watchdog(digest=digest)
