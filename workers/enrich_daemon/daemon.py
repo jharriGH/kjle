@@ -87,9 +87,6 @@ BRAIN_KEY            = os.environ.get(
 ).strip()
 _HEALTHY_NOTIFY_INTERVAL_S = int(os.environ.get("HEALTHY_NOTIFY_INTERVAL_S", "86400"))
 
-# All leads with websites are eligible (Stage 1 is free, no pain floor)
-_ENRICH_MIN_PAIN = 0
-
 # Per-lead fetch ceiling -- wa_fetch_html_free has its own 15s timeout per attempt
 # (2 attempts = up to 32s); this outer ceiling is a belt-and-suspenders backstop.
 _FETCH_TIMEOUT_S = 35
@@ -324,7 +321,6 @@ def _claim_chunk_sync(db: Client, chunk_size: int) -> list[dict]:
             .eq("is_active", True)
             .eq("enrichment_stage", 0)
             .eq("enrichment_locked", False)
-            .gte("pain_score", _ENRICH_MIN_PAIN)
             .not_.is_("website", "null")
             .neq("website", "")
             .order("pain_score", desc=True)

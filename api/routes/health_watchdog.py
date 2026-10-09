@@ -178,13 +178,23 @@ def compute_health() -> dict:
     else:
         enr_color, enr_detail = "green", f"ok (backlog={backlog})"
 
-    # classify stage: RED if null or older than 12h
-    if cls_at is None or (cls_h is not None and cls_h > 12):
+    # classify stage: last_classified_at (segment_updated_at) is never populated by the
+    # RPC, so a null value means data is unavailable — not that classify is broken.
+    # When null, derive health from the classify_segments job result already in items.
+    if cls_at is None:
+        cls_job = next((i for i in items if i["name"] == "classify_segments"), None)
+        if cls_job and cls_job["color"] == "green":
+            cls_color  = "green"
+            cls_detail = "ok (segment_data unavailable; classify_segments job green)"
+        elif cls_job and cls_job["color"] == "yellow":
+            cls_color  = "yellow"
+            cls_detail = "segment_data unavailable; classify_segments job yellow"
+        else:
+            cls_color  = "red"
+            cls_detail = "last_classified_at null and classify_segments job not green"
+    elif cls_h is not None and cls_h > 12:
         cls_color  = "red"
-        cls_detail = (
-            f"last_classified_at {cls_h:.1f}h ago (max 12h)" if cls_h is not None
-            else "last_classified_at null"
-        )
+        cls_detail = f"last_classified_at {cls_h:.1f}h ago (max 12h)"
     else:
         cls_color, cls_detail = "green", f"ok ({cls_h:.1f}h ago)"
 
