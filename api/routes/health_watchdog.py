@@ -54,7 +54,6 @@ EXPECTED_JOBS = {
     "fed_dnc_refresh_monthly":   {"label": "FED DNC Refresh (Monthly)",   "max_age_hours": 744, "allow_skipped": True},
     "nanpa_refresh_monthly":     {"label": "NANPA Refresh (Monthly)",     "max_age_hours": 744, "allow_skipped": True},
     "tcpa_refresh_weekly":       {"label": "TCPA Refresh (Weekly)",       "max_age_hours": 192, "allow_skipped": True},
-    "recompute_pain_backfill":   {"label": "Pain Score Backfill (Hourly)", "max_age_hours": 2,   "allow_skipped": False},
 }
 
 
