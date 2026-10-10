@@ -11,9 +11,11 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi.responses import HTMLResponse
 
 from ..database import get_db
 from ..lib.email_sender import send_email
@@ -291,6 +293,13 @@ def compute_health() -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # GET /kjle/v1/health/overview — public, no auth
 # ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/health/panel", response_class=HTMLResponse)
+async def health_panel():
+    """System Health UI panel. Public, no auth."""
+    html_path = Path(__file__).parent.parent / "static" / "health_panel.html"
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"), media_type="text/html")
+
 
 @router.get("/health/overview")
 async def health_overview():
