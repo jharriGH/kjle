@@ -3259,8 +3259,8 @@ async def job_recompute_pain_backfill() -> dict:
                     db.table("leads")
                     .select(SELECT_FIELDS)
                     .eq("is_active", True)
+                    .not_.is_("last_audited_at", "null")
                     .or_("pain_score_version.is.null,pain_score_version.lt.3")
-                    .or_("is_parked.eq.true,website_has_ssl.eq.false,website_reachable.eq.false,website_status_code.gte.400")
                     .order("id")
                     .limit(this_chunk)
                 )
@@ -4277,6 +4277,21 @@ def setup_scheduler() -> AsyncIOScheduler:
         name="Pipeline Health Digest (daily 08:45 UTC)",
         replace_existing=True,
         misfire_grace_time=1800,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Job 20: recompute_pain_backfill — every hour at :50
+    # Scores audited-but-unscored leads (last_audited_at IS NOT NULL AND
+    # pain_score_version IS NULL or < 3). Phased to :50 — clear of classify_segments
+    # (:05), email_clean_poll_batches (:00/:30), and watchdog (:20).
+    scheduler.add_job(
+        job_recompute_pain_backfill,
+        trigger=CronTrigger(minute=50),
+        id="recompute_pain_backfill",
+        name="Hourly Pain Score Backfill",
+        replace_existing=True,
+        misfire_grace_time=600,
         max_instances=1,
         coalesce=True,
     )

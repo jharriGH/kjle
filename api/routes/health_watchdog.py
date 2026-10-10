@@ -54,6 +54,7 @@ EXPECTED_JOBS = {
     "fed_dnc_refresh_monthly":   {"label": "FED DNC Refresh (Monthly)",   "max_age_hours": 744, "allow_skipped": True},
     "nanpa_refresh_monthly":     {"label": "NANPA Refresh (Monthly)",     "max_age_hours": 744, "allow_skipped": True},
     "tcpa_refresh_weekly":       {"label": "TCPA Refresh (Weekly)",       "max_age_hours": 192, "allow_skipped": True},
+    "recompute_pain_backfill":   {"label": "Pain Score Backfill (Hourly)", "max_age_hours": 2,   "allow_skipped": False},
 }
 
 
@@ -159,13 +160,15 @@ def compute_health() -> dict:
         # both attempts failed or returned null/empty — stages unreadable
         stages_unavailable = True
 
-    ec_at   = _parse_ts(stage.get("last_email_clean_at"))
-    enr_at  = _parse_ts(stage.get("last_enriched_at"))
-    cls_at  = _parse_ts(stage.get("last_classified_at"))
-    backlog = int(stage.get("backlog_unenriched") or 0)
-    uc      = int(stage.get("backlog_uncleaned")  or 0)
-    pending = int(stage.get("pending_batch")      or 0)
-    s_ready = int(stage.get("send_ready")         or 0)
+    ec_at              = _parse_ts(stage.get("last_email_clean_at"))
+    enr_at             = _parse_ts(stage.get("last_enriched_at"))
+    cls_at             = _parse_ts(stage.get("last_classified_at"))
+    backlog            = int(stage.get("backlog_unenriched")  or 0)
+    backlog_enrichable = int(stage.get("backlog_enrichable")  or 0)
+    stuck_batches      = int(stage.get("stuck_batches")       or 0)
+    uc                 = int(stage.get("backlog_uncleaned")   or 0)
+    pending            = int(stage.get("pending_batch")       or 0)
+    s_ready            = int(stage.get("send_ready")          or 0)
 
     ec_h  = _hours_ago(ec_at)
     enr_h = _hours_ago(enr_at)
@@ -201,25 +204,27 @@ def compute_health() -> dict:
             },
         ])
     else:
-        # email_clean stage: RED only when value is present and breaches threshold
-        if ec_at is None or (ec_h is not None and ec_h > 26):
+        # email_clean stage: RED only if stuck_batches > 0 (completed batches not ingested >2h).
+        # last_email_clean_at is kept as informational context only — "caught up" pipelines
+        # can go 26h+ between clean runs without any real issue.
+        if stuck_batches > 0:
             ec_color  = "red"
-            ec_detail = (
-                f"last_email_clean_at {ec_h:.1f}h ago (max 26h)" if ec_h is not None
-                else "last_email_clean_at null"
-            )
+            ec_detail = f"stuck_batches={stuck_batches} (completed TrueList batches not ingested >2h)"
         else:
-            ec_color, ec_detail = "green", f"ok ({ec_h:.1f}h ago)"
+            ec_last = f"{ec_h:.1f}h ago" if ec_h is not None else "never"
+            ec_color, ec_detail = "green", f"ok (stuck_batches=0, last_email_clean_at={ec_last})"
 
-        # enrichment stage: RED only if backlog > 0 AND last_enriched_at older than 6h (daemon stalled)
-        if backlog > 0 and (enr_at is None or (enr_h is not None and enr_h > 6)):
+        # enrichment stage: RED only if backlog_enrichable > 0 AND last_enriched_at older than 6h.
+        # backlog_enrichable = unenriched leads that HAVE a website; daemon-idle when 0.
+        if backlog_enrichable > 0 and (enr_at is None or (enr_h is not None and enr_h > 6)):
             enr_color  = "red"
             enr_detail = (
-                f"daemon stalled: backlog={backlog}, last_enriched {enr_h:.1f}h ago"
-                if enr_h is not None else f"daemon stalled: backlog={backlog}, no enrichment run"
+                f"daemon stalled: backlog_enrichable={backlog_enrichable}, last_enriched {enr_h:.1f}h ago"
+                if enr_h is not None
+                else f"daemon stalled: backlog_enrichable={backlog_enrichable}, no enrichment run"
             )
         else:
-            enr_color, enr_detail = "green", f"ok (backlog={backlog})"
+            enr_color, enr_detail = "green", f"ok (backlog_enrichable={backlog_enrichable})"
 
         # classify stage: last_classified_at (segment_updated_at) is never populated by the
         # RPC, so a null value means data is unavailable — not that classify is broken.
