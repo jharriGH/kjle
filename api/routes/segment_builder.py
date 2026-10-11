@@ -97,7 +97,7 @@ def apply_filters(query, filters: SegmentFilters):
     if filters.state:
         query = query.eq("state", filters.state)
     if filters.city:
-        query = query.ilike("city", f"%{filters.city}%")
+        query = query.ilike("city", filters.city.strip())
     if filters.enrichment_stage is not None:
         query = query.eq("enrichment_stage", filters.enrichment_stage)
     if filters.has_chatbot is not None:

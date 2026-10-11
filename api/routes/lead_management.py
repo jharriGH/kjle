@@ -247,6 +247,7 @@ _ELIGIBLE_KNOWN_PARAMS = frozenset({
     "require_email_valid", "require_name_verified", "audited_after",
     "min_word_count", "min_internal_pages", "email_provider", "email_trust",
     "product", "exclude_already_contacted", "cooldown_days", "include_total",
+    "city", "has_chatbot", "website_reachable", "quality_tier",
 })
 
 
@@ -273,6 +274,7 @@ async def eligible_for_campaign(
     exclude_already_contacted: bool = Query(False, description="When true and product is set, exclude leads with a lead_campaign_history row for that product."),
     cooldown_days: Optional[int] = Query(None, description="Exclude leads whose last_contacted_at is within this many days."),
     include_total: bool = Query(False, description="Compute the total count (expensive on broad filters); default False returns total=null"),
+    city: Optional[str] = Query(None, description="Case-insensitive exact city match (whitespace trimmed). Omit to skip."),
     x_api_key: str = Header(...),
 ):
     verify_api_key(x_api_key)
@@ -399,6 +401,9 @@ async def eligible_for_campaign(
         elif len(trusts) > 1:
             query = query.in_("email_trust", trusts)
             count_query = count_query.in_("email_trust", trusts)
+    if city and city.strip():
+        query = query.ilike("city", city.strip())
+        count_query = count_query.ilike("city", city.strip())
 
     # ── BizReply site-quality pre-screen ──────────────────────────────────────
     if product and product.lower() == "bizreply":
