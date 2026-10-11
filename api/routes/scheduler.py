@@ -271,8 +271,8 @@ JOB_DEFINITIONS = {
         "trigger":     "cron",
     },
     "pipeline_watchdog_digest": {
-        "description": "Daily pipeline health digest email (08:45 UTC, after all nightly jobs finish)",
-        "schedule":    "Daily at 08:45 UTC",
+        "description": "Daily pipeline health digest email (08:45 America/Los_Angeles)",
+        "schedule":    "Daily at 08:45 America/Los_Angeles",
         "trigger":     "cron",
     },
 }
@@ -4265,16 +4265,15 @@ def setup_scheduler() -> AsyncIOScheduler:
         coalesce=True,
     )
 
-    # Job 19: pipeline_watchdog_digest — daily at 08:45 UTC
-    # Sends the full health digest email. 08:45 lands after all nightly jobs
-    # finish (latest: pagespeed_nightly runs 07:30–~08:30) so the digest
-    # reflects a fully settled pipeline. misfire_grace_time=1800 handles a
-    # brief service restart around that window.
+    # Job 19: pipeline_watchdog_digest — daily at 08:45 America/Los_Angeles
+    # Sends the full health digest email at 8:45 AM Pacific so the owner sees
+    # it at the start of the work day. misfire_grace_time=1800 handles a brief
+    # service restart around that window.
     scheduler.add_job(
         job_pipeline_watchdog_digest,
-        trigger=CronTrigger(hour=8, minute=45),
+        trigger=CronTrigger(hour=8, minute=45, timezone="America/Los_Angeles"),
         id="pipeline_watchdog_digest",
-        name="Pipeline Health Digest (daily 08:45 UTC)",
+        name="Pipeline Health Digest (daily 08:45 America/Los_Angeles)",
         replace_existing=True,
         misfire_grace_time=1800,
         max_instances=1,

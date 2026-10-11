@@ -9,10 +9,14 @@ and capped at 2,500 emails/night. V2 submits 25K-email batches to
 Truelist and ingests the annotated CSV per batch on completion. ~19
 batches clears the 469K backlog.
 
-Truelist API (confirmed via smoke test 2026-05-10):
+Truelist API:
   Submit: POST https://api.truelist.io/api/v1/batches
-          body: {"data": [["email1"], ["email2"], ...]}
+          body: multipart/form-data — field "file" is a CSV with header "email",
+                one address per row. Optional "name" field in the same form.
           response: {"id": <uuid>, "batch_state": "pending", "email_count": N, ...}
+  NOTE (2026-10-11): TrueList changed from accepting JSON {"data":[...]} to
+  requiring a CSV file upload. The 422 "No email column found. Please check
+  your CSV!" is returned when the old JSON body is sent.
   Poll:   GET  https://api.truelist.io/api/v1/batches/{uuid}
           response: includes batch_state and (on completion) 4 CSV URLs
           states observed: pending → processing → completed
@@ -188,6 +192,26 @@ async def submit_batch(
     if not payload_data:
         return {"submitted": 0, "skipped": True, "reason": "no_usable_emails"}
 
+    # Build CSV with "email" header — TrueList /api/v1/batches requires a CSV
+    # file upload (multipart/form-data), not a JSON body. A single "email" column
+    # is the unambiguous safe form per TrueList's current API.
+    csv_buf = io.StringIO()
+    csv_writer = csv.writer(csv_buf)
+    csv_writer.writerow(["email"])
+    for row in payload_data:
+        csv_writer.writerow(row)
+    csv_bytes = csv_buf.getvalue().encode("utf-8")
+
+    # Guard: the CSV must have at least one data row and the email header.
+    # Unreachable under normal flow (payload_data check above), but prevents
+    # sending a headerless or empty CSV on any future regression.
+    if len(payload_data) == 0 or not csv_bytes.strip().startswith(b"email"):
+        raise ValueError(
+            f"submit_batch: CSV sanity check failed — "
+            f"data_rows={len(payload_data)}, csv_start={csv_bytes[:40]!r}. "
+            "Not submitting to Truelist."
+        )
+
     # Unique name per submission so Truelist doesn't hash-dedup identical email lists
     # across nightly runs (same 9K unknown leads → same content hash → 409 without this).
     batch_name = f"kjle_reval_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
@@ -195,8 +219,9 @@ async def submit_batch(
     async with httpx.AsyncClient(timeout=SUBMIT_TIMEOUT_SEC) as client:
         r = await client.post(
             TRUELIST_BATCHES_URL,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"data": payload_data, "name": batch_name},
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={"file": ("emails.csv", csv_bytes, "text/csv")},
+            data={"name": batch_name},
         )
 
     adopted_existing = False
