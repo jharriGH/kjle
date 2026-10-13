@@ -56,6 +56,7 @@ import asyncio
 import io
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -78,6 +79,34 @@ EMAIL_INGEST_CHUNK    = 300   # email-list chunks for lower(email)=ANY() UPDATE
 STAMP_CHUNK_SIZE      = 100   # lead-id chunks for UPDATE .in_() calls
                               # 100 UUIDs × 37 chars = ~3.7KB URL, safe under Supabase's
                               # 8KB PATCH URL limit (500 × 37 = 18KB → hit 414 silently)
+
+# Matches trailing provider annotations like " (accept_all)" or " (risky)" in multi-email fields.
+# These annotations are appended by LeadRocks/LeadSays ingest and cause TrueList 422 when included
+# in the CSV (the field is not a valid email address with them present).
+_ANNOTATION_RE = re.compile(r'\s*\([^)]*\)\s*$')
+
+
+def _extract_emails(raw: str) -> list[str]:
+    """
+    Extract individual valid-looking email addresses from an email field that may contain:
+      - A single clean address:          "foo@bar.com"
+      - An annotated address:            "foo@bar.com (accept_all)"
+      - Multiple annotated addresses:    "a@b.com (accept_all) , c@d.com (accept_all)"
+      - Multiple addresses, no annot:    "a@b.com, c@d.com"
+
+    Splits on commas, strips surrounding whitespace, removes trailing "(…)" annotations,
+    then validates each candidate (has @, no spaces, non-empty, ≤254 chars).
+
+    Returns a list of lowercased clean email addresses. Empty list if none are found.
+    """
+    if not raw:
+        return []
+    results: list[str] = []
+    for part in re.split(r'\s*,\s*', raw.strip()):
+        clean = _ANNOTATION_RE.sub('', part).strip()
+        if clean and '@' in clean and ' ' not in clean and len(clean) <= 254:
+            results.append(clean.lower())
+    return results
 SUBMIT_TIMEOUT_SEC    = 60.0
 POLL_TIMEOUT_SEC      = 30.0
 CSV_DOWNLOAD_TIMEOUT  = 300.0
@@ -178,16 +207,34 @@ async def submit_batch(
     if not leads:
         return {"submitted": 0, "skipped": True, "reason": "empty_batch"}
 
-    # Deduplicate emails within this batch — Truelist will dedupe anyway, but
-    # we want a stable email→[lead_id,…] map for ingestion.
-    seen: set[str] = set()
+    # Extract individual email addresses from each lead's email field.
+    # The email column may contain multiple addresses and/or provider annotations
+    # (e.g. "foo@bar.com (accept_all) , baz@qux.com (accept_all)") from the
+    # LeadRocks/LeadSays ingest. TrueList rejects a CSV that contains these raw
+    # strings — it expects one plain, valid email address per row.
+    # _extract_emails() splits on commas, strips "(…)" annotations, and validates
+    # each candidate. The lead is stamped by ID (not by email) so multi-email
+    # leads are still correctly associated with the batch for later ingestion.
+    seen_emails: set[str] = set()
     payload_data: list[list[str]] = []
+    stampable_ids: list[str] = []
+
     for lead in leads:
-        em = (lead.get("email") or "").strip()
-        if not em or em.lower() in seen:
+        lead_id = lead.get("id")
+        raw_em = (lead.get("email") or "").strip()
+        extracted = _extract_emails(raw_em)
+        if not extracted:
+            logger.warning(
+                f"[submit_batch] lead {lead_id}: no extractable email from "
+                f"{raw_em!r:.120s} — skipping"
+            )
             continue
-        seen.add(em.lower())
-        payload_data.append([em])
+        for em in extracted:
+            if em not in seen_emails:
+                seen_emails.add(em)
+                payload_data.append([em])
+        if lead_id:
+            stampable_ids.append(lead_id)
 
     if not payload_data:
         return {"submitted": 0, "skipped": True, "reason": "no_usable_emails"}
@@ -291,10 +338,10 @@ async def submit_batch(
     # If stamping fails silently, ingest returns processed=0 and the leads get re-submitted
     # the next night to a different batch. Use STAMP_CHUNK_SIZE=100 to stay under Supabase's
     # 8KB PATCH URL limit (500 UUIDs × 37 chars = 18KB → silent 414, was the root-cause bug).
-    ids = [l["id"] for l in leads]
+    # stampable_ids contains only lead IDs that had at least one extractable email address.
     updated = 0
-    for i in range(0, len(ids), STAMP_CHUNK_SIZE):
-        chunk = ids[i:i + STAMP_CHUNK_SIZE]
+    for i in range(0, len(stampable_ids), STAMP_CHUNK_SIZE):
+        chunk = stampable_ids[i:i + STAMP_CHUNK_SIZE]
         try:
             db.table("leads").update({
                 "email_status":            "pending_batch",
@@ -311,10 +358,10 @@ async def submit_batch(
                 detail=f"Failed to stamp leads for batch {batch_id} at offset {i}: {e}",
             )
 
-    if updated != len(ids):
+    if updated != len(stampable_ids):
         logger.warning(
             f"[truelist.submit_batch] stamp count mismatch for {batch_id}: "
-            f"expected={len(ids)}, stamped={updated}"
+            f"expected={len(stampable_ids)}, stamped={updated}"
         )
 
     return {
