@@ -646,41 +646,85 @@ async def ingest_batch_result(
         raise HTTPException(status_code=502, detail=f"Annotated CSV for {batch_id} parsed to 0 rows")
     print(f"[HB] ingest_batch_result {batch_id}: CSV has {len(email_map)} emails", flush=True)
 
-    # Group CSV entries by verdict so each UPDATE targets one status value
-    verdict_groups: dict[tuple, list] = {}
-    sub_state_seen: dict[str, int] = {}
-    for em_lower, mapped in email_map.items():
-        status, valid = parse_truelist_state(mapped["state"])
-        sub = mapped.get("sub_state", "") or ""
-        sub_state_seen[sub] = sub_state_seen.get(sub, 0) + 1
-        verdict_groups.setdefault((status, valid, sub), []).append(em_lower)
+    # Fetch all leads associated with this batch that haven't been cleaned yet.
+    # Match by email_truelist_batch_id (stamped by lead ID during submit) rather
+    # than by raw email equality. The old RPC path did WHERE lower(email)=ANY(emails)
+    # which returned 0 rows because leads.email contains raw annotated strings like
+    # "foo@bar.com (accept_all)" that never match the clean "foo@bar.com" in the CSV.
+    PAGE = 1000
+    all_leads: list[dict] = []
+    offset = 0
+    while True:
+        try:
+            rows = (
+                db.table("leads")
+                .select("id, email")
+                .eq("email_truelist_batch_id", batch_id)
+                .is_("email_cleaned_at", "null")
+                .range(offset, offset + PAGE - 1)
+                .execute()
+                .data or []
+            )
+        except Exception as e:
+            logger.error(f"[ingest_batch_result] lead fetch failed at offset {offset}: {e}")
+            rows = []
+        all_leads.extend(rows)
+        if len(rows) < PAGE:
+            break
+        offset += PAGE
+
+    print(f"[HB] ingest_batch_result {batch_id}: {len(all_leads)} leads to process", flush=True)
+
+    # For each lead, extract clean addresses and resolve the best verdict from the CSV map.
+    # Best-verdict precedence: valid > unknown > invalid (any valid address → lead is valid).
+    _VERDICT_ORDER = {"valid": 0, "unknown": 1, "invalid": 2}
+    verdict_to_leads: dict[tuple, list[str]] = {}
+    no_match = 0
+
+    for lead in all_leads:
+        clean_emails = _extract_emails(lead.get("email") or "")
+        best: Optional[tuple[str, Optional[bool]]] = None
+        for em in clean_emails:
+            entry = email_map.get(em)
+            if entry is None:
+                continue
+            sv = parse_truelist_state(entry["state"])
+            if best is None or _VERDICT_ORDER.get(sv[0], 99) < _VERDICT_ORDER.get(best[0], 99):
+                best = sv
+        if best is None:
+            no_match += 1
+            continue
+        verdict_to_leads.setdefault(best, []).append(lead["id"])
+
+    print(
+        f"[HB] ingest_batch_result {batch_id}: "
+        f"matched={len(all_leads) - no_match} no_match={no_match} "
+        f"verdict_groups={len(verdict_to_leads)}",
+        flush=True,
+    )
 
     counts: dict[str, int] = {"valid": 0, "invalid": 0, "unknown": 0, "error": 0}
     total_processed = 0
     now_iso = _now_iso()
 
-    # Email-match ingest via Supabase RPC (ingest_email_verdict) — no direct
-    # DATABASE_URL / psycopg2 connection needed; runs over the REST service role.
-    for (status, valid, sub), emails_lower in verdict_groups.items():
-        for i in range(0, len(emails_lower), EMAIL_INGEST_CHUNK):
-            chunk = emails_lower[i:i + EMAIL_INGEST_CHUNK]
+    for (status, valid), lead_ids in verdict_to_leads.items():
+        for i in range(0, len(lead_ids), STAMP_CHUNK_SIZE):
+            chunk = lead_ids[i:i + STAMP_CHUNK_SIZE]
             try:
-                res = db.rpc("ingest_email_verdict", {
-                    "p_emails": chunk,
-                    "p_status": status,
-                    "p_valid":  valid,
-                    "p_sub":    sub,
-                }).execute()
-                n = res.data if isinstance(res.data, int) else int(res.data or 0)
-                total_processed += n
-                counts[status] = counts.get(status, 0) + n
+                db.table("leads").update({
+                    "email_status":     status,
+                    "email_valid":      valid,
+                    "email_cleaned_at": now_iso,
+                }).in_("id", chunk).execute()
+                total_processed += len(chunk)
+                counts[status] = counts.get(status, 0) + len(chunk)
                 print(
                     f"[HB] ingest_batch_result {batch_id}: "
-                    f"chunk offset={i} status={status} matched={n}",
+                    f"chunk offset={i} status={status} updated={len(chunk)}",
                     flush=True,
                 )
             except Exception as e:
-                logger.error(f"[ingest_batch_result] email-match RPC failed ({status}): {e}")
+                logger.error(f"[ingest_batch_result] verdict update chunk failed ({status}): {e}")
                 counts["error"] = counts.get("error", 0) + len(chunk)
 
     print(
@@ -694,9 +738,9 @@ async def ingest_batch_result(
         "status":      "ingested",
         "ingested_at": _now_iso(),
         "notes":       (batch.get("notes") or "") + (
-            f" | ingest(email-match): processed={total_processed}, valid={counts['valid']}, "
+            f" | ingest(batch-match v2): processed={total_processed}, valid={counts['valid']}, "
             f"invalid={counts['invalid']}, unknown={counts['unknown']}, "
-            f"errors={counts['error']}"
+            f"errors={counts['error']}, no_match={no_match}"
         ),
     }).eq("id", batch_id).execute()
 
@@ -705,7 +749,7 @@ async def ingest_batch_result(
         "status":          "ingested",
         "leads_processed": total_processed,
         "counts":          counts,
-        "sub_states_top":  sorted(sub_state_seen.items(), key=lambda x: -x[1])[:10],
+        "no_match":        no_match,
     }
 
 
@@ -826,9 +870,11 @@ async def recover_batch_stamps(db, api_key: str, batch_id: str) -> dict:
             }).eq("id", batch_id).execute()
             return {"batch_id": batch_id, "status": "recovery_noop", "stamped": 0}
 
-    # Step 5: ingest
-    result = await ingest_batch_result(db, api_key, batch_id)
-    return {"batch_id": batch_id, "status": "recovered", "stamped": already_tagged or stamped_total if already_tagged == 0 else already_tagged, "ingest": result}
+    # Step 5: ingest — force_reingest=True bypasses the "already_ingested" early-exit
+    # so we can drain leads that were stamped but never matched due to the email-match bug.
+    result = await ingest_batch_result(db, api_key, batch_id, force_reingest=True)
+    stamped = already_tagged if already_tagged > 0 else stamped_total
+    return {"batch_id": batch_id, "status": "recovered", "stamped": stamped, "ingest": result}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
