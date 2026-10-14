@@ -1199,8 +1199,17 @@ async def job_email_clean_nightly() -> dict:
         # Select returned [] on iteration 0 — nothing to clean, not a failure.
         notes = "no_leads_available (new+reval selectors both returned 0 on iteration 0)"
         status = "success"
+    elif submit_exception_count == 0:
+        # Selector found leads but all were skipped cleanly (no extractable emails).
+        # ec_submit_batch returned {"skipped": True, "reason": "no_usable_emails"} — no raise.
+        # This is a normal drained-backlog outcome, not a submit failure.
+        notes = (
+            f"no_usable_emails ({selector_total_returned} selected, 0 submittable) "
+            f"— leads have no extractable email addresses; not a submit error"
+        )
+        status = "success"
     else:
-        # Selector found leads but every submit attempt raised.
+        # Selector found leads and actual submit exceptions occurred (HTTP 4xx/5xx or raises).
         notes = (
             f"selector returned {selector_total_returned} leads but all "
             f"{submit_exception_count} submit attempts raised — see logs for exception details"
