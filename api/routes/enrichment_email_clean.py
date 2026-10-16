@@ -71,6 +71,15 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+
+class TruelistTransientError(Exception):
+    """Raised when TrueList returns a transient 5xx or network error after all retries.
+
+    Callers should log a WARNING, leave the batch status unchanged, and continue
+    to the next batch — the cron will retry on the next 30-min cycle.
+    """
+
+
 TRUELIST_BATCHES_URL  = "https://api.truelist.io/api/v1/batches"
 TRUELIST_VERIFY_URL   = "https://api.truelist.io/api/v1/verify_inline"  # retained for single endpoint
 
@@ -110,6 +119,8 @@ def _extract_emails(raw: str) -> list[str]:
 SUBMIT_TIMEOUT_SEC    = 60.0
 POLL_TIMEOUT_SEC      = 30.0
 CSV_DOWNLOAD_TIMEOUT  = 300.0
+_TRANSIENT_5XX        = frozenset({502, 503, 504})
+_TRANSIENT_BACKOFF    = (2.0, 5.0, 10.0)   # seconds; 3 retries before giving up
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -505,31 +516,75 @@ def select_revalidation_leads(db, limit: int, min_age_days: int = 90) -> list[di
 async def poll_batch(api_key: str, batch_id: str) -> dict:
     """GET /api/v1/batches/{id} — returns the raw Truelist response dict.
 
-    Retries on HTTP 429 (Truelist rate limit) with exponential backoff so that
-    polling several in-flight batches in one cycle does not trip the limit and
-    fail the whole run. Non-429 errors raise immediately.
+    Retry policy:
+    - HTTP 429 (rate limit): up to 3 retries, backoff 1.5s / 3s / 6s.
+    - HTTP 502/503/504 or connection/timeout errors (transient upstream blip):
+      up to 3 retries, backoff 2s / 5s / 10s; raises TruelistTransientError
+      after exhausting retries so the poll loop can skip this batch without
+      failing the whole run.
+    - HTTP 4xx (non-429): raises HTTPException immediately (real error, no retry).
+    - Other 5xx (e.g. 500): raises HTTPException immediately.
     """
-    last_text = ""
-    for attempt in range(4):  # backoff between tries: 1.5s, 3s, 6s
-        async with httpx.AsyncClient(timeout=POLL_TIMEOUT_SEC) as client:
-            r = await client.get(
-                f"{TRUELIST_BATCHES_URL}/{batch_id}",
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
+    transient_count = 0
+    rate_limit_count = 0
+
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=POLL_TIMEOUT_SEC) as client:
+                r = await client.get(
+                    f"{TRUELIST_BATCHES_URL}/{batch_id}",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            transient_count += 1
+            if transient_count <= 3:
+                delay = _TRANSIENT_BACKOFF[transient_count - 1]
+                logger.warning(
+                    f"[poll_batch] {batch_id}: network error ({exc.__class__.__name__}), "
+                    f"transient retry {transient_count}/3 in {delay}s"
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise TruelistTransientError(
+                f"TrueList poll for {batch_id} failed after {transient_count} attempts: {exc}"
+            ) from exc
+
         if r.status_code == 200:
             return r.json()
-        if r.status_code == 429 and attempt < 3:
-            await asyncio.sleep(1.5 * (2 ** attempt))
-            last_text = r.text[:300]
-            continue
+
+        if r.status_code == 429:
+            rate_limit_count += 1
+            if rate_limit_count <= 3:
+                delay = 1.5 * (2 ** (rate_limit_count - 1))
+                logger.warning(
+                    f"[poll_batch] {batch_id}: HTTP 429, rate-limit retry {rate_limit_count}/3 in {delay}s"
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise HTTPException(
+                status_code=502,
+                detail=f"Truelist poll failed for {batch_id}: HTTP 429 after retries: {r.text[:300]}",
+            )
+
+        if r.status_code in _TRANSIENT_5XX:
+            transient_count += 1
+            if transient_count <= 3:
+                delay = _TRANSIENT_BACKOFF[transient_count - 1]
+                logger.warning(
+                    f"[poll_batch] {batch_id}: HTTP {r.status_code} (transient upstream), "
+                    f"transient retry {transient_count}/3 in {delay}s"
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise TruelistTransientError(
+                f"TrueList poll for {batch_id} returned HTTP {r.status_code} after "
+                f"{transient_count} attempts: {r.text[:200]}"
+            )
+
         raise HTTPException(
             status_code=502,
             detail=f"Truelist poll failed for {batch_id}: HTTP {r.status_code}: {r.text[:300]}",
         )
-    raise HTTPException(
-        status_code=502,
-        detail=f"Truelist poll failed for {batch_id}: HTTP 429 after retries: {last_text}",
-    )
 
 
 def _parse_annotated_csv(csv_text: str) -> dict[str, dict]:

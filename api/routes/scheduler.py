@@ -40,6 +40,7 @@ from .segments_engine import _classify_lead
 from .enrichment import _extract_schema_types
 from .webhooks import fire_event
 from .enrichment_email_clean import (
+    TruelistTransientError as ec_TruelistTransientError,
     select_uncleaned_leads as ec_select_uncleaned_leads,
     select_revalidation_leads as ec_select_revalidation_leads,
     submit_batch as ec_submit_batch,
@@ -1272,6 +1273,7 @@ async def job_email_clean_poll_batches() -> dict:
     still_running = 0
     ingest_summaries: list[dict] = []
     errors: list[dict] = []
+    transient_skips: list[str] = []
 
     for r in rows:
         batch_id = r["id"]
@@ -1300,6 +1302,12 @@ async def job_email_clean_poll_batches() -> dict:
                 ingested += 1
             else:
                 still_running += 1
+        except ec_TruelistTransientError as e:
+            logger.warning(
+                f"[{job_name}] {batch_id}: transient upstream error — batch status unchanged, "
+                f"will retry on next poll cycle: {e}"
+            )
+            transient_skips.append(batch_id)
         except Exception as e:
             logger.error(f"[{job_name}] {batch_id} poll/ingest error: {e}")
             errors.append({"batch_id": batch_id, "error": str(e)[:300]})
@@ -1307,21 +1315,22 @@ async def job_email_clean_poll_batches() -> dict:
     duration = time.monotonic() - t_start
     notes = (
         f"in_flight={len(rows)}, ingested={ingested}, still_running={still_running}, "
-        f"errors={len(errors)}"
+        f"transient_skips={len(transient_skips)}, errors={len(errors)}"
     )
     status = "success" if not errors else ("partial" if ingested > 0 else "failed")
     await _log_job(job_name, leads_processed=sum(s.get("leads_processed", 0) for s in ingest_summaries),
                    duration_seconds=duration, status=status, notes=notes)
 
     return {
-        "job":           job_name,
-        "in_flight":     len(rows),
-        "ingested":      ingested,
-        "still_running": still_running,
-        "errors":        errors,
-        "summaries":     ingest_summaries,
-        "duration_s":    round(duration, 2),
-        "status":        status,
+        "job":             job_name,
+        "in_flight":       len(rows),
+        "ingested":        ingested,
+        "still_running":   still_running,
+        "transient_skips": transient_skips,
+        "errors":          errors,
+        "summaries":       ingest_summaries,
+        "duration_s":      round(duration, 2),
+        "status":          status,
     }
 
 
