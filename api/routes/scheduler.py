@@ -1255,6 +1255,12 @@ async def job_email_clean_poll_batches() -> dict:
             db.table("truelist_batches")
             .select("id, status, submitted_at, email_count")
             .in_("status", ["pending", "processing", "completed"])
+            # Only poll batches submitted by the leads pipeline.
+            # Contacts-pipeline batches (clean_national_realtors, etc.) use psycopg2
+            # directly and have their own drain/ingest path — picking them up here
+            # would call ec_ingest_batch_result on the leads table (finds 0 rows) and
+            # silently mark them ingested, blocking the contacts ingest.
+            .eq("submitted_by", "nightly_cron")
             .order("submitted_at", desc=False)
             .execute()
             .data or []

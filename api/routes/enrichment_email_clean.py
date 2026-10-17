@@ -26,10 +26,14 @@ Truelist API:
   Auth:   Authorization: Bearer <TRUELIST_API_KEY>
 
 Mapping from Truelist `Email State` → KJLE columns:
-  ok       → email_status='valid',   email_valid=True
-  invalid  → email_status='invalid', email_valid=False
-  risky    → email_status='unknown', email_valid=None
-  unknown  → email_status='unknown', email_valid=None
+  ok       → email_status='valid',         email_valid=True,  email_trust='valid'
+  invalid  → email_status='invalid',       email_valid=False, email_trust='invalid'
+  risky    → email_status='unknown',       email_valid=False, email_trust='catch_all'
+  unknown  → email_status='unconfirmable', email_valid=False, email_trust='unconfirmable'
+
+  email_status uses the legacy 4-value vocab (valid/invalid/unknown/unconfirmable) so
+  existing filters on that column keep working. email_trust is set directly from TrueList
+  at ingest time, bypassing the Tier-1 heuristic classifier for these leads.
 
 ⚠️ CAMPAIGN-ELIGIBLE FILTER — POSITIVE WHITELIST ONLY (per Session 2B plan)
   When selecting leads for outbound email campaigns, callers MUST use:
@@ -138,13 +142,13 @@ def parse_truelist_state(raw_state: Optional[str]) -> tuple[str, Optional[bool]]
     semantics, different naming.
 
     Returns:
-      ("valid",   True)   when Truelist says ok
-      ("invalid", False)  when Truelist says invalid
-      ("unknown", None)   when Truelist says risky or unknown
-      ("unknown", None)   when Truelist returns anything else (defensive default)
+      ("valid",         True)   when Truelist says ok
+      ("invalid",       False)  when Truelist says invalid
+      ("unknown",       False)  when Truelist says risky (accept_all / catch-all domain)
+      ("unconfirmable", False)  when Truelist says unknown or anything else
     """
     if not raw_state:
-        return ("unknown", None)
+        return ("unconfirmable", False)
     s = str(raw_state).strip().lower()
     # Strip `email_` prefix if present (verify_inline inconsistency)
     if s.startswith("email_"):
@@ -153,9 +157,31 @@ def parse_truelist_state(raw_state: Optional[str]) -> tuple[str, Optional[bool]]
         return ("valid", True)
     if s == "invalid":
         return ("invalid", False)
-    if s in ("risky", "unknown"):
-        return ("unknown", None)
-    return ("unknown", None)
+    if s == "risky":
+        return ("unknown", False)   # accept_all / catch-all domain
+    return ("unconfirmable", False) # unknown or any unrecognised state
+
+
+def _truelist_trust(raw_state: Optional[str]) -> str:
+    """
+    Map a Truelist `Email State` to the email_trust vocabulary.
+    Differentiates 'risky' (catch_all domains) from 'unknown' (genuinely unconfirmable)
+    — a distinction parse_truelist_state cannot express via email_status alone.
+
+    Best-verdict precedence: valid(0) > unconfirmable(1) > catch_all(2) > invalid(3)
+    """
+    if not raw_state:
+        return "unconfirmable"
+    s = str(raw_state).strip().lower()
+    if s.startswith("email_"):
+        s = s[len("email_"):]
+    if s == "ok":
+        return "valid"
+    if s == "invalid":
+        return "invalid"
+    if s == "risky":
+        return "catch_all"      # accept_all / catch-all domain
+    return "unconfirmable"      # unknown or anything else
 
 
 def is_campaign_eligible(email_status: Optional[str]) -> bool:
@@ -731,25 +757,29 @@ async def ingest_batch_result(
     print(f"[HB] ingest_batch_result {batch_id}: {len(all_leads)} leads to process", flush=True)
 
     # For each lead, extract clean addresses and resolve the best verdict from the CSV map.
-    # Best-verdict precedence: valid > unknown > invalid (any valid address → lead is valid).
-    _VERDICT_ORDER = {"valid": 0, "unknown": 1, "invalid": 2}
-    verdict_to_leads: dict[tuple, list[str]] = {}
+    # Best-verdict precedence (by email_trust): valid(0) > unconfirmable(1) > catch_all(2) > invalid(3)
+    # Using _truelist_trust() so risky (catch_all domains) ranks below genuinely unconfirmable.
+    _VERDICT_ORDER = {"valid": 0, "unconfirmable": 1, "catch_all": 2, "invalid": 3}
+    verdict_to_leads: dict[tuple, list[str]] = {}   # key: (email_status, email_valid, email_trust)
     no_match = 0
 
     for lead in all_leads:
         clean_emails = _extract_emails(lead.get("email") or "")
-        best: Optional[tuple[str, Optional[bool]]] = None
+        best_sv: Optional[tuple[str, Optional[bool]]] = None
+        best_trust: Optional[str] = None
         for em in clean_emails:
             entry = email_map.get(em)
             if entry is None:
                 continue
             sv = parse_truelist_state(entry["state"])
-            if best is None or _VERDICT_ORDER.get(sv[0], 99) < _VERDICT_ORDER.get(best[0], 99):
-                best = sv
-        if best is None:
+            trust = _truelist_trust(entry["state"])
+            if best_trust is None or _VERDICT_ORDER.get(trust, 99) < _VERDICT_ORDER.get(best_trust, 99):
+                best_sv = sv
+                best_trust = trust
+        if best_trust is None:
             no_match += 1
             continue
-        verdict_to_leads.setdefault(best, []).append(lead["id"])
+        verdict_to_leads.setdefault((best_sv[0], best_sv[1], best_trust), []).append(lead["id"])
 
     print(
         f"[HB] ingest_batch_result {batch_id}: "
@@ -758,28 +788,29 @@ async def ingest_batch_result(
         flush=True,
     )
 
-    counts: dict[str, int] = {"valid": 0, "invalid": 0, "unknown": 0, "error": 0}
+    counts: dict[str, int] = {"valid": 0, "catch_all": 0, "unconfirmable": 0, "invalid": 0, "error": 0}
     total_processed = 0
     now_iso = _now_iso()
 
-    for (status, valid), lead_ids in verdict_to_leads.items():
+    for (status, valid, trust), lead_ids in verdict_to_leads.items():
         for i in range(0, len(lead_ids), STAMP_CHUNK_SIZE):
             chunk = lead_ids[i:i + STAMP_CHUNK_SIZE]
             try:
                 db.table("leads").update({
                     "email_status":     status,
                     "email_valid":      valid,
+                    "email_trust":      trust,   # set at ingest time, bypass Tier-1 heuristic
                     "email_cleaned_at": now_iso,
                 }).in_("id", chunk).execute()
                 total_processed += len(chunk)
-                counts[status] = counts.get(status, 0) + len(chunk)
+                counts[trust] = counts.get(trust, 0) + len(chunk)
                 print(
                     f"[HB] ingest_batch_result {batch_id}: "
-                    f"chunk offset={i} status={status} updated={len(chunk)}",
+                    f"chunk offset={i} trust={trust} updated={len(chunk)}",
                     flush=True,
                 )
             except Exception as e:
-                logger.error(f"[ingest_batch_result] verdict update chunk failed ({status}): {e}")
+                logger.error(f"[ingest_batch_result] verdict update chunk failed (trust={trust}): {e}")
                 counts["error"] = counts.get("error", 0) + len(chunk)
 
     print(
@@ -788,13 +819,31 @@ async def ingest_batch_result(
         flush=True,
     )
 
+    # Fail-loud guard: TrueList reported valid emails but we wrote 0 valid leads.
+    # This catches the contacts/leads table mismatch (e.g. clean_national_realtors batches
+    # whose contacts live in the contacts table, not leads) and prevents silently marking
+    # them ingested with 0 processed — which would block the correct contacts ingest path.
+    ok_count = int(batch.get("ok_count") or 0)
+    if batch.get("annotated_csv_url") and ok_count > 0 and counts.get("valid", 0) == 0:
+        msg = (
+            f"[ingest_batch_result] {batch_id}: annotated_csv_url present, "
+            f"TrueList ok_count={ok_count}, but writeback produced 0 valid leads "
+            f"(total_processed={total_processed}). Refusing to mark ingested — "
+            f"likely a table mismatch (contacts vs leads pipeline). "
+            f"Use the correct per-pipeline ingest path for recovery."
+        )
+        logger.error(msg)
+        raise HTTPException(status_code=500, detail=msg)
+
     # Finalize batch row
     db.table("truelist_batches").update({
         "status":      "ingested",
         "ingested_at": _now_iso(),
         "notes":       (batch.get("notes") or "") + (
-            f" | ingest(batch-match v2): processed={total_processed}, valid={counts['valid']}, "
-            f"invalid={counts['invalid']}, unknown={counts['unknown']}, "
+            f" | ingest(batch-match v3): processed={total_processed}, valid={counts['valid']}, "
+            f"catch_all={counts.get('catch_all', 0)}, "
+            f"unconfirmable={counts.get('unconfirmable', 0)}, "
+            f"invalid={counts.get('invalid', 0)}, "
             f"errors={counts['error']}, no_match={no_match}"
         ),
     }).eq("id", batch_id).execute()
@@ -803,7 +852,7 @@ async def ingest_batch_result(
         "batch_id":        batch_id,
         "status":          "ingested",
         "leads_processed": total_processed,
-        "counts":          counts,
+        "counts":          counts,   # keyed by email_trust: valid/catch_all/unconfirmable/invalid/error
         "no_match":        no_match,
     }
 
@@ -1262,11 +1311,13 @@ async def single_email_clean(lead_id: str, db=Depends(get_db)):
 
     raw_state = email_obj.get("email_state")
     status, valid = parse_truelist_state(raw_state)
+    trust = _truelist_trust(raw_state)
     sub_state = email_obj.get("email_sub_state")
 
     db.table("leads").update({
         "email_status":     status,
         "email_valid":      valid,
+        "email_trust":      trust,
         "email_sub_state":  sub_state,
         "email_cleaned_at": _now_iso(),
     }).eq("id", lead_id).execute()
@@ -1276,6 +1327,7 @@ async def single_email_clean(lead_id: str, db=Depends(get_db)):
         "email":             email,
         "email_status":      status,
         "email_valid":       valid,
+        "email_trust":       trust,
         "email_state_raw":   raw_state,
         "email_sub_state":   sub_state,
         "did_you_mean":      email_obj.get("did_you_mean"),
