@@ -71,6 +71,7 @@ from .routes import reverify
 from .routes import campaign_prep
 from .routes import contacts
 from .routes import system_health
+from .routes import health_watchdog
 from .routes.scheduler import setup_scheduler
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -203,6 +204,7 @@ app.include_router(reverify.router,               prefix=PREFIX,                
 app.include_router(campaign_prep.router,          prefix=PREFIX,                  tags=["Campaign Prep"])
 app.include_router(contacts.router,               prefix=PREFIX,                  tags=["Contacts"])
 app.include_router(system_health.router,          prefix=PREFIX,                  tags=["System Health"])
+app.include_router(health_watchdog.router,        prefix=PREFIX,                  tags=["Pipeline Watchdog"])
 
 
 # ── Empire-wide notification endpoints (top-level, x-brain-key auth) ──────────

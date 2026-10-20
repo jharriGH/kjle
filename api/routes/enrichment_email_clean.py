@@ -9,10 +9,14 @@ and capped at 2,500 emails/night. V2 submits 25K-email batches to
 Truelist and ingests the annotated CSV per batch on completion. ~19
 batches clears the 469K backlog.
 
-Truelist API (confirmed via smoke test 2026-05-10):
+Truelist API:
   Submit: POST https://api.truelist.io/api/v1/batches
-          body: {"data": [["email1"], ["email2"], ...]}
+          body: multipart/form-data — field "file" is a CSV with header "email",
+                one address per row. Optional "name" field in the same form.
           response: {"id": <uuid>, "batch_state": "pending", "email_count": N, ...}
+  NOTE (2026-10-11): TrueList changed from accepting JSON {"data":[...]} to
+  requiring a CSV file upload. The 422 "No email column found. Please check
+  your CSV!" is returned when the old JSON body is sent.
   Poll:   GET  https://api.truelist.io/api/v1/batches/{uuid}
           response: includes batch_state and (on completion) 4 CSV URLs
           states observed: pending → processing → completed
@@ -22,10 +26,14 @@ Truelist API (confirmed via smoke test 2026-05-10):
   Auth:   Authorization: Bearer <TRUELIST_API_KEY>
 
 Mapping from Truelist `Email State` → KJLE columns:
-  ok       → email_status='valid',   email_valid=True
-  invalid  → email_status='invalid', email_valid=False
-  risky    → email_status='unknown', email_valid=None
-  unknown  → email_status='unknown', email_valid=None
+  ok       → email_status='valid',         email_valid=True,  email_trust='valid'
+  invalid  → email_status='invalid',       email_valid=False, email_trust='invalid'
+  risky    → email_status='unknown',       email_valid=False, email_trust='catch_all'
+  unknown  → email_status='unconfirmable', email_valid=False, email_trust='unconfirmable'
+
+  email_status uses the legacy 4-value vocab (valid/invalid/unknown/unconfirmable) so
+  existing filters on that column keep working. email_trust is set directly from TrueList
+  at ingest time, bypassing the Tier-1 heuristic classifier for these leads.
 
 ⚠️ CAMPAIGN-ELIGIBLE FILTER — POSITIVE WHITELIST ONLY (per Session 2B plan)
   When selecting leads for outbound email campaigns, callers MUST use:
@@ -52,11 +60,11 @@ import asyncio
 import io
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
-import psycopg2
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
@@ -67,6 +75,15 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+
+class TruelistTransientError(Exception):
+    """Raised when TrueList returns a transient 5xx or network error after all retries.
+
+    Callers should log a WARNING, leave the batch status unchanged, and continue
+    to the next batch — the cron will retry on the next 30-min cycle.
+    """
+
+
 TRUELIST_BATCHES_URL  = "https://api.truelist.io/api/v1/batches"
 TRUELIST_VERIFY_URL   = "https://api.truelist.io/api/v1/verify_inline"  # retained for single endpoint
 
@@ -75,9 +92,39 @@ EMAIL_INGEST_CHUNK    = 300   # email-list chunks for lower(email)=ANY() UPDATE
 STAMP_CHUNK_SIZE      = 100   # lead-id chunks for UPDATE .in_() calls
                               # 100 UUIDs × 37 chars = ~3.7KB URL, safe under Supabase's
                               # 8KB PATCH URL limit (500 × 37 = 18KB → hit 414 silently)
+
+# Matches trailing provider annotations like " (accept_all)" or " (risky)" in multi-email fields.
+# These annotations are appended by LeadRocks/LeadSays ingest and cause TrueList 422 when included
+# in the CSV (the field is not a valid email address with them present).
+_ANNOTATION_RE = re.compile(r'\s*\([^)]*\)\s*$')
+
+
+def _extract_emails(raw: str) -> list[str]:
+    """
+    Extract individual valid-looking email addresses from an email field that may contain:
+      - A single clean address:          "foo@bar.com"
+      - An annotated address:            "foo@bar.com (accept_all)"
+      - Multiple annotated addresses:    "a@b.com (accept_all) , c@d.com (accept_all)"
+      - Multiple addresses, no annot:    "a@b.com, c@d.com"
+
+    Splits on commas, strips surrounding whitespace, removes trailing "(…)" annotations,
+    then validates each candidate (has @, no spaces, non-empty, ≤254 chars).
+
+    Returns a list of lowercased clean email addresses. Empty list if none are found.
+    """
+    if not raw:
+        return []
+    results: list[str] = []
+    for part in re.split(r'\s*,\s*', raw.strip()):
+        clean = _ANNOTATION_RE.sub('', part).strip()
+        if clean and '@' in clean and ' ' not in clean and len(clean) <= 254:
+            results.append(clean.lower())
+    return results
 SUBMIT_TIMEOUT_SEC    = 60.0
 POLL_TIMEOUT_SEC      = 30.0
 CSV_DOWNLOAD_TIMEOUT  = 300.0
+_TRANSIENT_5XX        = frozenset({502, 503, 504})
+_TRANSIENT_BACKOFF    = (2.0, 5.0, 10.0)   # seconds; 3 retries before giving up
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -95,13 +142,13 @@ def parse_truelist_state(raw_state: Optional[str]) -> tuple[str, Optional[bool]]
     semantics, different naming.
 
     Returns:
-      ("valid",   True)   when Truelist says ok
-      ("invalid", False)  when Truelist says invalid
-      ("unknown", None)   when Truelist says risky or unknown
-      ("unknown", None)   when Truelist returns anything else (defensive default)
+      ("valid",         True)   when Truelist says ok
+      ("invalid",       False)  when Truelist says invalid
+      ("unknown",       False)  when Truelist says risky (accept_all / catch-all domain)
+      ("unconfirmable", False)  when Truelist says unknown or anything else
     """
     if not raw_state:
-        return ("unknown", None)
+        return ("unconfirmable", False)
     s = str(raw_state).strip().lower()
     # Strip `email_` prefix if present (verify_inline inconsistency)
     if s.startswith("email_"):
@@ -110,9 +157,31 @@ def parse_truelist_state(raw_state: Optional[str]) -> tuple[str, Optional[bool]]
         return ("valid", True)
     if s == "invalid":
         return ("invalid", False)
-    if s in ("risky", "unknown"):
-        return ("unknown", None)
-    return ("unknown", None)
+    if s == "risky":
+        return ("unknown", False)   # accept_all / catch-all domain
+    return ("unconfirmable", False) # unknown or any unrecognised state
+
+
+def _truelist_trust(raw_state: Optional[str]) -> str:
+    """
+    Map a Truelist `Email State` to the email_trust vocabulary.
+    Differentiates 'risky' (catch_all domains) from 'unknown' (genuinely unconfirmable)
+    — a distinction parse_truelist_state cannot express via email_status alone.
+
+    Best-verdict precedence: valid(0) > unconfirmable(1) > catch_all(2) > invalid(3)
+    """
+    if not raw_state:
+        return "unconfirmable"
+    s = str(raw_state).strip().lower()
+    if s.startswith("email_"):
+        s = s[len("email_"):]
+    if s == "ok":
+        return "valid"
+    if s == "invalid":
+        return "invalid"
+    if s == "risky":
+        return "catch_all"      # accept_all / catch-all domain
+    return "unconfirmable"      # unknown or anything else
 
 
 def is_campaign_eligible(email_status: Optional[str]) -> bool:
@@ -175,19 +244,57 @@ async def submit_batch(
     if not leads:
         return {"submitted": 0, "skipped": True, "reason": "empty_batch"}
 
-    # Deduplicate emails within this batch — Truelist will dedupe anyway, but
-    # we want a stable email→[lead_id,…] map for ingestion.
-    seen: set[str] = set()
+    # Extract individual email addresses from each lead's email field.
+    # The email column may contain multiple addresses and/or provider annotations
+    # (e.g. "foo@bar.com (accept_all) , baz@qux.com (accept_all)") from the
+    # LeadRocks/LeadSays ingest. TrueList rejects a CSV that contains these raw
+    # strings — it expects one plain, valid email address per row.
+    # _extract_emails() splits on commas, strips "(…)" annotations, and validates
+    # each candidate. The lead is stamped by ID (not by email) so multi-email
+    # leads are still correctly associated with the batch for later ingestion.
+    seen_emails: set[str] = set()
     payload_data: list[list[str]] = []
+    stampable_ids: list[str] = []
+
     for lead in leads:
-        em = (lead.get("email") or "").strip()
-        if not em or em.lower() in seen:
+        lead_id = lead.get("id")
+        raw_em = (lead.get("email") or "").strip()
+        extracted = _extract_emails(raw_em)
+        if not extracted:
+            logger.warning(
+                f"[submit_batch] lead {lead_id}: no extractable email from "
+                f"{raw_em!r:.120s} — skipping"
+            )
             continue
-        seen.add(em.lower())
-        payload_data.append([em])
+        for em in extracted:
+            if em not in seen_emails:
+                seen_emails.add(em)
+                payload_data.append([em])
+        if lead_id:
+            stampable_ids.append(lead_id)
 
     if not payload_data:
         return {"submitted": 0, "skipped": True, "reason": "no_usable_emails"}
+
+    # Build CSV with "email" header — TrueList /api/v1/batches requires a CSV
+    # file upload (multipart/form-data), not a JSON body. A single "email" column
+    # is the unambiguous safe form per TrueList's current API.
+    csv_buf = io.StringIO()
+    csv_writer = csv.writer(csv_buf)
+    csv_writer.writerow(["email"])
+    for row in payload_data:
+        csv_writer.writerow(row)
+    csv_bytes = csv_buf.getvalue().encode("utf-8")
+
+    # Guard: the CSV must have at least one data row and the email header.
+    # Unreachable under normal flow (payload_data check above), but prevents
+    # sending a headerless or empty CSV on any future regression.
+    if len(payload_data) == 0 or not csv_bytes.strip().startswith(b"email"):
+        raise ValueError(
+            f"submit_batch: CSV sanity check failed — "
+            f"data_rows={len(payload_data)}, csv_start={csv_bytes[:40]!r}. "
+            "Not submitting to Truelist."
+        )
 
     # Unique name per submission so Truelist doesn't hash-dedup identical email lists
     # across nightly runs (same 9K unknown leads → same content hash → 409 without this).
@@ -196,8 +303,9 @@ async def submit_batch(
     async with httpx.AsyncClient(timeout=SUBMIT_TIMEOUT_SEC) as client:
         r = await client.post(
             TRUELIST_BATCHES_URL,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"data": payload_data, "name": batch_name},
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={"file": ("emails.csv", csv_bytes, "text/csv")},
+            data={"name": batch_name},
         )
 
     adopted_existing = False
@@ -267,10 +375,10 @@ async def submit_batch(
     # If stamping fails silently, ingest returns processed=0 and the leads get re-submitted
     # the next night to a different batch. Use STAMP_CHUNK_SIZE=100 to stay under Supabase's
     # 8KB PATCH URL limit (500 UUIDs × 37 chars = 18KB → silent 414, was the root-cause bug).
-    ids = [l["id"] for l in leads]
+    # stampable_ids contains only lead IDs that had at least one extractable email address.
     updated = 0
-    for i in range(0, len(ids), STAMP_CHUNK_SIZE):
-        chunk = ids[i:i + STAMP_CHUNK_SIZE]
+    for i in range(0, len(stampable_ids), STAMP_CHUNK_SIZE):
+        chunk = stampable_ids[i:i + STAMP_CHUNK_SIZE]
         try:
             db.table("leads").update({
                 "email_status":            "pending_batch",
@@ -287,10 +395,10 @@ async def submit_batch(
                 detail=f"Failed to stamp leads for batch {batch_id} at offset {i}: {e}",
             )
 
-    if updated != len(ids):
+    if updated != len(stampable_ids):
         logger.warning(
             f"[truelist.submit_batch] stamp count mismatch for {batch_id}: "
-            f"expected={len(ids)}, stamped={updated}"
+            f"expected={len(stampable_ids)}, stamped={updated}"
         )
 
     return {
@@ -434,31 +542,75 @@ def select_revalidation_leads(db, limit: int, min_age_days: int = 90) -> list[di
 async def poll_batch(api_key: str, batch_id: str) -> dict:
     """GET /api/v1/batches/{id} — returns the raw Truelist response dict.
 
-    Retries on HTTP 429 (Truelist rate limit) with exponential backoff so that
-    polling several in-flight batches in one cycle does not trip the limit and
-    fail the whole run. Non-429 errors raise immediately.
+    Retry policy:
+    - HTTP 429 (rate limit): up to 3 retries, backoff 1.5s / 3s / 6s.
+    - HTTP 502/503/504 or connection/timeout errors (transient upstream blip):
+      up to 3 retries, backoff 2s / 5s / 10s; raises TruelistTransientError
+      after exhausting retries so the poll loop can skip this batch without
+      failing the whole run.
+    - HTTP 4xx (non-429): raises HTTPException immediately (real error, no retry).
+    - Other 5xx (e.g. 500): raises HTTPException immediately.
     """
-    last_text = ""
-    for attempt in range(4):  # backoff between tries: 1.5s, 3s, 6s
-        async with httpx.AsyncClient(timeout=POLL_TIMEOUT_SEC) as client:
-            r = await client.get(
-                f"{TRUELIST_BATCHES_URL}/{batch_id}",
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
+    transient_count = 0
+    rate_limit_count = 0
+
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=POLL_TIMEOUT_SEC) as client:
+                r = await client.get(
+                    f"{TRUELIST_BATCHES_URL}/{batch_id}",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            transient_count += 1
+            if transient_count <= 3:
+                delay = _TRANSIENT_BACKOFF[transient_count - 1]
+                logger.warning(
+                    f"[poll_batch] {batch_id}: network error ({exc.__class__.__name__}), "
+                    f"transient retry {transient_count}/3 in {delay}s"
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise TruelistTransientError(
+                f"TrueList poll for {batch_id} failed after {transient_count} attempts: {exc}"
+            ) from exc
+
         if r.status_code == 200:
             return r.json()
-        if r.status_code == 429 and attempt < 3:
-            await asyncio.sleep(1.5 * (2 ** attempt))
-            last_text = r.text[:300]
-            continue
+
+        if r.status_code == 429:
+            rate_limit_count += 1
+            if rate_limit_count <= 3:
+                delay = 1.5 * (2 ** (rate_limit_count - 1))
+                logger.warning(
+                    f"[poll_batch] {batch_id}: HTTP 429, rate-limit retry {rate_limit_count}/3 in {delay}s"
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise HTTPException(
+                status_code=502,
+                detail=f"Truelist poll failed for {batch_id}: HTTP 429 after retries: {r.text[:300]}",
+            )
+
+        if r.status_code in _TRANSIENT_5XX:
+            transient_count += 1
+            if transient_count <= 3:
+                delay = _TRANSIENT_BACKOFF[transient_count - 1]
+                logger.warning(
+                    f"[poll_batch] {batch_id}: HTTP {r.status_code} (transient upstream), "
+                    f"transient retry {transient_count}/3 in {delay}s"
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise TruelistTransientError(
+                f"TrueList poll for {batch_id} returned HTTP {r.status_code} after "
+                f"{transient_count} attempts: {r.text[:200]}"
+            )
+
         raise HTTPException(
             status_code=502,
             detail=f"Truelist poll failed for {batch_id}: HTTP {r.status_code}: {r.text[:300]}",
         )
-    raise HTTPException(
-        status_code=502,
-        detail=f"Truelist poll failed for {batch_id}: HTTP 429 after retries: {last_text}",
-    )
 
 
 def _parse_annotated_csv(csv_text: str) -> dict[str, dict]:
@@ -575,64 +727,91 @@ async def ingest_batch_result(
         raise HTTPException(status_code=502, detail=f"Annotated CSV for {batch_id} parsed to 0 rows")
     print(f"[HB] ingest_batch_result {batch_id}: CSV has {len(email_map)} emails", flush=True)
 
-    # Group CSV entries by verdict so each UPDATE targets one status value
-    verdict_groups: dict[tuple, list] = {}
-    sub_state_seen: dict[str, int] = {}
-    for em_lower, mapped in email_map.items():
-        status, valid = parse_truelist_state(mapped["state"])
-        sub = mapped.get("sub_state", "") or ""
-        sub_state_seen[sub] = sub_state_seen.get(sub, 0) + 1
-        verdict_groups.setdefault((status, valid, sub), []).append(em_lower)
+    # Fetch all leads associated with this batch that haven't been cleaned yet.
+    # Match by email_truelist_batch_id (stamped by lead ID during submit) rather
+    # than by raw email equality. The old RPC path did WHERE lower(email)=ANY(emails)
+    # which returned 0 rows because leads.email contains raw annotated strings like
+    # "foo@bar.com (accept_all)" that never match the clean "foo@bar.com" in the CSV.
+    PAGE = 1000
+    all_leads: list[dict] = []
+    offset = 0
+    while True:
+        try:
+            rows = (
+                db.table("leads")
+                .select("id, email")
+                .eq("email_truelist_batch_id", batch_id)
+                .is_("email_cleaned_at", "null")
+                .range(offset, offset + PAGE - 1)
+                .execute()
+                .data or []
+            )
+        except Exception as e:
+            logger.error(f"[ingest_batch_result] lead fetch failed at offset {offset}: {e}")
+            rows = []
+        all_leads.extend(rows)
+        if len(rows) < PAGE:
+            break
+        offset += PAGE
 
-    counts: dict[str, int] = {"valid": 0, "invalid": 0, "unknown": 0, "error": 0}
+    print(f"[HB] ingest_batch_result {batch_id}: {len(all_leads)} leads to process", flush=True)
+
+    # For each lead, extract clean addresses and resolve the best verdict from the CSV map.
+    # Best-verdict precedence (by email_trust): valid(0) > unconfirmable(1) > catch_all(2) > invalid(3)
+    # Using _truelist_trust() so risky (catch_all domains) ranks below genuinely unconfirmable.
+    _VERDICT_ORDER = {"valid": 0, "unconfirmable": 1, "catch_all": 2, "invalid": 3}
+    verdict_to_leads: dict[tuple, list[str]] = {}   # key: (email_status, email_valid, email_trust)
+    no_match = 0
+
+    for lead in all_leads:
+        clean_emails = _extract_emails(lead.get("email") or "")
+        best_sv: Optional[tuple[str, Optional[bool]]] = None
+        best_trust: Optional[str] = None
+        for em in clean_emails:
+            entry = email_map.get(em)
+            if entry is None:
+                continue
+            sv = parse_truelist_state(entry["state"])
+            trust = _truelist_trust(entry["state"])
+            if best_trust is None or _VERDICT_ORDER.get(trust, 99) < _VERDICT_ORDER.get(best_trust, 99):
+                best_sv = sv
+                best_trust = trust
+        if best_trust is None:
+            no_match += 1
+            continue
+        verdict_to_leads.setdefault((best_sv[0], best_sv[1], best_trust), []).append(lead["id"])
+
+    print(
+        f"[HB] ingest_batch_result {batch_id}: "
+        f"matched={len(all_leads) - no_match} no_match={no_match} "
+        f"verdict_groups={len(verdict_to_leads)}",
+        flush=True,
+    )
+
+    counts: dict[str, int] = {"valid": 0, "catch_all": 0, "unconfirmable": 0, "invalid": 0, "error": 0}
     total_processed = 0
     now_iso = _now_iso()
 
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        raise HTTPException(
-            status_code=500,
-            detail="DATABASE_URL not set — cannot perform email-match ingest",
-        )
-
-    # 60s per chunk — normal 500-email batches fit in <5s; allow headroom for
-    # large adopted batches. A lower(email) functional index on leads would help
-    # if timeouts recur: CREATE INDEX idx_leads_lower_email ON leads (lower(email)).
-    conn = psycopg2.connect(db_url, connect_timeout=15, options="-c statement_timeout=60000")
-    conn.autocommit = False
-    try:
-        for (status, valid, sub), emails_lower in verdict_groups.items():
-            for i in range(0, len(emails_lower), EMAIL_INGEST_CHUNK):
-                chunk = emails_lower[i:i + EMAIL_INGEST_CHUNK]
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            UPDATE leads
-                               SET email_status    = %s,
-                                   email_valid     = %s,
-                                   email_sub_state = NULLIF(%s, ''),
-                                   email_cleaned_at = %s
-                             WHERE lower(email) = ANY(%s::text[])
-                               AND email_cleaned_at IS NULL
-                            """,
-                            (status, valid, sub, now_iso, chunk),
-                        )
-                        n = cur.rowcount
-                    conn.commit()
-                    total_processed += n
-                    counts[status] = counts.get(status, 0) + n
-                    print(
-                        f"[HB] ingest_batch_result {batch_id}: "
-                        f"chunk offset={i} status={status} matched={n}",
-                        flush=True,
-                    )
-                except Exception as e:
-                    conn.rollback()
-                    logger.error(f"[ingest_batch_result] email-match UPDATE failed ({status}): {e}")
-                    counts["error"] = counts.get("error", 0) + len(chunk)
-    finally:
-        conn.close()
+    for (status, valid, trust), lead_ids in verdict_to_leads.items():
+        for i in range(0, len(lead_ids), STAMP_CHUNK_SIZE):
+            chunk = lead_ids[i:i + STAMP_CHUNK_SIZE]
+            try:
+                db.table("leads").update({
+                    "email_status":     status,
+                    "email_valid":      valid,
+                    "email_trust":      trust,   # set at ingest time, bypass Tier-1 heuristic
+                    "email_cleaned_at": now_iso,
+                }).in_("id", chunk).execute()
+                total_processed += len(chunk)
+                counts[trust] = counts.get(trust, 0) + len(chunk)
+                print(
+                    f"[HB] ingest_batch_result {batch_id}: "
+                    f"chunk offset={i} trust={trust} updated={len(chunk)}",
+                    flush=True,
+                )
+            except Exception as e:
+                logger.error(f"[ingest_batch_result] verdict update chunk failed (trust={trust}): {e}")
+                counts["error"] = counts.get("error", 0) + len(chunk)
 
     print(
         f"[HB] ingest_batch_result {batch_id}: done "
@@ -640,14 +819,32 @@ async def ingest_batch_result(
         flush=True,
     )
 
+    # Fail-loud guard: TrueList reported valid emails but we wrote 0 valid leads.
+    # This catches the contacts/leads table mismatch (e.g. clean_national_realtors batches
+    # whose contacts live in the contacts table, not leads) and prevents silently marking
+    # them ingested with 0 processed — which would block the correct contacts ingest path.
+    ok_count = int(batch.get("ok_count") or 0)
+    if batch.get("annotated_csv_url") and ok_count > 0 and counts.get("valid", 0) == 0:
+        msg = (
+            f"[ingest_batch_result] {batch_id}: annotated_csv_url present, "
+            f"TrueList ok_count={ok_count}, but writeback produced 0 valid leads "
+            f"(total_processed={total_processed}). Refusing to mark ingested — "
+            f"likely a table mismatch (contacts vs leads pipeline). "
+            f"Use the correct per-pipeline ingest path for recovery."
+        )
+        logger.error(msg)
+        raise HTTPException(status_code=500, detail=msg)
+
     # Finalize batch row
     db.table("truelist_batches").update({
         "status":      "ingested",
         "ingested_at": _now_iso(),
         "notes":       (batch.get("notes") or "") + (
-            f" | ingest(email-match): processed={total_processed}, valid={counts['valid']}, "
-            f"invalid={counts['invalid']}, unknown={counts['unknown']}, "
-            f"errors={counts['error']}"
+            f" | ingest(batch-match v3): processed={total_processed}, valid={counts['valid']}, "
+            f"catch_all={counts.get('catch_all', 0)}, "
+            f"unconfirmable={counts.get('unconfirmable', 0)}, "
+            f"invalid={counts.get('invalid', 0)}, "
+            f"errors={counts['error']}, no_match={no_match}"
         ),
     }).eq("id", batch_id).execute()
 
@@ -655,8 +852,8 @@ async def ingest_batch_result(
         "batch_id":        batch_id,
         "status":          "ingested",
         "leads_processed": total_processed,
-        "counts":          counts,
-        "sub_states_top":  sorted(sub_state_seen.items(), key=lambda x: -x[1])[:10],
+        "counts":          counts,   # keyed by email_trust: valid/catch_all/unconfirmable/invalid/error
+        "no_match":        no_match,
     }
 
 
@@ -777,9 +974,11 @@ async def recover_batch_stamps(db, api_key: str, batch_id: str) -> dict:
             }).eq("id", batch_id).execute()
             return {"batch_id": batch_id, "status": "recovery_noop", "stamped": 0}
 
-    # Step 5: ingest
-    result = await ingest_batch_result(db, api_key, batch_id)
-    return {"batch_id": batch_id, "status": "recovered", "stamped": already_tagged or stamped_total if already_tagged == 0 else already_tagged, "ingest": result}
+    # Step 5: ingest — force_reingest=True bypasses the "already_ingested" early-exit
+    # so we can drain leads that were stamped but never matched due to the email-match bug.
+    result = await ingest_batch_result(db, api_key, batch_id, force_reingest=True)
+    stamped = already_tagged if already_tagged > 0 else stamped_total
+    return {"batch_id": batch_id, "status": "recovered", "stamped": stamped, "ingest": result}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1112,11 +1311,13 @@ async def single_email_clean(lead_id: str, db=Depends(get_db)):
 
     raw_state = email_obj.get("email_state")
     status, valid = parse_truelist_state(raw_state)
+    trust = _truelist_trust(raw_state)
     sub_state = email_obj.get("email_sub_state")
 
     db.table("leads").update({
         "email_status":     status,
         "email_valid":      valid,
+        "email_trust":      trust,
         "email_sub_state":  sub_state,
         "email_cleaned_at": _now_iso(),
     }).eq("id", lead_id).execute()
@@ -1126,6 +1327,7 @@ async def single_email_clean(lead_id: str, db=Depends(get_db)):
         "email":             email,
         "email_status":      status,
         "email_valid":       valid,
+        "email_trust":       trust,
         "email_state_raw":   raw_state,
         "email_sub_state":   sub_state,
         "did_you_mean":      email_obj.get("did_you_mean"),

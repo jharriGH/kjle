@@ -25,6 +25,9 @@ _PROVIDER_BUCKETS = [
     "yahoo", "apple", "other", "self_hosted", "unknown",
 ]
 
+BIZREPLY_MIN_PAGES = 5
+BIZREPLY_MIN_WORDS = 1500
+
 
 def get_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
@@ -123,6 +126,11 @@ class MarkContactedRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     # Batch form
     updates: Optional[List[MarkContactedItem]] = None
+
+
+class BizReplyFeedbackItem(BaseModel):
+    lead_id: str
+    unbuildable_reason: str
 
 
 # ─────────────────────────────────────────────────
@@ -238,7 +246,8 @@ _ELIGIBLE_KNOWN_PARAMS = frozenset({
     "vertical", "niche", "segment_id", "pain_min", "limit", "offset",
     "require_email_valid", "require_name_verified", "audited_after",
     "min_word_count", "min_internal_pages", "email_provider", "email_trust",
-    "product", "exclude_already_contacted", "cooldown_days",
+    "product", "exclude_already_contacted", "cooldown_days", "include_total",
+    "city", "has_chatbot", "website_reachable", "quality_tier",
 })
 
 
@@ -256,11 +265,16 @@ async def eligible_for_campaign(
     audited_after: Optional[str] = Query(None, description="ISO timestamp; restrict to last_audited_at > this value"),
     min_word_count: Optional[int] = Query(None, description="Minimum website_word_count"),
     min_internal_pages: Optional[int] = Query(None, description="Minimum website_internal_page_count"),
+    has_chatbot: Optional[bool] = Query(None, description="Filter by chatbot presence (false = no chatbot)"),
+    website_reachable: Optional[bool] = Query(None, description="Filter by website reachability (false = broken/unreachable)"),
+    quality_tier: Optional[str] = Query(None, description="bizreply_buildable = buildable compound gate"),
     email_provider: Optional[str] = Query(None, description="Filter by email provider bucket(s). Single value or comma-separated."),
     email_trust: Optional[str] = Query(None, description="Filter by email trust value(s). Single value or comma-separated. Values: valid|catch_all|role|unconfirmable|invalid"),
     product: Optional[str] = Query(None, description="Product slug (e.g. compliancemds, bizreply). Used with exclude_already_contacted."),
     exclude_already_contacted: bool = Query(False, description="When true and product is set, exclude leads with a lead_campaign_history row for that product."),
     cooldown_days: Optional[int] = Query(None, description="Exclude leads whose last_contacted_at is within this many days."),
+    include_total: bool = Query(False, description="Compute the total count (expensive on broad filters); default False returns total=null"),
+    city: Optional[str] = Query(None, description="Case-insensitive exact city match (whitespace trimmed). Omit to skip."),
     x_api_key: str = Header(...),
 ):
     verify_api_key(x_api_key)
@@ -356,6 +370,21 @@ async def eligible_for_campaign(
     if min_internal_pages is not None:
         query = query.gte("website_internal_page_count", min_internal_pages)
         count_query = count_query.gte("website_internal_page_count", min_internal_pages)
+    if has_chatbot is not None:
+        query = query.eq("has_chatbot", has_chatbot)
+        count_query = count_query.eq("has_chatbot", has_chatbot)
+    if website_reachable is not None:
+        query = query.eq("website_reachable", website_reachable)
+        count_query = count_query.eq("website_reachable", website_reachable)
+    if quality_tier == "bizreply_buildable":
+        query = (query.eq("website_reachable", True).eq("is_parked", False)
+                      .gte("website_internal_page_count", BIZREPLY_MIN_PAGES)
+                      .gte("website_word_count", BIZREPLY_MIN_WORDS)
+                      .is_("bizreply_unbuildable_reason", "null"))
+        count_query = (count_query.eq("website_reachable", True).eq("is_parked", False)
+                      .gte("website_internal_page_count", BIZREPLY_MIN_PAGES)
+                      .gte("website_word_count", BIZREPLY_MIN_WORDS)
+                      .is_("bizreply_unbuildable_reason", "null"))
     if email_provider:
         providers = [p.strip() for p in email_provider.split(",") if p.strip()]
         if len(providers) == 1:
@@ -372,6 +401,27 @@ async def eligible_for_campaign(
         elif len(trusts) > 1:
             query = query.in_("email_trust", trusts)
             count_query = count_query.in_("email_trust", trusts)
+    if city and city.strip():
+        query = query.ilike("city", city.strip())
+        count_query = count_query.ilike("city", city.strip())
+
+    # ── BizReply site-quality pre-screen ──────────────────────────────────────
+    if product and product.lower() == "bizreply":
+        # page/word counts: exclude only when count is known and below threshold (null passes through)
+        br_page_or = f"website_internal_page_count.is.null,website_internal_page_count.gte.{BIZREPLY_MIN_PAGES}"
+        query = query.or_(br_page_or)
+        count_query = count_query.or_(br_page_or)
+        br_word_or = f"website_word_count.is.null,website_word_count.gte.{BIZREPLY_MIN_WORDS}"
+        query = query.or_(br_word_or)
+        count_query = count_query.or_(br_word_or)
+        # parked/dead sites — these exclusions apply regardless of null
+        query = query.or_("is_parked.is.null,is_parked.is.false")
+        count_query = count_query.or_("is_parked.is.null,is_parked.is.false")
+        query = query.or_("website_reachable.is.null,website_reachable.is.true")
+        count_query = count_query.or_("website_reachable.is.null,website_reachable.is.true")
+        # already failed a prior BizReply build
+        query = query.is_("bizreply_unbuildable_reason", "null")
+        count_query = count_query.is_("bizreply_unbuildable_reason", "null")
 
     # ── cooldown_days: exclude leads contacted within N days ───────────────────
     if cooldown_days is not None and cooldown_days > 0:
@@ -390,13 +440,15 @@ async def eligible_for_campaign(
         query = query.or_(attached_or)
         count_query = count_query.or_(attached_or)
 
-    # ── count ──────────────────────────────────────────────────────────────────
-    try:
-        count_result = count_query.execute()
-        total = count_result.count if count_result.count is not None else 0
-    except Exception as e:
-        logger.warning(f"eligible_for_campaign count degraded (non-fatal): {e}")
-        total = None
+    # ── count (opt-in only — skipped by default to avoid full-scan timeout) ────
+    total = None
+    if include_total:
+        try:
+            count_result = count_query.execute()
+            total = count_result.count if count_result.count is not None else 0
+        except Exception as e:
+            logger.warning(f"eligible_for_campaign count degraded (non-fatal): {e}")
+            total = None
 
     # ── fetch page ─────────────────────────────────────────────────────────────
     try:
@@ -556,6 +608,7 @@ async def eligible_for_campaign(
 
     return {
         "total": total,
+        "total_included": include_total,
         "count": len(leads_out),
         "count_degraded": total is None,
         "leads": leads_out,
@@ -788,6 +841,65 @@ async def mark_contacted(payload: MarkContactedRequest, x_api_key: str = Header(
         "skipped": skipped,
         "errors": errors,
     }
+
+
+# ─────────────────────────────────────────────────
+# POST /kjle/v1/leads/bizreply-feedback
+# Ingest BizReply build-failure signals.
+# Body: single {lead_id, unbuildable_reason} or a list thereof.
+# ─────────────────────────────────────────────────
+
+@router.post("/leads/bizreply-feedback")
+async def bizreply_feedback(request: Request, x_api_key: str = Header(...)):
+    verify_api_key(x_api_key)
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    if isinstance(body, dict):
+        raw_items = [body]
+    elif isinstance(body, list):
+        raw_items = body
+    else:
+        raise HTTPException(status_code=400, detail="Body must be a JSON object or array")
+
+    if len(raw_items) > 1000:
+        raise HTTPException(status_code=400, detail="Max 1000 items per call")
+
+    supabase = get_supabase()
+    updated = 0
+    not_found = 0
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for item in raw_items:
+        if not isinstance(item, dict):
+            not_found += 1
+            continue
+        lead_id = item.get("lead_id")
+        reason = item.get("unbuildable_reason")
+        if not lead_id or not reason or not str(reason).strip():
+            continue
+        try:
+            res = (
+                supabase.table("leads")
+                .update({
+                    "bizreply_unbuildable_reason": str(reason).strip(),
+                    "bizreply_feedback_at": now_iso,
+                })
+                .eq("id", str(lead_id))
+                .execute()
+            )
+            if res.data:
+                updated += 1
+            else:
+                not_found += 1
+        except Exception as e:
+            logger.error(f"bizreply_feedback lead_id={lead_id}: {e}")
+            not_found += 1
+
+    return {"updated": updated, "not_found": not_found}
 
 
 # ─────────────────────────────────────────────────

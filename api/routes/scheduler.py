@@ -40,6 +40,7 @@ from .segments_engine import _classify_lead
 from .enrichment import _extract_schema_types
 from .webhooks import fire_event
 from .enrichment_email_clean import (
+    TruelistTransientError as ec_TruelistTransientError,
     select_uncleaned_leads as ec_select_uncleaned_leads,
     select_revalidation_leads as ec_select_revalidation_leads,
     submit_batch as ec_submit_batch,
@@ -47,6 +48,7 @@ from .enrichment_email_clean import (
     ingest_batch_result as ec_ingest_batch_result,
     _get_truelist_api_key as ec_get_truelist_api_key,
 )
+from .health_watchdog import run_watchdog as _hw_run_watchdog
 from .website_audit import (
     _fetch_html_free as wa_fetch_html_free,
     _fetch_html_free_with_status as wa_fetch_html_free_with_status,
@@ -264,6 +266,16 @@ JOB_DEFINITIONS = {
         "schedule":    "Daily at 07:00 UTC",
         "trigger":     "cron",
     },
+    "pipeline_watchdog_hourly": {
+        "description": "Hourly pipeline health snapshot + alert on first-red transition",
+        "schedule":    "Hourly at :20",
+        "trigger":     "cron",
+    },
+    "pipeline_watchdog_digest": {
+        "description": "Daily pipeline health digest email (08:45 America/Los_Angeles)",
+        "schedule":    "Daily at 08:45 America/Los_Angeles",
+        "trigger":     "cron",
+    },
 }
 
 
@@ -376,7 +388,7 @@ async def job_classify_segments() -> dict:
     these chunks too. See the landmine breadcrumb in segments_engine.py.
     """
     job_name = "classify_segments"
-    CHUNK_SIZE = 1000
+    CHUNK_SIZE = int(os.getenv("CLASSIFY_CHUNK_SIZE", "250"))
     logger.info(f"[{job_name}] Starting (chunked-UPDATE mode, chunk={CHUNK_SIZE})...")
     t_start = time.monotonic()
 
@@ -1188,8 +1200,17 @@ async def job_email_clean_nightly() -> dict:
         # Select returned [] on iteration 0 — nothing to clean, not a failure.
         notes = "no_leads_available (new+reval selectors both returned 0 on iteration 0)"
         status = "success"
+    elif submit_exception_count == 0:
+        # Selector found leads but all were skipped cleanly (no extractable emails).
+        # ec_submit_batch returned {"skipped": True, "reason": "no_usable_emails"} — no raise.
+        # This is a normal drained-backlog outcome, not a submit failure.
+        notes = (
+            f"no_usable_emails ({selector_total_returned} selected, 0 submittable) "
+            f"— leads have no extractable email addresses; not a submit error"
+        )
+        status = "success"
     else:
-        # Selector found leads but every submit attempt raised.
+        # Selector found leads and actual submit exceptions occurred (HTTP 4xx/5xx or raises).
         notes = (
             f"selector returned {selector_total_returned} leads but all "
             f"{submit_exception_count} submit attempts raised — see logs for exception details"
@@ -1234,6 +1255,12 @@ async def job_email_clean_poll_batches() -> dict:
             db.table("truelist_batches")
             .select("id, status, submitted_at, email_count")
             .in_("status", ["pending", "processing", "completed"])
+            # Only poll batches submitted by the leads pipeline.
+            # Contacts-pipeline batches (clean_national_realtors, etc.) use psycopg2
+            # directly and have their own drain/ingest path — picking them up here
+            # would call ec_ingest_batch_result on the leads table (finds 0 rows) and
+            # silently mark them ingested, blocking the contacts ingest.
+            .eq("submitted_by", "nightly_cron")
             .order("submitted_at", desc=False)
             .execute()
             .data or []
@@ -1252,6 +1279,7 @@ async def job_email_clean_poll_batches() -> dict:
     still_running = 0
     ingest_summaries: list[dict] = []
     errors: list[dict] = []
+    transient_skips: list[str] = []
 
     for r in rows:
         batch_id = r["id"]
@@ -1280,6 +1308,12 @@ async def job_email_clean_poll_batches() -> dict:
                 ingested += 1
             else:
                 still_running += 1
+        except ec_TruelistTransientError as e:
+            logger.warning(
+                f"[{job_name}] {batch_id}: transient upstream error — batch status unchanged, "
+                f"will retry on next poll cycle: {e}"
+            )
+            transient_skips.append(batch_id)
         except Exception as e:
             logger.error(f"[{job_name}] {batch_id} poll/ingest error: {e}")
             errors.append({"batch_id": batch_id, "error": str(e)[:300]})
@@ -1287,21 +1321,22 @@ async def job_email_clean_poll_batches() -> dict:
     duration = time.monotonic() - t_start
     notes = (
         f"in_flight={len(rows)}, ingested={ingested}, still_running={still_running}, "
-        f"errors={len(errors)}"
+        f"transient_skips={len(transient_skips)}, errors={len(errors)}"
     )
     status = "success" if not errors else ("partial" if ingested > 0 else "failed")
     await _log_job(job_name, leads_processed=sum(s.get("leads_processed", 0) for s in ingest_summaries),
                    duration_seconds=duration, status=status, notes=notes)
 
     return {
-        "job":           job_name,
-        "in_flight":     len(rows),
-        "ingested":      ingested,
-        "still_running": still_running,
-        "errors":        errors,
-        "summaries":     ingest_summaries,
-        "duration_s":    round(duration, 2),
-        "status":        status,
+        "job":             job_name,
+        "in_flight":       len(rows),
+        "ingested":        ingested,
+        "still_running":   still_running,
+        "transient_skips": transient_skips,
+        "errors":          errors,
+        "summaries":       ingest_summaries,
+        "duration_s":      round(duration, 2),
+        "status":          status,
     }
 
 
@@ -3248,8 +3283,8 @@ async def job_recompute_pain_backfill() -> dict:
                     db.table("leads")
                     .select(SELECT_FIELDS)
                     .eq("is_active", True)
+                    .not_.is_("last_audited_at", "null")
                     .or_("pain_score_version.is.null,pain_score_version.lt.3")
-                    .or_("is_parked.eq.true,website_has_ssl.eq.false,website_reachable.eq.false,website_status_code.gte.400")
                     .order("id")
                     .limit(this_chunk)
                 )
@@ -3955,6 +3990,36 @@ async def job_axe_scan_nightly() -> dict:
 # JOB DISPATCH MAP — maps name → async callable
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def job_pipeline_watchdog_hourly():
+    job_name = "pipeline_watchdog_hourly"
+    t0 = time.time()
+    try:
+        out = await _hw_run_watchdog(digest=False)
+        overall = out.get("result", {}).get("overall", "?")
+        await _log_job(job_name, duration_seconds=time.time() - t0, status="success",
+                       notes=f"overall={overall}")
+        return out
+    except Exception as e:
+        await _log_job(job_name, duration_seconds=time.time() - t0, status="failed",
+                       notes=str(e))
+        raise
+
+
+async def job_pipeline_watchdog_digest():
+    job_name = "pipeline_watchdog_digest"
+    t0 = time.time()
+    try:
+        out = await _hw_run_watchdog(digest=True)
+        overall = out.get("result", {}).get("overall", "?")
+        await _log_job(job_name, duration_seconds=time.time() - t0, status="success",
+                       notes=f"overall={overall} digest=True")
+        return out
+    except Exception as e:
+        await _log_job(job_name, duration_seconds=time.time() - t0, status="failed",
+                       notes=str(e))
+        raise
+
+
 JOB_FUNCTIONS = {
     "classify_segments":    job_classify_segments,
     "enrich_stage1":        job_enrich_stage1,
@@ -3976,6 +4041,8 @@ JOB_FUNCTIONS = {
     "provider_classify_nightly":    job_provider_classify_nightly,
     "recompute_pain_backfill":      job_recompute_pain_backfill,
     "rdap_domain_check":            job_rdap_domain_check,
+    "pipeline_watchdog_hourly":     job_pipeline_watchdog_hourly,
+    "pipeline_watchdog_digest":     job_pipeline_watchdog_digest,
 }
 
 
@@ -4005,15 +4072,18 @@ def setup_scheduler() -> AsyncIOScheduler:
         misfire_grace_time=300,
     )
 
-    # Job 2: enrich_stage1 — every 12 hours
-    scheduler.add_job(
-        job_enrich_stage1,
-        trigger=IntervalTrigger(hours=12),
-        id="enrich_stage1",
-        name="Auto-Enrich Stage 1",
-        replace_existing=True,
-        misfire_grace_time=600,
-    )
+    # Job 2: enrich_stage1 -- DISABLED: replaced by workers/enrich_daemon/daemon.py
+    # The standalone always-on daemon processes the backlog concurrently (25 parallel
+    # fetches vs serial) and uses enrichment_locked for race safety. Disabling here
+    # prevents double-processing; the daemon is the sole Stage-1 writer.
+    # scheduler.add_job(
+    #     job_enrich_stage1,
+    #     trigger=IntervalTrigger(hours=12),
+    #     id="enrich_stage1",
+    #     name="Auto-Enrich Stage 1",
+    #     replace_existing=True,
+    #     misfire_grace_time=600,
+    # )
 
     # Job 3: cost_digest — daily at 08:00 UTC
     scheduler.add_job(
@@ -4200,6 +4270,38 @@ def setup_scheduler() -> AsyncIOScheduler:
         max_instances=1,
         coalesce=True,
         misfire_grace_time=3600,
+    )
+
+    # Job 18: pipeline_watchdog_hourly — every hour at :20
+    # Snapshots pipeline health and alerts on first-red transition. Pinned to
+    # :20 to avoid colliding with email_clean_poll_batches (:00/:30) and
+    # classify_segments (:05). misfire_grace_time=600 so a brief deploy gap
+    # doesn't cause a double-fire; max_instances=1 + coalesce prevents
+    # concurrent runs if a prior check is still waiting on the DB.
+    scheduler.add_job(
+        job_pipeline_watchdog_hourly,
+        trigger=CronTrigger(minute=20),
+        id="pipeline_watchdog_hourly",
+        name="Pipeline Health Watchdog (hourly)",
+        replace_existing=True,
+        misfire_grace_time=600,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Job 19: pipeline_watchdog_digest — daily at 08:45 America/Los_Angeles
+    # Sends the full health digest email at 8:45 AM Pacific so the owner sees
+    # it at the start of the work day. misfire_grace_time=1800 handles a brief
+    # service restart around that window.
+    scheduler.add_job(
+        job_pipeline_watchdog_digest,
+        trigger=CronTrigger(hour=8, minute=45, timezone="America/Los_Angeles"),
+        id="pipeline_watchdog_digest",
+        name="Pipeline Health Digest (daily 08:45 America/Los_Angeles)",
+        replace_existing=True,
+        misfire_grace_time=1800,
+        max_instances=1,
+        coalesce=True,
     )
 
     logger.info(f"⏰ APScheduler configured: {len(scheduler.get_jobs())} jobs registered")

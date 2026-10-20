@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone, timedelta
 
@@ -79,7 +80,6 @@ def _count_completed_since(cutoff_iso: str) -> int:
         f"&limit=1"
     )
     try:
-        import urllib.parse
         url = f"{SUPABASE_URL}/rest/v1/{path}"
         req = urllib.request.Request(
             url,
@@ -109,7 +109,6 @@ def _count_completed_since(cutoff_iso: str) -> int:
 
 def _count_via_get(path: str) -> int:
     try:
-        import urllib.parse
         url = f"{SUPABASE_URL}/rest/v1/{path}"
         req = urllib.request.Request(
             url,
@@ -130,7 +129,6 @@ def _count_via_get(path: str) -> int:
 
 def _count_queued() -> int:
     try:
-        import urllib.parse
         url = f"{SUPABASE_URL}/rest/v1/scan_jobs?select=id&status=eq.queued&limit=1"
         req = urllib.request.Request(
             url,
@@ -157,7 +155,6 @@ def _count_queued() -> int:
 
 def _count_done_total() -> int:
     try:
-        import urllib.parse
         url = f"{SUPABASE_URL}/rest/v1/scan_jobs?select=id&status=in.(done,error)&limit=1"
         req = urllib.request.Request(
             url,

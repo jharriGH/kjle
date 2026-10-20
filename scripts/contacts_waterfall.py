@@ -16,6 +16,7 @@ import csv
 import io
 import logging
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -293,6 +294,26 @@ def step2_trust() -> int:
 
 
 # ── Truelist helpers ──────────────────────────────────────────────────────────
+
+# Matches trailing provider annotations like " (accept_all)" in email fields.
+_ANNOTATION_RE = re.compile(r'\s*\([^)]*\)\s*$')
+
+
+def _extract_emails(raw: str) -> list:
+    """
+    Extract clean email addresses from a raw field that may contain annotations
+    or comma-separated multiple values (e.g. "foo@bar.com (accept_all)").
+    Returns list of lowercased clean addresses. Matches enrichment_email_clean.py.
+    """
+    if not raw:
+        return []
+    results = []
+    for part in re.split(r'\s*,\s*', raw.strip()):
+        clean = _ANNOTATION_RE.sub('', part).strip()
+        if clean and '@' in clean and ' ' not in clean and len(clean) <= 254:
+            results.append(clean.lower())
+    return results
+
 
 def _parse_truelist_state(raw_state: Optional[str]) -> tuple:
     if not raw_state:
@@ -590,24 +611,33 @@ def step3_truelist(api_key: str) -> dict:
         conn.close()
         return {"submitted": 0, "reason": "all_already_validated"}
 
-    # Deduplicate by email for Truelist payload
+    # Deduplicate by email using _extract_emails (strips annotations, handles multi-email fields)
     seen: set = set()
     payload = []
     for _, em in rows:
-        e = (em or "").strip().lower()
-        if e and e not in seen:
-            seen.add(e)
-            payload.append([e])
+        for e in _extract_emails(em or ""):
+            if e not in seen:
+                seen.add(e)
+                payload.append([e])
 
     log.info(f"  Submitting {len(payload)} unique emails to Truelist ({len(rows)} contacts)")
     print(f"[HB] step3: submitting {len(payload)} emails to Truelist", flush=True)
     batch_name = f"kjle_contacts_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
 
+    # Build CSV — TrueList requires CSV file upload since 2026-10-11; JSON body returns 422.
+    csv_buf = io.StringIO()
+    csv_wr = csv.writer(csv_buf)
+    csv_wr.writerow(["email"])
+    for row in payload:
+        csv_wr.writerow(row)
+    csv_bytes = csv_buf.getvalue().encode("utf-8")
+
     with httpx.Client(timeout=60.0) as client:
         r = client.post(
             TRUELIST_BATCHES_URL,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"data": payload, "name": batch_name},
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={"file": ("emails.csv", csv_bytes, "text/csv")},
+            data={"name": batch_name},
         )
 
     if r.status_code == 409:

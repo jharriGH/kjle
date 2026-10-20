@@ -1,0 +1,26 @@
+[Unit]
+Description=KJLE Stage-1 Enrichment Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=notify: systemd waits for READY=1 before marking service active.
+# WatchdogSec=120: systemd kills+restarts if WATCHDOG=1 stops arriving within 120s.
+# This catches silent hangs (event loop deadlock, hung httpx connection) that
+# Restart=on-failure alone misses.
+Type=notify
+NotifyAccess=main
+User=ccrunner
+WorkingDirectory=/opt/kjle/workers/enrich_daemon
+EnvironmentFile=/etc/kjle-enrich-daemon.env
+ExecStart=/usr/bin/python3 /opt/kjle/workers/enrich_daemon/daemon.py
+Restart=always
+RestartSec=10
+WatchdogSec=120
+StandardOutput=journal
+StandardError=journal
+TimeoutStopSec=60
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
