@@ -397,6 +397,7 @@ async def contacts_eligible_for_campaign(
 
     return {
         "total": total,
+        "total_included": include_total,
         "count": len(contacts_out),
         "count_degraded": total is None,
         "contacts": contacts_out,
