@@ -362,8 +362,16 @@ async def contacts_eligible_for_campaign(
     total = None
     if include_total:
         try:
+            # "exact", not "estimated" -- the planner's row estimate for this
+            # filter combination (niche_slug + is_realtor + email_trust, all
+            # ANDed) is badly wrong (independence-assumption underestimate on
+            # correlated columns: e.g. 1,244 estimated vs 52,430 actual for
+            # the national realtor+valid segment). idx_contacts_realtor_eligible
+            # makes an exact count on this filtered-and-indexed set cheap
+            # (~150ms via index scan), so there's no timeout risk trade-off
+            # for choosing correctness here.
             count_result = apply_filters(
-                db.table("contacts").select("id", count="estimated")
+                db.table("contacts").select("id", count="exact")
             ).range(0, 0).execute()
             total = count_result.count if count_result.count is not None else 0
         except Exception as exc:
