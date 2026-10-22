@@ -338,7 +338,10 @@ async def contacts_eligible_for_campaign(
     def apply_filters(q):
         q = q.eq("niche_slug", niche_slug)
         if title_is_realtor:
-            q = q.filter("title", "imatch", _TITLE_IS_REALTOR_PATTERN)
+            # Precomputed + indexed (idx_contacts_realtor_eligible) -- the raw
+            # title ~* regex over the full 1.69M-row table had no index support
+            # and was the root cause of the deep-offset statement timeouts.
+            q = q.eq("is_realtor", True)
         if state:
             q = q.eq("state", state.upper())
         if city:
@@ -367,14 +370,39 @@ async def contacts_eligible_for_campaign(
             _logger.warning("contacts_eligible_for_campaign count_query failed: %s", exc)
             skipped_filters.append(f"count_failed:{exc}")
 
+    # Seek/keyset pagination, ordered by id -- NOT a raw deep OFFSET over the
+    # expensive row set. `offset`/`limit` stay the external contract, but
+    # internally `offset` is only ever used against a single-column (id-only)
+    # lookup, which idx_contacts_realtor_eligible answers as a cheap
+    # index-only scan. The actual page of full rows is always a tight
+    # `id > boundary ORDER BY id LIMIT n` range scan, so page depth doesn't
+    # degrade the way raw OFFSET + an unindexed regex filter did.
     try:
-        page = (
-            apply_filters(db.table("contacts").select(_ELIGIBLE_SELECT_COLS))
-            .order("created_at", desc=True, nullsfirst=False)
-            .range(offset, offset + limit - 1)
-            .execute()
-        )
-        rows = page.data or []
+        past_end = False
+        boundary_id = None
+        if offset > 0:
+            boundary_page = (
+                apply_filters(db.table("contacts").select("id"))
+                .order("id")
+                .range(offset - 1, offset - 1)
+                .execute()
+            )
+            boundary_rows = boundary_page.data or []
+            if boundary_rows:
+                boundary_id = boundary_rows[0]["id"]
+            else:
+                # offset is past the end of the matching set -- 200 + empty,
+                # not a 500 (Bug 2).
+                past_end = True
+
+        if past_end:
+            rows = []
+        else:
+            data_query = apply_filters(db.table("contacts").select(_ELIGIBLE_SELECT_COLS)).order("id")
+            if boundary_id is not None:
+                data_query = data_query.gt("id", boundary_id)
+            page = data_query.limit(limit).execute()
+            rows = page.data or []
     except Exception as e:
         _logger.error(f"contacts_eligible_for_campaign fetch failed: {e}")
         raise HTTPException(status_code=500, detail=f"contact_query_failed: {e}")
