@@ -58,10 +58,10 @@ def _dnc_auth(request: Request, x_api_key: Optional[str] = Header(None)) -> None
     if _DNC_REQUIRE_AUTH:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
     logger.warning(
-        "dnc: unauthenticated request path=%s source=%s key_present=%s",
+        "dnc warn-mode: unauthenticated path=%s source=%s key_present=%s",
         request.url.path,
-        request.query_params.get("source", "unknown"),
-        x_api_key is not None,
+        request.query_params.get("source", "none"),
+        "true" if x_api_key is not None else "false",
     )
 
 
