@@ -14,8 +14,8 @@ no RPC, no JOIN. Requires niche_slug (returns 400 otherwise) to stay on that ind
 import logging
 import os
 
-from fastapi import APIRouter, Header, HTTPException, Query
-from typing import Optional
+from fastapi import APIRouter, Header, HTTPException, Query, Request
+from typing import List, Optional
 from ..database import get_db
 
 _logger = logging.getLogger(__name__)
@@ -287,4 +287,155 @@ async def list_contacts(
         "total":     total,
         "count":     len(contacts_out),
         "contacts":  contacts_out,
+    }
+
+
+# ─────────────────────────────────────────────────
+# GET /kjle/v1/contacts/eligible-for-campaign
+# Mirrors GET /kjle/v1/leads/eligible-for-campaign (auth, pagination,
+# response envelope) but reads the person-level `contacts` table.
+# Read-only — never writes to contacts.
+# ─────────────────────────────────────────────────
+
+_ELIGIBLE_SELECT_COLS = (
+    "id, first_name, last_name, title, company, primary_email, "
+    "email_provider, email_trust, city, state"
+)
+
+_TITLE_IS_REALTOR_PATTERN = (
+    r"(realtor|real estate agent|listing agent|sales agent|associate broker|"
+    r"broker associate|real estate broker|sales associate)"
+)
+
+_CONTACTS_ELIGIBLE_KNOWN_PARAMS = frozenset({
+    "niche_slug", "title_is_realtor", "state", "city",
+    "email_valid", "email_trust", "limit", "offset", "include_total",
+})
+
+
+@router.get("/contacts/eligible-for-campaign")
+async def contacts_eligible_for_campaign(
+    request: Request,
+    niche_slug: str = Query("realestate", description="niche_slug filter"),
+    title_is_realtor: bool = Query(False, description="When true, restrict to realtor-ish titles via a regex match on title."),
+    state: Optional[str] = Query(None, description="Exact US state abbreviation"),
+    city: Optional[str] = Query(None, description="Single or comma-separated city list; ILIKE ANY match"),
+    email_valid: bool = Query(True, description="Restrict to contacts.email_valid = this value"),
+    email_trust: Optional[str] = Query(None, description="Single or comma-separated: valid|catch_all|role|unconfirmable|invalid"),
+    limit: int = Query(500, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
+    include_total: bool = Query(False, description="When true, also compute an estimated total (extra DB round-trip on this 1.7M-row table)."),
+    x_api_key: str = Header(...),
+):
+    verify_api_key(x_api_key)
+    db = get_db()
+
+    skipped_filters: List[str] = []
+    for _qk in request.query_params:
+        if _qk not in _CONTACTS_ELIGIBLE_KNOWN_PARAMS:
+            skipped_filters.append(f"unrecognized:{_qk}")
+
+    def apply_filters(q):
+        q = q.eq("niche_slug", niche_slug)
+        if title_is_realtor:
+            # Precomputed + indexed (idx_contacts_realtor_eligible) -- the raw
+            # title ~* regex over the full 1.69M-row table had no index support
+            # and was the root cause of the deep-offset statement timeouts.
+            q = q.eq("is_realtor", True)
+        if state:
+            q = q.eq("state", state.upper())
+        if city:
+            cities = [c.strip() for c in city.split(",") if c.strip()]
+            if len(cities) == 1:
+                q = q.ilike("city", cities[0])
+            elif len(cities) > 1:
+                q = q.or_(",".join(f"city.ilike.{c}" for c in cities))
+        q = q.eq("email_valid", email_valid)
+        if email_trust:
+            trusts = [t.strip() for t in email_trust.split(",") if t.strip()]
+            if len(trusts) == 1:
+                q = q.eq("email_trust", trusts[0])
+            elif len(trusts) > 1:
+                q = q.in_("email_trust", trusts)
+        return q
+
+    total = None
+    if include_total:
+        try:
+            # "exact", not "estimated" -- the planner's row estimate for this
+            # filter combination (niche_slug + is_realtor + email_trust, all
+            # ANDed) is badly wrong (independence-assumption underestimate on
+            # correlated columns: e.g. 1,244 estimated vs 52,430 actual for
+            # the national realtor+valid segment). idx_contacts_realtor_eligible
+            # makes an exact count on this filtered-and-indexed set cheap
+            # (~150ms via index scan), so there's no timeout risk trade-off
+            # for choosing correctness here.
+            count_result = apply_filters(
+                db.table("contacts").select("id", count="exact")
+            ).range(0, 0).execute()
+            total = count_result.count if count_result.count is not None else 0
+        except Exception as exc:
+            _logger.warning("contacts_eligible_for_campaign count_query failed: %s", exc)
+            skipped_filters.append(f"count_failed:{exc}")
+
+    # Seek/keyset pagination, ordered by id -- NOT a raw deep OFFSET over the
+    # expensive row set. `offset`/`limit` stay the external contract, but
+    # internally `offset` is only ever used against a single-column (id-only)
+    # lookup, which idx_contacts_realtor_eligible answers as a cheap
+    # index-only scan. The actual page of full rows is always a tight
+    # `id > boundary ORDER BY id LIMIT n` range scan, so page depth doesn't
+    # degrade the way raw OFFSET + an unindexed regex filter did.
+    try:
+        past_end = False
+        boundary_id = None
+        if offset > 0:
+            boundary_page = (
+                apply_filters(db.table("contacts").select("id"))
+                .order("id")
+                .range(offset - 1, offset - 1)
+                .execute()
+            )
+            boundary_rows = boundary_page.data or []
+            if boundary_rows:
+                boundary_id = boundary_rows[0]["id"]
+            else:
+                # offset is past the end of the matching set -- 200 + empty,
+                # not a 500 (Bug 2).
+                past_end = True
+
+        if past_end:
+            rows = []
+        else:
+            data_query = apply_filters(db.table("contacts").select(_ELIGIBLE_SELECT_COLS)).order("id")
+            if boundary_id is not None:
+                data_query = data_query.gt("id", boundary_id)
+            page = data_query.limit(limit).execute()
+            rows = page.data or []
+    except Exception as e:
+        _logger.error(f"contacts_eligible_for_campaign fetch failed: {e}")
+        raise HTTPException(status_code=500, detail=f"contact_query_failed: {e}")
+
+    contacts_out = [
+        {
+            "id": r.get("id"),
+            "first_name": r.get("first_name"),
+            "last_name": r.get("last_name"),
+            "title": r.get("title"),
+            "company": r.get("company"),
+            "primary_email": r.get("primary_email"),
+            "email_provider": r.get("email_provider"),
+            "email_trust": r.get("email_trust"),
+            "city": r.get("city"),
+            "state": r.get("state"),
+        }
+        for r in rows
+    ]
+
+    return {
+        "total": total,
+        "total_included": include_total,
+        "count": len(contacts_out),
+        "count_degraded": total is None,
+        "contacts": contacts_out,
+        "skipped_filters": skipped_filters,
     }
