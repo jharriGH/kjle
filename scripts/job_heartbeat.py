@@ -539,6 +539,102 @@ def maybe_restart(row: dict, conn) -> str | None:
         return f"restart_failed: {e}"
 
 
+# ── KJSupportz key-liveness probe (once per day) ─────────────────────────────
+
+def probe_key_liveness():
+    """
+    Hits KJSupportz /admin/key_liveness once per calendar day.
+    Gate: marker file /tmp/kjle-keyprobe-YYYYMMDD. Skip if it exists.
+    Alerts Jim only on any_dead==true. Inconclusive (5xx/timeout) is silent.
+    Never echoes credentials or full provider error bodies.
+    """
+    api_key = os.environ.get("KJSUPPORTZ_API_SECRET_KEY", "")
+    if not api_key:
+        log.warning("[key_liveness] KJSUPPORTZ_API_SECRET_KEY not set — skipping probe")
+        return
+
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    marker = f"/tmp/kjle-keyprobe-{today}"
+    if os.path.exists(marker):
+        log.info("[key_liveness] daily marker present — skipping")
+        return
+
+    url = "https://kjsupportz-api.onrender.com/kjsupportz/v1/admin/key_liveness"
+    try:
+        r = httpx.get(
+            url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=20.0,
+        )
+    except Exception as e:
+        log.warning(f"[key_liveness] request error: {e}")
+        brain_log_entry(
+            f"key_liveness inconclusive: request exception {str(e)[:200]}",
+            tags=["key_liveness", "inconclusive"],
+        )
+        # Create marker so a transient error doesn't re-run every 15 min all day
+        open(marker, "w").close()
+        return
+
+    if r.status_code >= 500:
+        snippet = r.text[:200]
+        log.warning(f"[key_liveness] server error {r.status_code}: {snippet}")
+        brain_log_entry(
+            f"key_liveness inconclusive: HTTP {r.status_code} {snippet}",
+            tags=["key_liveness", "inconclusive"],
+        )
+        open(marker, "w").close()
+        return
+
+    if r.status_code == 401 or r.status_code == 403:
+        # Auth failure means the key itself may be dead
+        brain_log_entry(
+            f"key_liveness alert: HTTP {r.status_code} — bearer rejected by admin endpoint",
+            tags=["key_liveness", "alert"],
+        )
+        brain_notify(
+            "KJSupportz key-liveness probe: admin bearer rejected (HTTP "
+            f"{r.status_code}) — key may be dead or rotated",
+            severity="warn",
+        )
+        open(marker, "w").close()
+        return
+
+    try:
+        body = r.json()
+    except Exception:
+        snippet = r.text[:200]
+        brain_log_entry(
+            f"key_liveness inconclusive: non-JSON response HTTP {r.status_code} {snippet}",
+            tags=["key_liveness", "inconclusive"],
+        )
+        open(marker, "w").close()
+        return
+
+    any_dead = body.get("any_dead", False)
+
+    if any_dead:
+        dead_providers = body.get("dead_providers", [])
+        providers_str = ", ".join(str(p) for p in dead_providers) if dead_providers else "unknown"
+        brain_log_entry(
+            f"key_liveness alert: any_dead=true, dead_providers=[{providers_str}]",
+            tags=["key_liveness", "alert"],
+        )
+        brain_notify(
+            f"KJSupportz DEAD API KEY(S): {providers_str} — check Render env vars. DO NOT auto-rotate.",
+            severity="warn",
+        )
+        log.warning(f"[key_liveness] DEAD KEY(S): {providers_str}")
+    else:
+        brain_log_entry(
+            "key_liveness ok: all_ok=true, no dead providers",
+            tags=["key_liveness", "ok"],
+        )
+        log.info("[key_liveness] all ok")
+
+    open(marker, "w").close()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -626,6 +722,12 @@ def main():
     # HTTP health probes (web-layer outage detection)
     print(f"[HB] running API health probes")
     run_api_health_probes(conn, now)
+
+    # Key-liveness probe (once per day, independent of job checks)
+    try:
+        probe_key_liveness()
+    except Exception as e:
+        log.error(f"probe_key_liveness raised: {e}", exc_info=True)
 
     summary = ", ".join(summary_parts)
     log.info(f"=== job_heartbeat done: {summary} ===")
