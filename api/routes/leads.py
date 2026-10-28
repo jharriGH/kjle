@@ -15,9 +15,6 @@ from typing import List, Optional
 from ..database import get_db
 
 _logger = logging.getLogger(__name__)
-# Safe cap for NOT IN suppression list; above this we fall back to post-page filtering
-# (which leaves `total` approximate) and log a warning.
-_SUPPRESS_CAP = 10_000
 
 router = APIRouter()
 
@@ -170,29 +167,20 @@ async def list_leads(
     offset = (page - 1) * page_size
 
     # ── Email suppression pre-fetch ───────────────────────────────────────────
-    # Option A: load suppressed email set once, apply as NOT IN on BOTH the main
-    # query AND count_query so `total` stays correct and pagination is exact.
-    # Case-sensitivity note: email_suppressions stores normalized lowercase emails;
-    # leads.email may have mixed case (uncommon for validated leads). Mixed-case
-    # variants won't be excluded — document limitation, no schema change available.
-    # Cap: if list > _SUPPRESS_CAP, skip NOT IN (query URL too large), post-filter
-    # the result page instead (total becomes approximate, logged as warning).
-    suppressed_list: list = []
+    # Load suppressed-email set once per request; filter in Python after the DB
+    # page is fetched. Inlining suppressions in a NOT IN DB filter blows the
+    # PostgREST URL length limit at ~7k+ addresses and triggers a 414 response
+    # that the postgrest client cannot parse → ValidationError → ASGI 500.
     suppressed_set: set = set()
-    suppress_overflow = False
     if exclude_email_suppressed:
         try:
             sup_res = db.table("email_suppressions").select("email").execute()
             suppressed_set = {row["email"] for row in sup_res.data if row.get("email")}
-            if len(suppressed_set) > _SUPPRESS_CAP:
-                suppress_overflow = True
-                _logger.warning(
-                    "email_suppressions count %d exceeds cap %d; NOT IN filter skipped — "
-                    "`total` will not exclude suppressed emails (post-page filter still applied)",
-                    len(suppressed_set), _SUPPRESS_CAP,
+            if suppressed_set:
+                _logger.info(
+                    "email_suppressions: %d addresses loaded for post-page filter",
+                    len(suppressed_set),
                 )
-            else:
-                suppressed_list = list(suppressed_set)
         except Exception as exc:
             _logger.warning("email_suppressions fetch failed: %s — suppression filter skipped", exc)
 
@@ -325,8 +313,6 @@ async def list_leads(
             count_q = apply_filters(
                 db.table("leads").select("id", count="exact").eq("is_active", is_active)
             )
-            if suppressed_list and not suppress_overflow:
-                count_q = count_q.not_.in_("email", suppressed_list)
             count_result = count_q.range(0, 0).execute()
             total = count_result.count if count_result.count is not None else 0
         except Exception as exc:
@@ -340,27 +326,25 @@ async def list_leads(
             est_q = apply_filters(
                 db.table("leads").select("id", count="estimated").eq("is_active", is_active)
             )
-            if suppressed_list and not suppress_overflow:
-                est_q = est_q.not_.in_("email", suppressed_list)
             est_result = est_q.range(0, 0).execute()
             total = est_result.count if est_result.count is not None else 0
         except Exception as exc:
             _logger.warning("estimated count failed (%s: %s) — total unknown", type(exc).__name__, exc)
             total = 0
 
-    # Apply suppression to row query before ordering/pagination (mirrors count_q).
-    if suppressed_list and not suppress_overflow:
-        query = query.not_.in_("email", suppressed_list)
-
     # Ordering + pagination
     query = query.order(order_by, desc=(order_dir == "desc"), nullsfirst=False)
     query = query.range(offset, offset + page_size - 1)
 
-    result = query.execute()
-    leads_data = result.data
+    try:
+        result = query.execute()
+        leads_data = result.data
+    except Exception as exc:
+        _logger.error("leads query failed: %s", exc)
+        raise HTTPException(status_code=500, detail="lead_query_failed")
 
-    # Post-filter: overflow case only (list too large for NOT IN).
-    if suppress_overflow and suppressed_set:
+    # Post-filter suppressed emails in Python — never inline in the DB URL.
+    if suppressed_set:
         leads_data = [
             r for r in leads_data
             if (r.get("email") or "").strip().lower() not in suppressed_set
