@@ -71,6 +71,19 @@ router = APIRouter(dependencies=[Depends(_dnc_auth)])
 SEARCHBUG_COST_PER_LOOKUP_USD = 0.0214
 SCRUB_BATCH_MAX               = 100
 
+# Suppression reasons the whitelist short-circuit is allowed to override.
+# Anything not in this set (or not containing these keywords) is PROTECTED
+# (real consumer opt-out) and must block the whitelist — fail-safe default.
+_WHITELIST_TEST_REASONS = frozenset({
+    "manual_test", "dnc_test", "probe", "whitelist_verification",
+})
+_WHITELIST_TEST_KEYWORDS = ("verif", "test", "probe")
+
+
+def _is_test_probe_suppression(reason: str) -> bool:
+    r = (reason or "").lower().strip()
+    return r in _WHITELIST_TEST_REASONS or any(kw in r for kw in _WHITELIST_TEST_KEYWORDS)
+
 # Hard state-level suppression — calls into FL/OK/TX are categorically
 # blocked regardless of federal/provider status. State derived from
 # nanpa_carrier_prefixes (7-char npa_nxx_x primary key, with 6-char fallback)
@@ -223,20 +236,35 @@ async def _perform_check(
     db = get_db()
     src = source or "unknown"
 
-    # 0. Whitelist short-circuit — overrides suppressions, cache, budget cap,
-    #    and provider. A whitelist hit means "always allow this number."
+    # 0. Whitelist short-circuit — overrides ONLY test/probe suppressions.
+    #    A real consumer opt-out (do_not_call_request, replied_stop, stop_keyword,
+    #    or any unrecognized reason) takes precedence and must NOT be overridden.
+    #    When a protected suppression is present, fall through so step 1 returns
+    #    is_dnc=True with the real reason and logs it to dnc_audit_log.
     try:
         wl = db.table("dnc_whitelist").select("phone").eq("phone", phone).execute()
         if wl.data:
-            _audit(
-                phone=phone, source=src, result="whitelist",
-                is_dnc=False, requesting_lead_id=lead_id,
-            )
-            return _serialize_response(
-                result_source="whitelist",
-                phone_normalized=phone, is_dnc=False,
-                reason="whitelisted",
-            )
+            _has_protected = False
+            try:
+                _sc = db.table("dnc_suppressions").select("reason").eq("phone", phone).execute()
+                for _sr in (_sc.data or []):
+                    if not _is_test_probe_suppression(_sr.get("reason") or ""):
+                        _has_protected = True
+                        break
+            except Exception as _e_sc:
+                logger.warning(f"dnc: whitelist suppression pre-check failed for {phone}: {_e_sc}")
+                _has_protected = True  # fail-safe: don't short-circuit on lookup error
+            if not _has_protected:
+                _audit(
+                    phone=phone, source=src, result="whitelist",
+                    is_dnc=False, requesting_lead_id=lead_id,
+                )
+                return _serialize_response(
+                    result_source="whitelist",
+                    phone_normalized=phone, is_dnc=False,
+                    reason="whitelisted",
+                )
+            # Protected suppression present — fall through; step 1 returns the real result.
     except Exception as e:
         logger.warning(f"dnc: whitelist read failed for {phone}: {e}")
         # Fall through — better to consult suppressions/cache/provider than 500.
