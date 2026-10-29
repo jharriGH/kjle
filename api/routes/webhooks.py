@@ -36,7 +36,6 @@ SUPPORTED_EVENTS = {
     "lead.enriched",
     "batch.push_complete",
     "export.csv_complete",
-    "export.reachinbox_complete",
     "segment.classified",
 }
 

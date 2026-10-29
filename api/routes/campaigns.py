@@ -14,8 +14,7 @@ Routes registered by main.py with prefix=/kjle/v1:
   POST   /campaigns/performance/{id}/attribute   — demo/close events (auth)
   PATCH  /campaigns/performance/{id}             — notes/status/metadata (auth)
 
-Also exposes two helpers used by other modules:
-  - _auto_register_from_ri_create: called from reachinbox.py /campaigns/create
+Also exposes:
   - get_campaign_activity_summary_24h: STABLE signature for Prompt 2 daily_cost_report
 """
 
@@ -53,10 +52,8 @@ FALLBACK_PROJECT = "kjle"
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RegisterCampaignRequest(BaseModel):
-    project:                Optional[str] = None   # auto-inferred from domain if None
-    reachinbox_server:      str = "server_1"
-    reachinbox_campaign_id: Optional[str] = None
-    campaign_name:          str
+    project:       Optional[str] = None   # auto-inferred from domain if None
+    campaign_name: str
     niche:                  Optional[str] = None
     domain_used:            Optional[str] = None
     offer_type:             Optional[str] = None
@@ -76,9 +73,8 @@ class PatchCampaignRequest(BaseModel):
     status:   Optional[str]  = None
     notes:    Optional[str]  = None
     metadata: Optional[dict] = None
-    # Immutable identity fields — 422 if present in body:
-    project:           Optional[str] = None
-    reachinbox_server: Optional[str] = None
+    # Immutable identity field — 422 if present in body:
+    project: Optional[str] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,7 +107,6 @@ def _lookup_project_by_domain(domain: Optional[str]) -> Optional[str]:
 def _resolve_project(
     explicit_project: Optional[str],
     domain_used: Optional[str],
-    ri_campaign_id: Optional[str],
 ) -> str:
     """
     Resolution order:
@@ -127,7 +122,7 @@ def _resolve_project(
     # Actionable fallback warning — greppable
     logger.warning(
         f"campaign_performance.register: domain='{domain_used}' not in project_domains, "
-        f"defaulting to '{FALLBACK_PROJECT}' (campaign_id={ri_campaign_id or 'none'})"
+        f"defaulting to '{FALLBACK_PROJECT}'"
     )
     return FALLBACK_PROJECT
 
@@ -137,63 +132,6 @@ def _serialize_row(row: dict) -> dict:
     if row.get("revenue_attributed_usd") is not None:
         row["revenue_attributed_usd"] = float(row["revenue_attributed_usd"])
     return row
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Internal helper — called by reachinbox.py /campaigns/create auto-register hook
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def _auto_register_from_ri_create(
-    ri_campaign_id: str,
-    campaign_name: str,
-    niche: Optional[str],
-    domain_used: Optional[str],
-    offer_type: Optional[str],
-    leads_count: int,
-    launched: bool,
-) -> int:
-    """
-    Auto-register a campaign created via /reachinbox/campaigns/create.
-    Idempotent: if (project, server, ri_campaign_id) already exists, updates it.
-
-    Returns the campaign_performance row id.
-    Raises on DB failure — caller should catch and log (non-fatal).
-    """
-    project = _resolve_project(None, domain_used, ri_campaign_id)
-    server  = "server_1"
-    status  = "active" if launched else "draft"
-    started_at = _now_iso() if launched else None
-
-    payload = {
-        "project":                project,
-        "reachinbox_server":      server,
-        "reachinbox_campaign_id": ri_campaign_id,
-        "campaign_name":          campaign_name,
-        "niche":                  niche,
-        "domain_used":            domain_used,
-        "offer_type":             offer_type,
-        "leads_count":            leads_count,
-        "status":                 status,
-        "started_at":             started_at,
-    }
-
-    db = get_db()
-
-    existing = (
-        db.table(PERF_TABLE)
-        .select("id")
-        .eq("project", project)
-        .eq("reachinbox_server", server)
-        .eq("reachinbox_campaign_id", ri_campaign_id)
-        .execute().data or []
-    )
-
-    if existing:
-        db.table(PERF_TABLE).update(payload).eq("id", existing[0]["id"]).execute()
-        return existing[0]["id"]
-
-    res = db.table(PERF_TABLE).insert(payload).execute()
-    return res.data[0]["id"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -414,48 +352,24 @@ async def get_campaign(id: int):
 async def register_campaign(body: RegisterCampaignRequest, x_api_key: str = Header(...)):
     verify_api_key(x_api_key)
 
-    project = _resolve_project(body.project, body.domain_used, body.reachinbox_campaign_id)
+    project = _resolve_project(body.project, body.domain_used)
     started = body.started_at.isoformat() if body.started_at else None
     if not started and body.status == "active":
         started = _now_iso()
 
     payload = {
-        "project":                project,
-        "reachinbox_server":      body.reachinbox_server,
-        "reachinbox_campaign_id": body.reachinbox_campaign_id,
-        "campaign_name":          body.campaign_name,
-        "niche":                  body.niche,
-        "domain_used":            body.domain_used,
-        "offer_type":             body.offer_type,
-        "leads_count":            body.leads_count,
-        "status":                 body.status,
-        "started_at":             started,
-        "metadata":               body.metadata,
+        "project":      project,
+        "campaign_name": body.campaign_name,
+        "niche":         body.niche,
+        "domain_used":   body.domain_used,
+        "offer_type":    body.offer_type,
+        "leads_count":   body.leads_count,
+        "status":        body.status,
+        "started_at":    started,
+        "metadata":      body.metadata,
     }
 
     db = get_db()
-
-    existing = None
-    if body.reachinbox_campaign_id:
-        res = (
-            db.table(PERF_TABLE)
-            .select("id")
-            .eq("project", project)
-            .eq("reachinbox_server", body.reachinbox_server)
-            .eq("reachinbox_campaign_id", body.reachinbox_campaign_id)
-            .execute()
-        )
-        existing = res.data[0] if res.data else None
-
-    if existing:
-        db.table(PERF_TABLE).update(payload).eq("id", existing["id"]).execute()
-        row = db.table(PERF_TABLE).select("*").eq("id", existing["id"]).execute().data[0]
-        return {
-            "status":           "success",
-            "action":           "updated",
-            "project_resolved": project,
-            "campaign":         _serialize_row(row),
-        }
 
     res = db.table(PERF_TABLE).insert(payload).execute()
     return {
@@ -517,10 +431,10 @@ async def attribute_event(id: int, body: AttributeRequest, x_api_key: str = Head
 async def patch_campaign(id: int, body: PatchCampaignRequest, x_api_key: str = Header(...)):
     verify_api_key(x_api_key)
 
-    if body.project is not None or body.reachinbox_server is not None:
+    if body.project is not None:
         raise HTTPException(
             status_code=422,
-            detail="project and reachinbox_server are immutable — cannot be changed via PATCH",
+            detail="project is immutable — cannot be changed via PATCH",
         )
 
     db = get_db()

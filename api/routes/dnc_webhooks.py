@@ -1,73 +1,36 @@
 """
-KJLE — DNC inbound webhooks (Phase 3)
+KJLE — DNC inbound webhooks
 File: api/routes/dnc_webhooks.py
 
 Routes (PREFIX /kjle/v1 added by main.py):
-  POST /dnc/webhooks/reachinbox?secret=<...>  — query-param secret auth
-                                                (constant-time compare)
-  POST /dnc/webhooks/suppression              — x-api-key auth; generic intake
+  POST /dnc/webhooks/suppression  — x-api-key auth; generic intake for any
+                                    empire app (DemoEnginez, CEz, VoiceDrop, etc.)
 
-Closes the DNC feedback loop: opt-out signals from ReachInbox (and any future
-empire app) flow automatically into KJLE's suppression list.
-
-ReachInbox auth model (per their docs at https://docs.reachinbox.ai/webhooks):
-  HTTPS only, NO request signing — URL secrecy IS the security boundary.
-  We require a ?secret=<REACHINBOX_WEBHOOK_SECRET> query parameter and compare
-  it constant-time against settings.REACHINBOX_WEBHOOK_SECRET. Both sides
-  must be non-empty (empty=empty is rejected). If the env var is unset, all
-  webhooks fail-closed with 401.
+Closes the DNC feedback loop: opt-out signals from any sending platform flow
+automatically into KJLE's suppression list.
 
 Internal helpers (private to this module):
   _add_phone_suppression()  — normalize, UPSERT dnc_suppressions, invalidate cache, audit
   _add_email_suppression()  — normalize, UPSERT email_suppressions, audit
-
-ReachInbox event canonicalization (defensive against schema variation):
-  unsubscribed   → suppress phone + email
-  bounced_hard   → suppress email only        (RI string: "Email bounced")
-  replied        → run reply_parser; suppress phone + email if unsubscribe match
-                                              (RI string: "Reply received")
-  complained     → suppress phone + email
-  wrong_person   → suppress email only        (RI string: "Lead wrong person")
-  not_interested → suppress email only        (RI string: "Lead not interested")
 """
 from __future__ import annotations
 
-import hmac
-import json
 import logging
 import os
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
-from ..config import settings
 from ..database import get_db
 from ..lib.phone_utils import normalize_phone
-from ..lib.reply_parser import is_unsubscribe_reply
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-# Canonical event types → known string variants we accept (case-insensitive,
-# whitespace-stripped — see _canonicalize_event). Add new vendor strings here.
-EVENT_TYPE_VARIANTS = {
-    "unsubscribed":   {"lead.unsubscribed", "unsubscribed", "lead_unsubscribed", "optout"},
-    "bounced_hard":   {"lead.bounced_hard", "hard_bounce", "bounced.hard",
-                       "Email bounced"},                                       # ReachInbox UI string
-    "replied":        {"lead.replied", "replied", "reply.received",
-                       "Reply received"},                                      # ReachInbox UI string
-    "complained":     {"lead.complained", "spam_complaint", "complaint", "lead.complained_spam"},
-    "wrong_person":   {"Lead wrong person", "wrong_person",                    # ReachInbox UI string
-                       "wrong.person", "lead.wrong_person"},
-    "not_interested": {"Lead not interested", "not_interested",                # ReachInbox UI string
-                       "lead.not_interested"},
-}
-
-# Auth shared with the rest of the codebase
 API_SECRET_KEY = os.environ.get("API_SECRET_KEY", "kjle-prod-2026-secret")
 
 
@@ -140,7 +103,7 @@ def _audit(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Suppression helpers (private, used by both webhook endpoints)
+# Suppression helpers (private, used by the webhook endpoint)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _add_phone_suppression(
@@ -238,221 +201,6 @@ async def _add_email_suppression(
                   "notes": notes, **(metadata or {})},
     )
     return {"added": True, "email_normalized": norm, "error": None}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ReachInbox webhook auth — query-param shared secret (constant-time compare)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _verify_query_secret(provided: Optional[str], expected: str) -> bool:
-    """
-    Constant-time comparison of the ?secret=... query param against the
-    configured shared secret. Both sides must be non-empty — fail-closed
-    when REACHINBOX_WEBHOOK_SECRET is unset (won't accidentally accept
-    empty=empty).
-    """
-    if not expected:
-        return False        # secret env var unset → fail-closed
-    if not provided:
-        return False        # query param missing or empty
-    try:
-        return hmac.compare_digest(expected, provided)
-    except Exception:
-        return False
-
-
-def _canonicalize_event(raw_event: str, body: dict) -> Optional[str]:
-    """Map a vendor event-type string to one of our canonical event names."""
-    if not raw_event:
-        return None
-    e = raw_event.strip().lower()
-
-    # Special case: "lead.bounced" qualifies as bounced_hard ONLY if
-    # bounce_type=hard appears in the payload. Soft bounces are ignored.
-    if e == "lead.bounced":
-        bt = (
-            (body.get("bounce_type")
-             or body.get("data", {}).get("bounce_type")
-             or "")
-            .strip().lower()
-        )
-        return "bounced_hard" if bt == "hard" else None
-
-    for canonical, variants in EVENT_TYPE_VARIANTS.items():
-        if e in {v.lower() for v in variants}:
-            return canonical
-    return None
-
-
-def _extract_phone_email(body: dict) -> tuple[Optional[str], Optional[str]]:
-    """Pull phone + email defensively from common payload locations."""
-    lead = body.get("lead") or {}
-    data = body.get("data") or {}
-    phone = lead.get("phone") or data.get("phone") or body.get("phone")
-    email = lead.get("email") or data.get("email") or body.get("email")
-    return phone, email
-
-
-def _extract_reply_text(body: dict) -> Optional[str]:
-    """
-    Pull reply text from a webhook payload, defensively across known shapes.
-    Mirrors _extract_phone_email's nested-path pattern: prefer nested 'reply.X'
-    first (some providers nest), then 'data.X' (ReachInbox's actual format),
-    then top-level (legacy / generic webhooks).
-    """
-    reply = body.get("reply") or {}
-    data  = body.get("data")  or {}
-    return (
-        reply.get("text")
-        or reply.get("body")
-        or data.get("reply_text")
-        or data.get("text")
-        or data.get("body")
-        or body.get("reply_text")
-        or body.get("text")
-        or body.get("body")
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# POST /dnc/webhooks/reachinbox
-# ─────────────────────────────────────────────────────────────────────────────
-
-@router.post("/dnc/webhooks/reachinbox")
-async def reachinbox_webhook(request: Request):
-    """
-    Inbound webhook from ReachInbox. Authenticated via ?secret=<...> query
-    param (constant-time compare against REACHINBOX_WEBHOOK_SECRET).
-
-    Example URL format:
-      https://kjle-api.onrender.com/kjle/v1/dnc/webhooks/reachinbox?secret=<REACHINBOX_WEBHOOK_SECRET>
-
-    Always returns 200 once the secret is verified — even on unknown event
-    types or missing data — so ReachInbox doesn't loop on retries. Detailed
-    diagnostics land in dnc_audit_log for postmortem.
-    """
-    body_bytes = await request.body()
-    provided_secret = request.query_params.get("secret")
-    expected_secret = settings.REACHINBOX_WEBHOOK_SECRET or ""
-
-    if not _verify_query_secret(provided_secret, expected_secret):
-        # Fail-closed. Log security event (no audit row — we don't know who sent this).
-        # Intentionally NOT logging the secret value or its length.
-        logger.warning(
-            f"dnc_webhooks: ReachInbox secret INVALID — provided_present={bool(provided_secret)}, "
-            f"secret_configured={bool(expected_secret)}, body_len={len(body_bytes)}"
-        )
-        raise HTTPException(status_code=401, detail="invalid_secret")
-
-    # Parse JSON manually (we already consumed the raw body above for body_len logging)
-    try:
-        body = json.loads(body_bytes.decode("utf-8") or "{}") if body_bytes else {}
-    except Exception as e:
-        logger.error(f"dnc_webhooks: ReachInbox payload not JSON: {e}")
-        _audit(phone=None, email=None, source="reachinbox", result="error",
-               error=f"payload_not_json: {e}")
-        return {"status": "received", "processed": False, "reason": "payload_not_json"}
-
-    raw_event = (
-        body.get("event")
-        or body.get("type")
-        or body.get("eventType")
-        or ""
-    )
-    canonical = _canonicalize_event(raw_event, body)
-    phone, email = _extract_phone_email(body)
-
-    # Unknown event type — record and ack (don't 500)
-    if canonical is None:
-        _audit(
-            phone=None, email=None, source="reachinbox",
-            result="webhook_unknown_event",
-            metadata={"raw_event": raw_event, "phone_present": bool(phone), "email_present": bool(email)},
-        )
-        return {"status": "received", "processed": False, "reason": "unknown_event_type", "raw_event": raw_event}
-
-    summary = {
-        "phone_added":   False,
-        "email_added":   False,
-        "reason":        f"reachinbox_{canonical}",
-        "canonical_event": canonical,
-    }
-
-    # Reason mapping for the suppression record
-    reason_text = {
-        "unsubscribed":   "reachinbox_unsubscribe",
-        "bounced_hard":   "reachinbox_bounced_hard",
-        "replied":        "reachinbox_replied_unsubscribe",
-        "complained":     "reachinbox_spam_complaint",
-        "wrong_person":   "reachinbox_wrong_person",
-        "not_interested": "reachinbox_not_interested",
-    }[canonical]
-
-    base_metadata = {"raw_event": raw_event, "canonical_event": canonical}
-
-    # Per-event handling
-    if canonical == "unsubscribed" or canonical == "complained":
-        if phone:
-            r = await _add_phone_suppression(phone, reason_text, "reachinbox",
-                                              metadata={**base_metadata})
-            summary["phone_added"] = bool(r.get("added"))
-        if email:
-            r = await _add_email_suppression(email, reason_text, "reachinbox",
-                                              metadata={**base_metadata})
-            summary["email_added"] = bool(r.get("added"))
-
-    elif canonical == "bounced_hard":
-        # Hard bounce only suppresses the email — phone is unaffected.
-        if email:
-            r = await _add_email_suppression(email, reason_text, "reachinbox",
-                                              metadata={**base_metadata})
-            summary["email_added"] = bool(r.get("added"))
-
-    elif canonical == "wrong_person" or canonical == "not_interested":
-        # Email-channel signals — recipient said "wrong person" or "not
-        # interested" via reply/feedback. Suppress email only; phone is a
-        # different channel with different consent posture, leave it alone.
-        if email:
-            r = await _add_email_suppression(email, reason_text, "reachinbox",
-                                              metadata={**base_metadata})
-            summary["email_added"] = bool(r.get("added"))
-        else:
-            # Defensive visibility: event arrived but we couldn't extract an
-            # email. Audit so we can spot ReachInbox payload-shape drift and
-            # adjust _extract_phone_email if needed.
-            _audit(phone=None, email=None, source="reachinbox",
-                   result="webhook_skipped",
-                   metadata={**base_metadata, "reason": "no_email_in_payload"})
-
-    elif canonical == "replied":
-        reply_text = _extract_reply_text(body) or ""
-        is_unsub, kw = is_unsubscribe_reply(reply_text)
-        summary["reply_text_present"] = bool(reply_text)
-        summary["matched_keyword"] = kw
-        if is_unsub:
-            md = {**base_metadata, "matched_keyword": kw, "reply_excerpt": reply_text[:200]}
-            if phone:
-                r = await _add_phone_suppression(phone, reason_text, "reachinbox",
-                                                  metadata=md)
-                summary["phone_added"] = bool(r.get("added"))
-            if email:
-                r = await _add_email_suppression(email, reason_text, "reachinbox",
-                                                  metadata=md)
-                summary["email_added"] = bool(r.get("added"))
-        else:
-            # Non-unsubscribe reply — log it for audit, don't suppress
-            _audit(phone=None, email=None, source="reachinbox",
-                   result="webhook_skipped",
-                   metadata={**base_metadata, "reason": "reply_no_unsubscribe_match",
-                             "reply_excerpt": reply_text[:200]})
-
-    suppressions_added = int(summary.get("phone_added", False)) + int(summary.get("email_added", False))
-    logger.info(
-        f"dnc_webhooks: ReachInbox event processed — type={canonical}, "
-        f"source=reachinbox, suppressions_added={suppressions_added}"
-    )
-
-    return {"status": "received", "processed": True, **summary}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

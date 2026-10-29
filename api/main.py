@@ -53,7 +53,6 @@ from .routes import webhooks
 from .routes import scheduler
 from .routes import admin_settings
 from .routes import commander
-from .routes import reachinbox
 from .routes import campaigns
 from .routes import dnc
 from .routes import dnc_channel
@@ -93,7 +92,6 @@ async def lifespan(app: FastAPI):
     logger.info(f"   Yelp          : {'✓ configured' if settings.YELP_API_KEY           else '✗ not set (Stage 2 Yelp disabled)'}")
     logger.info(f"   Outscraper    : {'✓ configured' if settings.OUTSCRAPER_API_KEY     else '✗ not set (Stage 3 disabled)'}")
     logger.info(f"   Firecrawl     : {'✓ configured' if settings.FIRECRAWL_API_KEY      else '✗ not set (Stage 4 disabled)'}")
-    logger.info(f"   ReachInbox    : {'✓ configured' if settings.REACHINBOX_API_KEY     else '✗ not set (RI export disabled)'}")
     logger.info(f"   Truelist      : {'✓ configured' if settings.TRUELIST_API_KEY       else '○ not set (use admin_settings table)'}")
     de_mode = "dedicated" if (settings.DEMOENGINEZ_SUPABASE_URL and settings.DEMOENGINEZ_SUPABASE_KEY) else "shared Supabase"
     vd_mode = "dedicated" if (settings.VOICEDROP_SUPABASE_URL   and settings.VOICEDROP_SUPABASE_KEY)   else "shared Supabase"
@@ -185,7 +183,6 @@ app.include_router(push_voicedrop.router,         prefix=PREFIX,                
 app.include_router(webhooks.router,               prefix=PREFIX,                  tags=["Webhooks"])
 app.include_router(scheduler.router,              prefix=PREFIX,                  tags=["Scheduler"])
 app.include_router(commander.router,              prefix=PREFIX,                  tags=["Commander"])
-app.include_router(reachinbox.router,             prefix=PREFIX,                  tags=["ReachInbox"])
 app.include_router(dnc.router,                    prefix=PREFIX,                  tags=["DNC"])
 app.include_router(dnc_channel.router,            prefix=PREFIX,                  tags=["DNC — Channel-Aware"])
 app.include_router(local_scraper_ingest.router,   prefix=PREFIX,                  tags=["Ingest — Local Scraper"])

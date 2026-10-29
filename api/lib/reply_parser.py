@@ -16,7 +16,7 @@ Two-tier matching:
     trap: "I'm interested, please don't stop sending" → must be False).
 
 Not auto-wired anywhere in Phase 3 — this helper exists so future code
-(e.g., a future ReachInbox reply webhook) can use it.
+(e.g., a future sender-platform reply webhook) can use it.
 """
 from __future__ import annotations
 
