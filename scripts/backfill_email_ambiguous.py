@@ -114,7 +114,7 @@ def run(dry_run: bool) -> None:
             chunk_num = i // CHUNK_SIZE + 1
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE leads SET email_ambiguous = true WHERE id = ANY(%s)",
+                    "UPDATE leads SET email_ambiguous = true WHERE id = ANY(%s::uuid[])",
                     (chunk,),
                 )
                 written = cur.rowcount
