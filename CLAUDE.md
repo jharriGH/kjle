@@ -439,3 +439,23 @@ This repo belongs to the KJ Empire (DevelopingRiches Inc, owner Jim Harris / jha
 - Decide-and-proceed. Cost-gate chargeable dispatches. Never echo secrets — pull keys from the Brain vault.
 - See ROADMAP.md for status.
 <!-- /KJE-ONBOARD-V1 -->
+
+## WORKING-DIRECTORY ISOLATION (2026-10-29, incident recovery)
+This is the Central repo (per this file's own onboarding section above) —
+it is read and written by every product's sessions, not one. Same
+exposure `jim-brain` had the day before two sessions collided in its bare
+checkout on 2026-10-27 (one `git stash`'d the other's uncommitted work to
+get a clean tree; the other session's commit silently no-op'd with
+"nothing to commit" — the only warning, and easy to miss).
+
+**Do not edit directly in this bare checkout.** Use a lane worktree
+instead, same convention as `kjwidgetz-api`'s `kjw-lane1..5` and
+`jim-brain`/`kje-mcp`/`complianceenginez`'s `-lane1`:
+```
+git worktree add ../kjle-lane2 -b lane2
+cd ../kjle-lane2
+```
+`kjle-lane1` already exists as a ready-to-use lane. Add `lane2`, `lane3`,
+etc. the same way whenever a second session needs to work here
+concurrently. Remove a lane once its branch is merged:
+`git worktree remove ../kjle-laneN`.
