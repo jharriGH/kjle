@@ -308,7 +308,7 @@ _TITLE_IS_REALTOR_PATTERN = (
 )
 
 _CONTACTS_ELIGIBLE_KNOWN_PARAMS = frozenset({
-    "niche_slug", "title_is_realtor", "state", "city",
+    "niche_slug", "title_is_realtor", "state", "city", "cities",
     "email_valid", "email_trust", "limit", "offset", "include_total",
 })
 
@@ -320,6 +320,7 @@ async def contacts_eligible_for_campaign(
     title_is_realtor: bool = Query(False, description="When true, restrict to realtor-ish titles via a regex match on title."),
     state: Optional[str] = Query(None, description="Exact US state abbreviation"),
     city: Optional[str] = Query(None, description="Single or comma-separated city list; ILIKE ANY match"),
+    cities: Optional[str] = Query(None, description="Comma-separated city list; OR-ed with `city` when both present. e.g. cities=Irvine,Long Beach,Anaheim"),
     email_valid: bool = Query(True, description="Restrict to contacts.email_valid = this value"),
     email_trust: Optional[str] = Query(None, description="Single or comma-separated: valid|catch_all|role|unconfirmable|invalid"),
     limit: int = Query(500, ge=1, le=2000),
@@ -344,12 +345,15 @@ async def contacts_eligible_for_campaign(
             q = q.eq("is_realtor", True)
         if state:
             q = q.eq("state", state.upper())
+        _all_cities: list = []
         if city:
-            cities = [c.strip() for c in city.split(",") if c.strip()]
-            if len(cities) == 1:
-                q = q.ilike("city", cities[0])
-            elif len(cities) > 1:
-                q = q.or_(",".join(f"city.ilike.{c}" for c in cities))
+            _all_cities += [c.strip() for c in city.split(",") if c.strip()]
+        if cities:
+            _all_cities += [c.strip() for c in cities.split(",") if c.strip()]
+        if len(_all_cities) == 1:
+            q = q.ilike("city", _all_cities[0])
+        elif len(_all_cities) > 1:
+            q = q.or_(",".join(f"city.ilike.{c}" for c in _all_cities))
         q = q.eq("email_valid", email_valid)
         if email_trust:
             trusts = [t.strip() for t in email_trust.split(",") if t.strip()]
