@@ -299,7 +299,7 @@ async def list_contacts(
 
 _ELIGIBLE_SELECT_COLS = (
     "id, first_name, last_name, title, company, primary_email, "
-    "email_provider, email_trust, city, state"
+    "email_provider, email_trust, city, state, county"
 )
 
 _TITLE_IS_REALTOR_PATTERN = (
@@ -310,6 +310,7 @@ _TITLE_IS_REALTOR_PATTERN = (
 _CONTACTS_ELIGIBLE_KNOWN_PARAMS = frozenset({
     "niche_slug", "title_is_realtor", "state", "city", "cities",
     "email_valid", "email_trust", "limit", "offset", "include_total",
+    "include_ambiguous", "county",
 })
 
 
@@ -321,8 +322,10 @@ async def contacts_eligible_for_campaign(
     state: Optional[str] = Query(None, description="Exact US state abbreviation"),
     city: Optional[str] = Query(None, description="Single or comma-separated city list; ILIKE ANY match"),
     cities: Optional[str] = Query(None, description="Comma-separated city list; OR-ed with `city` when both present. e.g. cities=Irvine,Long Beach,Anaheim"),
+    county: Optional[str] = Query(None, description="Single or comma-separated county list; case-insensitive OR match against contacts.county. e.g. county=los angeles,orange"),
     email_valid: bool = Query(True, description="Restrict to contacts.email_valid = this value"),
     email_trust: Optional[str] = Query(None, description="Single or comma-separated: valid|catch_all|role|unconfirmable|invalid"),
+    include_ambiguous: bool = Query(False, description="When false (default), excludes contacts where email_ambiguous=true (free-mail on multiple companies or obviously-wrong domain)."),
     limit: int = Query(500, ge=1, le=2000),
     offset: int = Query(0, ge=0),
     include_total: bool = Query(False, description="When true, also compute an estimated total (extra DB round-trip on this 1.7M-row table)."),
@@ -343,6 +346,8 @@ async def contacts_eligible_for_campaign(
             # title ~* regex over the full 1.69M-row table had no index support
             # and was the root cause of the deep-offset statement timeouts.
             q = q.eq("is_realtor", True)
+        if not include_ambiguous:
+            q = q.eq("email_ambiguous", False)
         if state:
             q = q.eq("state", state.upper())
         _all_cities: list = []
@@ -354,6 +359,12 @@ async def contacts_eligible_for_campaign(
             q = q.ilike("city", _all_cities[0])
         elif len(_all_cities) > 1:
             q = q.or_(",".join(f"city.ilike.{c}" for c in _all_cities))
+        if county:
+            _counties = [c.strip() for c in county.split(",") if c.strip()]
+            if len(_counties) == 1:
+                q = q.ilike("county", _counties[0])
+            elif len(_counties) > 1:
+                q = q.or_(",".join(f"county.ilike.{c}" for c in _counties))
         q = q.eq("email_valid", email_valid)
         if email_trust:
             trusts = [t.strip() for t in email_trust.split(",") if t.strip()]
@@ -431,6 +442,7 @@ async def contacts_eligible_for_campaign(
             "email_trust": r.get("email_trust"),
             "city": r.get("city"),
             "state": r.get("state"),
+            "county": r.get("county"),
         }
         for r in rows
     ]
