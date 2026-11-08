@@ -136,6 +136,53 @@ def _valid_email(raw: str) -> bool:
     return "@" in (raw or "") and "." in (raw or "").split("@")[-1]
 
 
+_FREE_DOMAINS: frozenset = frozenset({
+    "gmail.com", "googlemail.com", "yahoo.com", "ymail.com", "rocketmail.com",
+    "hotmail.com", "hotmail.co.uk", "hotmail.fr", "hotmail.de", "hotmail.es",
+    "outlook.com", "outlook.co.uk", "live.com", "live.co.uk", "live.ca",
+    "live.fr", "live.de", "msn.com", "aol.com", "icloud.com", "me.com",
+    "comcast.net", "verizon.net", "sbcglobal.net", "att.net",
+    "yahoo.co.uk", "yahoo.fr", "yahoo.de", "yahoo.es", "yahoo.it",
+    "yahoo.com.au", "yahoo.ca", "protonmail.com", "protonmail.ch", "pm.me",
+})
+
+
+def _domain_to_name(domain: str) -> Optional[str]:
+    """Strip www, drop TLD, replace separators with spaces, Title Case."""
+    domain = domain.lower().strip()
+    if domain.startswith("www."):
+        domain = domain[4:]
+    base = domain.rsplit(".", 1)[0]
+    name = re.sub(r"[-_.]", " ", base).strip()
+    return name.title() if name else None
+
+
+def _derive_business_name(website: Optional[str], email: Optional[str]) -> Optional[str]:
+    """
+    Derive a business_name from website or email when the source is blank.
+    Priority: (a) website domain  (b) email domain if not freemail
+              (c) email local-part  (d) None → caller skips the row.
+    """
+    if website:
+        m = re.search(r"https?://([^/?#:]+)", website)
+        raw_host = m.group(1) if m else website
+        name = _domain_to_name(raw_host)
+        if name:
+            return name
+
+    if email and "@" in email:
+        domain = email.split("@", 1)[1].lower().strip()
+        if domain not in _FREE_DOMAINS:
+            name = _domain_to_name(domain)
+            if name:
+                return name
+        local = re.sub(r"[-_.]", " ", email.split("@", 1)[0]).strip()
+        if local:
+            return local.title()
+
+    return None
+
+
 def _compute_fingerprint(phone: str, business_name: str) -> Optional[str]:
     """Canonical fingerprint: sha256(phone10:normname)[:32]. Returns None if no valid 10-digit phone."""
     digits = re.sub(r"\D", "", phone or "")
@@ -365,6 +412,19 @@ async def import_csv(upload_id: str, opts: ImportOptions, db=Depends(get_db)):
 
             # ── strip empty strings ───────────────────────────────────────
             lead = {k: v for k, v in lead.items() if v != "" and v is not None}
+
+            # ── derive business_name when source is blank ─────────────────
+            if not lead.get("business_name"):
+                derived = _derive_business_name(lead.get("website"), lead.get("email"))
+                if derived:
+                    lead["business_name"] = derived
+                    fp = _compute_fingerprint(clean_phone, derived)
+                else:
+                    logger.info(
+                        f"[csv-import] row {row_num}: no derivable business_name — skipping"
+                    )
+                    skipped_invalid += 1
+                    continue
 
             # ── pipeline-consistent fields ────────────────────────────────
             lead["fingerprint"] = fp  # may be None for un-parseable phones
