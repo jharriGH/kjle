@@ -442,26 +442,47 @@ async def import_csv(upload_id: str, opts: ImportOptions, db=Depends(get_db)):
             logger.error(f"[csv-import] Failed row {row_num}: {e}")
             failed_rows.append({"row": row_num, "data": row, "reason": str(e)})
 
-    # ── bulk insert: one round-trip per 500 rows instead of one per row ─────
-    # (per-row inserts were ~100ms each → ~51s/500 rows; bulk is <1s/500 rows)
+    # ── bulk upsert: ON CONFLICT (fingerprint) DO NOTHING ────────────────────
+    # Already-present rows are silently skipped; only genuinely new rows land.
+    # res.data contains only inserted rows, so len(res.data) = actual inserts
+    # and len(batch) - len(res.data) = DB-level duplicate skips.
     BULK_BATCH = 500
     for i in range(0, len(to_insert), BULK_BATCH):
         pair_batch = to_insert[i:i + BULK_BATCH]
         lead_batch = [lead for (_rn, lead) in pair_batch]
         try:
-            db.table("leads").insert(lead_batch).execute()
-            imported += len(lead_batch)
+            res = db.table("leads").upsert(
+                lead_batch, on_conflict="fingerprint", ignore_duplicates=True
+            ).execute()
+            n_inserted = len(res.data) if res.data else 0
+            imported += n_inserted
+            skipped_duplicate += len(lead_batch) - n_inserted
         except Exception as bulk_err:
             # One bad row shouldn't sink the batch — fall back to per-row for this batch only
-            logger.warning(f"[csv-import] Bulk insert failed at offset {i}, retrying per-row: {bulk_err}")
+            logger.warning(f"[csv-import] Bulk upsert failed at offset {i}, retrying per-row: {bulk_err}")
             for rnum, lead in pair_batch:
                 try:
-                    db.table("leads").insert(lead).execute()
-                    imported += 1
+                    res = db.table("leads").upsert(
+                        [lead], on_conflict="fingerprint", ignore_duplicates=True
+                    ).execute()
+                    if res.data:
+                        imported += 1
+                    else:
+                        skipped_duplicate += 1
                 except Exception as row_err:
-                    failed += 1
-                    logger.error(f"[csv-import] Failed row {rnum} insert: {row_err}")
-                    failed_rows.append({"row": rnum, "data": lead, "reason": str(row_err)})
+                    err_str = str(row_err)
+                    if "23505" in err_str or "duplicate key" in err_str.lower():
+                        skipped_duplicate += 1
+                    else:
+                        failed += 1
+                        logger.error(f"[csv-import] Failed row {rnum} insert: {row_err}")
+                        failed_rows.append({"row": rnum, "data": lead, "reason": str(row_err)})
+
+    logger.info(
+        f"[csv-import] {filename}: {imported} inserted, "
+        f"{skipped_duplicate} skipped-duplicate, "
+        f"{skipped_invalid} skipped-invalid"
+    )
 
     total_rows = len(rows)
     skipped_total = skipped_duplicate + skipped_invalid
