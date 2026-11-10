@@ -354,7 +354,7 @@ async def job_classify_segments() -> dict:
     these chunks too. See the landmine breadcrumb in segments_engine.py.
     """
     job_name = "classify_segments"
-    CHUNK_SIZE = int(os.getenv("CLASSIFY_CHUNK_SIZE", "250"))
+    CHUNK_SIZE = min(int(os.getenv("CLASSIFY_CHUNK_SIZE", "2000")), 2000)
     logger.info(f"[{job_name}] Starting (chunked-UPDATE mode, chunk={CHUNK_SIZE})...")
     t_start = time.monotonic()
 
@@ -413,8 +413,11 @@ async def job_classify_segments() -> dict:
                 upd = upd.gte("id", first_id).lte("id", last_id)
                 upd.execute()
             except Exception as e:
-                logger.error(f"[{job_name}] {label.upper()} UPDATE chunk {chunk_idx} failed: {e}")
-                raise
+                logger.error(f"[{job_name}] {label.upper()} UPDATE chunk {chunk_idx} failed (skipping): {e}")
+                last_id_cursor = last_id  # advance cursor so the loop doesn't stall
+                chunk_idx += 1
+                await asyncio.sleep(0)
+                continue
             total += len(rows)
             last_id_cursor = last_id
             chunk_idx += 1
@@ -1130,38 +1133,58 @@ async def job_email_clean_nightly() -> dict:
             logger.info(f"[{job_name}] No more leads (new or reval) after {i} iterations — stopping early")
             break
         selector_total_returned += len(leads)
-        try:
-            r = await ec_submit_batch(
-                db, api_key, leads,
-                submitted_by="nightly_cron",
-                notes=f"nightly_{i+1}_of_{max_batches}",
-            )
-            r["index"] = i
-            submitted_batches.append(r)
-            logger.info(
-                f"[{job_name}] Batch {i+1}/{max_batches}: submitted={r.get('submitted')}, "
-                f"batch_id={r.get('batch_id')}"
-            )
-        except Exception as e:
-            submit_exception_count += 1
-            logger.error(
-                f"[{job_name}] iteration={i} ec_submit_batch raised: "
-                f"{type(e).__name__}: {e}",
-                exc_info=True,
-            )
-            submitted_batches.append({"index": i, "submitted": 0, "error": str(e)})
-            break  # don't hammer Truelist if first one failed
+        # Chunk into slices of at most 2000 — Truelist submissions above this size
+        # have raised in production. Each chunk becomes its own Truelist batch so
+        # one bad chunk never aborts the rest.
+        TRUELIST_CHUNK = 2000
+        lead_chunks = [leads[j:j + TRUELIST_CHUNK] for j in range(0, len(leads), TRUELIST_CHUNK)]
+        logger.info(
+            f"[{job_name}] iteration={i} split into {len(lead_chunks)} chunk(s) "
+            f"of max {TRUELIST_CHUNK} (total_leads={len(leads)})"
+        )
+        for ci, chunk in enumerate(lead_chunks):
+            try:
+                r = await ec_submit_batch(
+                    db, api_key, chunk,
+                    submitted_by="nightly_cron",
+                    notes=f"nightly_{i+1}_of_{max_batches}_chunk_{ci+1}_of_{len(lead_chunks)}",
+                )
+                r["index"] = i
+                r["chunk"] = ci
+                submitted_batches.append(r)
+                logger.info(
+                    f"[{job_name}] Batch {i+1}/{max_batches} chunk {ci+1}/{len(lead_chunks)}: "
+                    f"submitted={r.get('submitted')}, batch_id={r.get('batch_id')}"
+                )
+            except Exception as e:
+                submit_exception_count += 1
+                logger.error(
+                    f"[{job_name}] iteration={i} chunk={ci} ec_submit_batch raised: "
+                    f"{type(e).__name__}: {e}",
+                    exc_info=True,
+                )
+                submitted_batches.append({"index": i, "chunk": ci, "submitted": 0, "error": str(e)})
+                # log and continue — one bad chunk must not abort remaining chunks
 
     duration = time.monotonic() - t_start
     total_emails = sum((b.get("submitted") or 0) for b in submitted_batches)
     any_submitted = any(b.get("submitted", 0) > 0 for b in submitted_batches)
-    if any_submitted:
+    batches_ok = len([b for b in submitted_batches if b.get("submitted", 0) > 0])
+    if any_submitted and submit_exception_count == 0:
         notes = (
-            f"batches_submitted={len([b for b in submitted_batches if b.get('submitted', 0) > 0])}, "
+            f"batches_submitted={batches_ok}, "
             f"total_emails={total_emails}, "
             f"batch_ids={[b.get('batch_id') for b in submitted_batches if b.get('batch_id')]}"
         )
         status = "success"
+    elif any_submitted and submit_exception_count > 0:
+        # Some chunks succeeded, some failed — partial is not a full failure.
+        notes = (
+            f"partial: batches_submitted={batches_ok}, total_emails={total_emails}, "
+            f"failed_chunks={submit_exception_count}, "
+            f"batch_ids={[b.get('batch_id') for b in submitted_batches if b.get('batch_id')]}"
+        )
+        status = "partial"
     elif selector_total_returned == 0:
         # Select returned [] on iteration 0 — nothing to clean, not a failure.
         notes = "no_leads_available (new+reval selectors both returned 0 on iteration 0)"
@@ -1176,7 +1199,7 @@ async def job_email_clean_nightly() -> dict:
         )
         status = "success"
     else:
-        # Selector found leads and actual submit exceptions occurred (HTTP 4xx/5xx or raises).
+        # Selector found leads and all submit chunks raised.
         notes = (
             f"selector returned {selector_total_returned} leads but all "
             f"{submit_exception_count} submit attempts raised — see logs for exception details"
