@@ -7,6 +7,7 @@ import csv
 import hashlib
 import io
 import logging
+import os
 import re
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -214,6 +215,10 @@ def _parse_csv_bytes(content: bytes) -> tuple[List[str], List[dict]]:
 @router.post("/csv/upload")
 async def upload_csv(file: UploadFile = File(...), db=Depends(get_db)):
     """Upload a CSV file, preview first 5 rows, return suggested field mappings."""
+
+    if os.getenv("CSV_INGEST_ENABLED", "true").lower() in {"false", "0", "no", "off"}:
+        logger.info("csv ingest paused via CSV_INGEST_ENABLED")
+        return {"status": "ingestion_paused", "rows_processed": 0}
 
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only .csv files are accepted.")
