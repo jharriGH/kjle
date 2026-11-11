@@ -84,7 +84,11 @@ def _purge_expired_uploads(db) -> None:
 def _store_upload(db, upload_id: str, data: dict) -> None:
     """Persist an upload to the shared Supabase store so any worker can read it."""
     _purge_expired_uploads(db)
-    db.table("csv_uploads").insert({"upload_id": upload_id, "payload": data}).execute()
+    db.table("csv_uploads").insert({
+        "upload_id":  upload_id,
+        "payload":    data,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }).execute()
 
 
 def _fetch_upload(db, upload_id: str) -> Optional[dict]:
@@ -234,12 +238,16 @@ async def upload_csv(file: UploadFile = File(...), db=Depends(get_db)):
     preview = rows[:PREVIEW_ROWS]
     suggested = _suggest_mappings(headers)
 
-    _store_upload(db, upload_id, {
-        "filename": file.filename,
-        "headers": headers,
-        "rows": rows,
-        "uploaded_at": datetime.now(timezone.utc).isoformat(),
-    })
+    try:
+        _store_upload(db, upload_id, {
+            "filename": file.filename,
+            "headers": headers,
+            "rows": rows,
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        logger.warning(f"[csv-import] csv_uploads insert failed — upload not stored: {e}")
+        raise HTTPException(status_code=503, detail="upload_store_unavailable: could not persist upload session")
 
     return {
         "upload_id": upload_id,

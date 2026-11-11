@@ -167,6 +167,9 @@ def _audit(
     error: Optional[str] = None,
     metadata: Optional[dict] = None,
 ) -> None:
+    # Coerce empty/blank uuid fields to None — Postgres rejects "" as a UUID (22P02).
+    if not (requesting_lead_id or "").strip():
+        requesting_lead_id = None
     try:
         db = get_db()
         db.table("dnc_audit_log").insert({
@@ -182,7 +185,7 @@ def _audit(
         }).execute()
     except Exception as e:
         # Auditing must never break the request path.
-        logger.error(f"dnc: audit insert failed: {e}")
+        logger.warning(f"dnc: audit insert failed: {e}")
 
 
 def _serialize_response(
