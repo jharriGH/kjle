@@ -309,8 +309,18 @@ _TITLE_IS_REALTOR_PATTERN = (
 
 _CONTACTS_ELIGIBLE_KNOWN_PARAMS = frozenset({
     "niche_slug", "title_is_realtor", "state", "city", "cities",
-    "email_valid", "email_trust", "limit", "offset", "include_total",
+    "email_valid", "email_status", "email_trust", "limit", "offset", "include_total",
     "include_ambiguous", "county",
+})
+
+_CONSUMER_DOMAINS = frozenset({
+    "gmail.com", "googlemail.com",
+    "yahoo.com", "ymail.com", "aol.com", "rocketmail.com", "yahoo.co.uk", "yahoo.ca",
+    "hotmail.com", "outlook.com", "live.com", "msn.com",
+    "hotmail.co.uk", "outlook.co.uk", "live.co.uk", "hotmail.fr",
+    "icloud.com", "me.com", "mac.com",
+    "comcast.net", "sbcglobal.net", "att.net", "verizon.net",
+    "bellsouth.net", "cox.net",
 })
 
 
@@ -323,7 +333,8 @@ async def contacts_eligible_for_campaign(
     city: Optional[str] = Query(None, description="Single or comma-separated city list; ILIKE ANY match"),
     cities: Optional[str] = Query(None, description="Comma-separated city list; OR-ed with `city` when both present. e.g. cities=Irvine,Long Beach,Anaheim"),
     county: Optional[str] = Query(None, description="Single or comma-separated county list; case-insensitive OR match against contacts.county. e.g. county=los angeles,orange"),
-    email_valid: bool = Query(True, description="Restrict to contacts.email_valid = this value"),
+    email_status: Optional[str] = Query(None, description="valid|invalid|unknown — when passed, takes precedence over email_valid (unknown rows have email_valid IS NULL so email_valid alone can't reach them)"),
+    email_valid: bool = Query(True, description="Restrict to contacts.email_valid = this value (ignored when email_status is passed)"),
     email_trust: Optional[str] = Query(None, description="Single or comma-separated: valid|catch_all|role|unconfirmable|invalid"),
     include_ambiguous: bool = Query(False, description="When false (default), excludes contacts where email_ambiguous=true (free-mail on multiple companies or obviously-wrong domain)."),
     limit: int = Query(500, ge=1, le=2000),
@@ -365,7 +376,12 @@ async def contacts_eligible_for_campaign(
                 q = q.ilike("county", _counties[0])
             elif len(_counties) > 1:
                 q = q.or_(",".join(f"county.ilike.{c}" for c in _counties))
-        q = q.eq("email_valid", email_valid)
+        # email_status takes precedence: unknown rows have email_valid IS NULL so
+        # the boolean filter alone silently excludes them even when explicitly requested.
+        if email_status:
+            q = q.eq("email_status", email_status)
+        else:
+            q = q.eq("email_valid", email_valid)
         if email_trust:
             trusts = [t.strip() for t in email_trust.split(",") if t.strip()]
             if len(trusts) == 1:
@@ -455,3 +471,83 @@ async def contacts_eligible_for_campaign(
         "contacts": contacts_out,
         "skipped_filters": skipped_filters,
     }
+
+
+# ─────────────────────────────────────────────────
+# POST /kjle/v1/contacts/queue-reverify-business-domain
+# Re-queue CA realtor business-domain 'valid' contacts for TrueList re-verification.
+# Clears email_cleaned_at + email_truelist_batch_id; clean_national_realtors.py picks
+# them up on its next cron run. Consumer webmail excluded by domain suffix.
+# ─────────────────────────────────────────────────
+
+@router.post("/contacts/queue-reverify-business-domain")
+async def queue_reverify_business_domain(
+    dry_run: bool = Query(False, description="When true, count eligible contacts without updating"),
+    x_api_key: str = Header(...),
+):
+    """Re-queue CA realtor business-domain valid contacts for fresh TrueList verification.
+
+    Scope: is_realtor=true, state='CA', email_valid=true, email_trust='valid',
+    primary_email domain NOT in consumer/ISP webmail list (gmail/yahoo/aol/hotmail/
+    outlook/icloud/me/live/msn/comcast/sbcglobal/att/verizon/bellsouth/cox).
+
+    Action (dry_run=false): clears email_cleaned_at + email_truelist_batch_id so
+    clean_national_realtors.py picks them up on its next cron run. Contacts currently
+    stamped pending_batch (email_status='pending_batch') are skipped — already in-flight.
+    Already-re-queued contacts (email_cleaned_at IS NULL) are skipped — idempotent.
+    """
+    verify_api_key(x_api_key)
+    db = get_db()
+
+    target_ids: List[str] = []
+    _PAGE = 1000
+    _offset = 0
+    while True:
+        try:
+            rows = (
+                db.table("contacts")
+                .select("id, primary_email, email_status, email_cleaned_at")
+                .eq("is_realtor", True)
+                .eq("state", "CA")
+                .eq("email_valid", True)
+                .eq("email_trust", "valid")
+                .not_.is_("primary_email", "null")
+                .range(_offset, _offset + _PAGE - 1)
+                .execute()
+                .data or []
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"contact_fetch_failed: {exc}")
+
+        for r in rows:
+            if r.get("email_status") == "pending_batch":
+                continue
+            if r.get("email_cleaned_at") is None:
+                continue  # already re-queued or never cleaned — skip
+            em = (r.get("primary_email") or "").lower()
+            domain = em.split("@", 1)[1] if "@" in em else ""
+            if not domain or domain in _CONSUMER_DOMAINS:
+                continue
+            target_ids.append(r["id"])
+
+        if len(rows) < _PAGE:
+            break
+        _offset += _PAGE
+
+    if dry_run:
+        return {"eligible": len(target_ids), "queued": 0, "dry_run": True}
+
+    _CHUNK = 100
+    queued = 0
+    for i in range(0, len(target_ids), _CHUNK):
+        chunk = target_ids[i:i + _CHUNK]
+        try:
+            db.table("contacts").update({
+                "email_cleaned_at": None,
+                "email_truelist_batch_id": None,
+            }).in_("id", chunk).execute()
+            queued += len(chunk)
+        except Exception as exc:
+            _logger.error(f"[queue_reverify] chunk update failed at offset {i}: {exc}")
+
+    return {"queued": queued, "dry_run": False}
