@@ -120,7 +120,10 @@ AXE_SCAN_NIGHTLY_MAX_SECONDS = 300     # 5-minute ceiling (OFFSET makes this fas
 AXE_SCAN_FETCH_CHUNK      = 2_000   # leads fetched per chunk
 
 # Provider classify nightly — TIER-1 string-match, no DNS
-PROVIDER_CLASSIFY_BATCH_SIZE   = 20_000   # rows per SELECT (bounded)
+# Reduced from 20k to 5k: each SELECT page must finish within PostgREST's
+# 30s statement timeout. With idx_leads_provider_classify_candidate the scan
+# is fast, but the safety buffer prevents 57014 on cold-cache planner runs.
+PROVIDER_CLASSIFY_BATCH_SIZE   = 5_000    # rows per SELECT (bounded)
 PROVIDER_CLASSIFY_UPDATE_CHUNK = 500      # IDs per UPDATE .in_() call
 PROVIDER_CLASSIFY_MAX_ITER     = 20       # iteration guard (~400k rows max)
 
@@ -3881,6 +3884,126 @@ async def job_pipeline_watchdog_digest():
         raise
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# job_tz_backfill_nightly — drain leads.timezone NULL rows
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def job_tz_backfill_nightly() -> dict:
+    """
+    Drain leads.timezone = NULL for active US leads using tz_backfill.
+    Runs until the chunk returns assigned==0 (fully drained) or hits a
+    10-minute time cap. Idempotent — safe to run repeatedly.
+    """
+    from ..lib.tz_backfill import run_tz_backfill_chunk
+
+    job_name = "tz_backfill_nightly"
+    logger.info(f"[{job_name}] Starting...")
+    t_start = time.monotonic()
+    max_seconds = 600.0  # 10-minute cap
+    db = get_db()
+
+    total_assigned = 0
+    total_skipped  = 0
+    chunks         = 0
+
+    while True:
+        if time.monotonic() - t_start >= max_seconds:
+            logger.info(f"[{job_name}] Time cap reached — stopping (assigned={total_assigned})")
+            break
+        result = run_tz_backfill_chunk(db, chunk_size=20_000)
+        total_assigned += result.get("assigned", 0)
+        total_skipped  += result.get("skipped", 0)
+        chunks         += 1
+        if result.get("assigned", 0) == 0:
+            logger.info(f"[{job_name}] No more rows to fill — done")
+            break
+
+    elapsed = time.monotonic() - t_start
+    summary = (
+        f"tz_backfill complete: assigned={total_assigned}, "
+        f"skipped={total_skipped}, chunks={chunks}, elapsed={elapsed:.1f}s"
+    )
+    logger.info(f"[{job_name}] {summary}")
+    await _log_job(job_name, leads_processed=total_assigned, duration_seconds=elapsed,
+                   status="success", notes=summary)
+    return {"job": job_name, "assigned": total_assigned, "skipped": total_skipped, "elapsed_seconds": round(elapsed, 1)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# job_refresh_leads_email_stats — write leads email metrics to stats_cache
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def job_refresh_leads_email_stats() -> dict:
+    """
+    Write leads email-clean throughput/backlog stats into stats_cache so the
+    job_heartbeat.py probe can read from cache instead of running a full-table
+    COUNT on 1.26M rows every 15 minutes (was up to 200s per run).
+    Keys written:
+      'leads_email_clean_stats' — {throughput_1440m, backlog, last_output_at}
+    """
+    job_name = "refresh_leads_email_stats"
+    db = get_db()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    cutoff_1440 = (datetime.now(timezone.utc) - timedelta(minutes=1440)).isoformat()
+    cutoff_60   = (datetime.now(timezone.utc) - timedelta(minutes=60)).isoformat()
+
+    try:
+        # Build stats using multiple small targeted queries rather than one
+        # monster aggregate. Each query uses existing partial indexes.
+        rows_1440 = (
+            db.table("leads")
+            .select("id", count="exact")
+            .not_.is_("email", "null").neq("email", "")
+            .gt("email_cleaned_at", cutoff_1440)
+            .limit(1)
+            .execute()
+        )
+        throughput_1440 = rows_1440.count or 0
+
+        rows_60 = (
+            db.table("leads")
+            .select("id", count="exact")
+            .not_.is_("email", "null").neq("email", "")
+            .gt("email_cleaned_at", cutoff_60)
+            .limit(1)
+            .execute()
+        )
+        throughput_60 = rows_60.count or 0
+
+        # last_output_at: most recent email_cleaned_at
+        last_rows = (
+            db.table("leads")
+            .select("email_cleaned_at")
+            .not_.is_("email_cleaned_at", "null")
+            .order("email_cleaned_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        last_output_at = (last_rows.data or [{}])[0].get("email_cleaned_at")
+
+        stats_data = {
+            "throughput_1440m": throughput_1440,
+            "throughput_60m":   throughput_60,
+            "last_output_at":   last_output_at,
+            "refreshed_at":     now_iso,
+        }
+
+        db.table("stats_cache").upsert(
+            {"key": "leads_email_clean_stats", "data": stats_data, "refreshed_at": now_iso},
+            on_conflict="key",
+        ).execute()
+
+        logger.info(
+            f"[{job_name}] updated stats_cache: throughput_1440={throughput_1440}, "
+            f"throughput_60={throughput_60}"
+        )
+        return {"job": job_name, "status": "ok", **stats_data}
+    except Exception as exc:
+        logger.error(f"[{job_name}] failed: {exc}", exc_info=True)
+        return {"job": job_name, "status": "error", "error": str(exc)[:200]}
+
+
 JOB_FUNCTIONS = {
     "classify_segments":    job_classify_segments,
     "enrich_stage1":        job_enrich_stage1,
@@ -4148,6 +4271,37 @@ def setup_scheduler() -> AsyncIOScheduler:
         name="Pipeline Health Digest (daily 08:45 America/Los_Angeles)",
         replace_existing=True,
         misfire_grace_time=1800,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Job 20: tz_backfill_nightly — daily at 05:00 UTC
+    # Drains leads.timezone=NULL for active US leads. Runs between axe_scan
+    # (04:00) and website_audit (05:30); 10-min cap so it finishes well clear.
+    # Idempotent: becomes a no-op once all rows are filled.
+    scheduler.add_job(
+        job_tz_backfill_nightly,
+        trigger=CronTrigger(hour=5, minute=0),
+        id="tz_backfill_nightly",
+        name="Nightly Timezone Backfill",
+        replace_existing=True,
+        misfire_grace_time=1800,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Job 21: refresh_leads_email_stats — every 25 minutes
+    # Writes leads email-clean throughput/backlog into stats_cache so the
+    # job_heartbeat.py probe_leads_nightly_clean can read cached metrics
+    # instead of running a full-table COUNT (was up to 200s).
+    # 25-min interval fits between the 30-min email_clean_poll_batches runs.
+    scheduler.add_job(
+        job_refresh_leads_email_stats,
+        trigger=IntervalTrigger(minutes=25),
+        id="refresh_leads_email_stats",
+        name="Refresh Leads Email Stats Cache (25min)",
+        replace_existing=True,
+        misfire_grace_time=300,
         max_instances=1,
         coalesce=True,
     )

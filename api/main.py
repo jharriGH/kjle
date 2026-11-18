@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import settings
 from .database import init_db
 from .notify import notify, NotifyRequest
+from .lib.startup_migrations import run_startup_migrations
 
 
 # ── Empire-wide brain key auth (shared across all KJ services) ────────────────
@@ -71,6 +72,7 @@ from .routes import campaign_prep
 from .routes import contacts
 from .routes import system_health
 from .routes import health_watchdog
+from .routes import outreach_contract
 from .routes.scheduler import setup_scheduler
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -88,6 +90,10 @@ async def lifespan(app: FastAPI):
 
     await init_db()
     logger.info("   Database      : ✓ Supabase client initialized")
+
+    # Idempotent DDL migrations (signals columns, indexes, idempotency table)
+    run_startup_migrations()
+    logger.info("   Migrations    : ✓ startup DDL migrations complete")
 
     logger.info(f"   Yelp          : {'✓ configured' if settings.YELP_API_KEY           else '✗ not set (Stage 2 Yelp disabled)'}")
     logger.info(f"   Outscraper    : {'✓ configured' if settings.OUTSCRAPER_API_KEY     else '✗ not set (Stage 3 disabled)'}")
@@ -183,6 +189,7 @@ app.include_router(push_voicedrop.router,         prefix=PREFIX,                
 app.include_router(webhooks.router,               prefix=PREFIX,                  tags=["Webhooks"])
 app.include_router(scheduler.router,              prefix=PREFIX,                  tags=["Scheduler"])
 app.include_router(commander.router,              prefix=PREFIX,                  tags=["Commander"])
+app.include_router(outreach_contract.router,      prefix=PREFIX,                  tags=["Outreach Contract v1"])
 app.include_router(dnc.router,                    prefix=PREFIX,                  tags=["DNC"])
 app.include_router(dnc_channel.router,            prefix=PREFIX,                  tags=["DNC — Channel-Aware"])
 app.include_router(local_scraper_ingest.router,   prefix=PREFIX,                  tags=["Ingest — Local Scraper"])

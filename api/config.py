@@ -13,6 +13,11 @@ class Settings(BaseSettings):
     SUPABASE_URL: str
     SUPABASE_SERVICE_KEY: str
 
+    # ── Direct Postgres connection (for startup DDL migrator via psycopg2) ───
+    # Optional. If set, startup_migrations.py runs ALTER TABLE / CREATE INDEX.
+    # Format: postgresql://postgres:[password]@[host]:5432/postgres
+    DATABASE_URL: str = ""
+
     # ── App Security ──────────────────────────────────────────────────────────
     API_SECRET_KEY: str = "change-me-in-production"
 

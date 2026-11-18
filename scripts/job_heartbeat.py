@@ -184,28 +184,78 @@ def probe_contacts_classify(conn, row: dict) -> dict:
 def probe_leads_nightly_clean(conn, row: dict) -> dict:
     window_min   = int(row.get("window_minutes") or 1440)
     min_expected = int(row.get("min_expected")   or 1000)
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT
-              COUNT(*) FILTER (WHERE email_cleaned_at > now() - (%s * interval '1 minute'))
-                AS throughput,
-              COUNT(*) FILTER (WHERE email_status = 'unvalidated') AS backlog,
-              MAX(email_cleaned_at) AS last_output_at
-            FROM leads
-            WHERE email IS NOT NULL AND email <> ''
-        """, (window_min,))
-        throughput, backlog, last_output_at = cur.fetchone()
-    throughput = int(throughput or 0)
-    backlog    = int(backlog    or 0)
+
+    # Fast path: read from stats_cache (written by job_refresh_leads_email_stats
+    # every 25 min). Avoids full-table COUNT on 1.26M leads (was up to 200s).
+    # Cache row is fresh if refreshed_at < 45 min ago; fall back to live if stale.
+    throughput = None
+    backlog = None
+    last_output_at = None
+    used_cache = False
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT data, refreshed_at FROM stats_cache WHERE key = 'leads_email_clean_stats' LIMIT 1"
+            )
+            cache_row = cur.fetchone()
+        if cache_row:
+            data, refreshed_at = cache_row
+            # Accept cache if refreshed in the last 45 minutes
+            age_s = seconds_since(refreshed_at)
+            if age_s is not None and age_s < 2700:
+                # data is a dict (psycopg2 returns jsonb as dict)
+                if isinstance(data, str):
+                    import json as _json
+                    data = _json.loads(data)
+                # Use the right window key
+                throughput     = int(data.get("throughput_1440m", 0) if window_min >= 1440 else data.get("throughput_60m", 0))
+                last_output_at = data.get("last_output_at")
+                used_cache = True
+                log.debug(f"[probe_leads_nightly_clean] cache hit age={age_s:.0f}s")
+    except Exception as e:
+        log.warning(f"[probe_leads_nightly_clean] stats_cache read failed (falling back to live): {e}")
+
+    # Backlog: always live — it's a small indexed query on email_status='unvalidated'
+    # (much cheaper than the aggregate COUNT above)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM leads WHERE email IS NOT NULL AND email <> '' AND email_status = 'unvalidated'"
+            )
+            backlog = int(cur.fetchone()[0] or 0)
+    except Exception as e:
+        log.warning(f"[probe_leads_nightly_clean] backlog query failed: {e}")
+        backlog = 0
+
+    # Live fallback if cache miss/stale
+    if throughput is None:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                      COUNT(*) FILTER (WHERE email_cleaned_at > now() - (%s * interval '1 minute'))
+                        AS throughput,
+                      MAX(email_cleaned_at) AS last_output_at
+                    FROM leads
+                    WHERE email IS NOT NULL AND email <> ''
+                """, (window_min,))
+                throughput, last_output_at = cur.fetchone()
+            throughput = int(throughput or 0)
+            log.info(f"[probe_leads_nightly_clean] live fallback used (cache miss/stale)")
+        except Exception as e:
+            log.error(f"[probe_leads_nightly_clean] live fallback failed: {e}")
+            throughput = 0
 
     stalled = throughput < min_expected and backlog > 0
     status = "stalled" if stalled else ("healthy" if backlog == 0 else "ok")
+    cache_flag = " (cache)" if used_cache else " (live)"
     return {
         "status":            status,
         "throughput_window": throughput,
         "backlog":           backlog,
         "last_output_at":    _iso(last_output_at),
-        "detail":            f"throughput={throughput} last {window_min}m (min={min_expected}), backlog={backlog}",
+        "detail":            f"throughput={throughput}{cache_flag} last {window_min}m (min={min_expected}), backlog={backlog}",
     }
 
 
