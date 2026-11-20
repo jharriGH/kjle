@@ -53,13 +53,6 @@ async def list_integrations(x_api_key: str = Header(...)):
 
     integrations = [
         {
-            "id": "reachinbox",
-            "name": "ReachInbox",
-            "description": "Email outreach export",
-            "configured": bool(resolve_key(supabase, "REACHINBOX_API_KEY", "reachinbox_api_key")),
-            "category": "outreach",
-        },
-        {
             "id": "truelist",
             "name": "Truelist.io",
             "description": "Email validation and cleaning",
@@ -104,33 +97,6 @@ async def list_integrations(x_api_key: str = Header(...)):
         "not_configured": len(integrations) - configured_count,
         "integrations": integrations,
     }
-
-
-# ─────────────────────────────────────────────────
-# POST /kjle/v1/integrations/reachinbox/test
-# ─────────────────────────────────────────────────
-
-@router.post("/integrations/reachinbox/test")
-async def test_reachinbox(x_api_key: str = Header(...)):
-    verify_api_key(x_api_key)
-    supabase = get_supabase()
-
-    api_key = resolve_key(supabase, "REACHINBOX_API_KEY", "reachinbox_api_key")
-    if not api_key:
-        return {"integration": "reachinbox", "status": "not_configured", "message": "No API key found in environment or admin_settings"}
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                "https://api.reachinbox.ai/api/v1/email-account/list",
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-        if resp.status_code == 200:
-            return {"integration": "reachinbox", "status": "ok", "http_status": resp.status_code}
-        else:
-            return {"integration": "reachinbox", "status": "error", "http_status": resp.status_code, "message": resp.text[:200]}
-    except Exception as e:
-        return {"integration": "reachinbox", "status": "error", "message": str(e)}
 
 
 # ─────────────────────────────────────────────────

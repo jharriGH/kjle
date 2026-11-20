@@ -120,7 +120,10 @@ AXE_SCAN_NIGHTLY_MAX_SECONDS = 300     # 5-minute ceiling (OFFSET makes this fas
 AXE_SCAN_FETCH_CHUNK      = 2_000   # leads fetched per chunk
 
 # Provider classify nightly — TIER-1 string-match, no DNS
-PROVIDER_CLASSIFY_BATCH_SIZE   = 20_000   # rows per SELECT (bounded)
+# Reduced from 20k to 5k: each SELECT page must finish within PostgREST's
+# 30s statement timeout. With idx_leads_provider_classify_candidate the scan
+# is fast, but the safety buffer prevents 57014 on cold-cache planner runs.
+PROVIDER_CLASSIFY_BATCH_SIZE   = 5_000    # rows per SELECT (bounded)
 PROVIDER_CLASSIFY_UPDATE_CHUNK = 500      # IDs per UPDATE .in_() call
 PROVIDER_CLASSIFY_MAX_ITER     = 20       # iteration guard (~400k rows max)
 
@@ -160,20 +163,6 @@ _PROVIDER_TIER1_MAP: dict = {
     "frontier.com": "other",            "optonline.net": "other",
     "windstream.net": "other",
 }
-
-# ── Campaign sync targets (config-driven) ──
-# Each entry describes one (project, server) pair to sync hourly from ReachInbox.
-# Adding a new project or server = append one dict. No logic changes required.
-CAMPAIGN_SYNC_TARGETS = [
-    {
-        "project":           "kjle",
-        "reachinbox_server": "server_1",
-        "api_base":          "https://api.reachinbox.ai/api/v1",
-        "api_key_attr":      "REACHINBOX_API_KEY",   # settings attribute name
-        "statuses_to_sync":  ["active", "paused"],
-    },
-]
-
 
 JOB_DEFINITIONS = {
     "classify_segments": {
@@ -220,11 +209,6 @@ JOB_DEFINITIONS = {
         "description": "Daily cost + lead-pipeline digest emailed via Resend (rolling 24h)",
         "schedule":    "Daily at 16:00 UTC (09:00 PDT / 08:00 PST)",
         "trigger":     "cron",
-    },
-    "campaign_sync_hourly": {
-        "description": "Hourly campaign stats sync from ReachInbox — project/server-scoped via CAMPAIGN_SYNC_TARGETS",
-        "schedule":    "Every 60 minutes",
-        "trigger":     "interval",
     },
     "fed_dnc_refresh_monthly": {
         "description": "Refresh fed_dnc_list table from /opt/fed_dnc_latest.zip — warns and skips if file missing",
@@ -344,21 +328,6 @@ def _safe_int(val, default=0) -> int:
         return default
 
 
-def _map_ri_status(ri_status: Optional[str]) -> Optional[str]:
-    """Map ReachInbox status strings to our lowercase canonical values."""
-    if not ri_status:
-        return None
-    mapping = {
-        "draft":     "draft",
-        "active":    "active",
-        "running":   "active",
-        "paused":    "paused",
-        "stopped":   "paused",
-        "completed": "completed",
-        "archived":  "archived",
-    }
-    return mapping.get(ri_status.strip().lower())
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Job 1 — Auto-Classify Segments (every 6 hours)
@@ -388,7 +357,7 @@ async def job_classify_segments() -> dict:
     these chunks too. See the landmine breadcrumb in segments_engine.py.
     """
     job_name = "classify_segments"
-    CHUNK_SIZE = int(os.getenv("CLASSIFY_CHUNK_SIZE", "250"))
+    CHUNK_SIZE = min(int(os.getenv("CLASSIFY_CHUNK_SIZE", "2000")), 2000)
     logger.info(f"[{job_name}] Starting (chunked-UPDATE mode, chunk={CHUNK_SIZE})...")
     t_start = time.monotonic()
 
@@ -447,8 +416,11 @@ async def job_classify_segments() -> dict:
                 upd = upd.gte("id", first_id).lte("id", last_id)
                 upd.execute()
             except Exception as e:
-                logger.error(f"[{job_name}] {label.upper()} UPDATE chunk {chunk_idx} failed: {e}")
-                raise
+                logger.error(f"[{job_name}] {label.upper()} UPDATE chunk {chunk_idx} failed (skipping): {e}")
+                last_id_cursor = last_id  # advance cursor so the loop doesn't stall
+                chunk_idx += 1
+                await asyncio.sleep(0)
+                continue
             total += len(rows)
             last_id_cursor = last_id
             chunk_idx += 1
@@ -1164,38 +1136,58 @@ async def job_email_clean_nightly() -> dict:
             logger.info(f"[{job_name}] No more leads (new or reval) after {i} iterations — stopping early")
             break
         selector_total_returned += len(leads)
-        try:
-            r = await ec_submit_batch(
-                db, api_key, leads,
-                submitted_by="nightly_cron",
-                notes=f"nightly_{i+1}_of_{max_batches}",
-            )
-            r["index"] = i
-            submitted_batches.append(r)
-            logger.info(
-                f"[{job_name}] Batch {i+1}/{max_batches}: submitted={r.get('submitted')}, "
-                f"batch_id={r.get('batch_id')}"
-            )
-        except Exception as e:
-            submit_exception_count += 1
-            logger.error(
-                f"[{job_name}] iteration={i} ec_submit_batch raised: "
-                f"{type(e).__name__}: {e}",
-                exc_info=True,
-            )
-            submitted_batches.append({"index": i, "submitted": 0, "error": str(e)})
-            break  # don't hammer Truelist if first one failed
+        # Chunk into slices of at most 2000 — Truelist submissions above this size
+        # have raised in production. Each chunk becomes its own Truelist batch so
+        # one bad chunk never aborts the rest.
+        TRUELIST_CHUNK = 2000
+        lead_chunks = [leads[j:j + TRUELIST_CHUNK] for j in range(0, len(leads), TRUELIST_CHUNK)]
+        logger.info(
+            f"[{job_name}] iteration={i} split into {len(lead_chunks)} chunk(s) "
+            f"of max {TRUELIST_CHUNK} (total_leads={len(leads)})"
+        )
+        for ci, chunk in enumerate(lead_chunks):
+            try:
+                r = await ec_submit_batch(
+                    db, api_key, chunk,
+                    submitted_by="nightly_cron",
+                    notes=f"nightly_{i+1}_of_{max_batches}_chunk_{ci+1}_of_{len(lead_chunks)}",
+                )
+                r["index"] = i
+                r["chunk"] = ci
+                submitted_batches.append(r)
+                logger.info(
+                    f"[{job_name}] Batch {i+1}/{max_batches} chunk {ci+1}/{len(lead_chunks)}: "
+                    f"submitted={r.get('submitted')}, batch_id={r.get('batch_id')}"
+                )
+            except Exception as e:
+                submit_exception_count += 1
+                logger.error(
+                    f"[{job_name}] iteration={i} chunk={ci} ec_submit_batch raised: "
+                    f"{type(e).__name__}: {e}",
+                    exc_info=True,
+                )
+                submitted_batches.append({"index": i, "chunk": ci, "submitted": 0, "error": str(e)})
+                # log and continue — one bad chunk must not abort remaining chunks
 
     duration = time.monotonic() - t_start
     total_emails = sum((b.get("submitted") or 0) for b in submitted_batches)
     any_submitted = any(b.get("submitted", 0) > 0 for b in submitted_batches)
-    if any_submitted:
+    batches_ok = len([b for b in submitted_batches if b.get("submitted", 0) > 0])
+    if any_submitted and submit_exception_count == 0:
         notes = (
-            f"batches_submitted={len([b for b in submitted_batches if b.get('submitted', 0) > 0])}, "
+            f"batches_submitted={batches_ok}, "
             f"total_emails={total_emails}, "
             f"batch_ids={[b.get('batch_id') for b in submitted_batches if b.get('batch_id')]}"
         )
         status = "success"
+    elif any_submitted and submit_exception_count > 0:
+        # Some chunks succeeded, some failed — partial is not a full failure.
+        notes = (
+            f"partial: batches_submitted={batches_ok}, total_emails={total_emails}, "
+            f"failed_chunks={submit_exception_count}, "
+            f"batch_ids={[b.get('batch_id') for b in submitted_batches if b.get('batch_id')]}"
+        )
+        status = "partial"
     elif selector_total_returned == 0:
         # Select returned [] on iteration 0 — nothing to clean, not a failure.
         notes = "no_leads_available (new+reval selectors both returned 0 on iteration 0)"
@@ -1210,7 +1202,7 @@ async def job_email_clean_nightly() -> dict:
         )
         status = "success"
     else:
-        # Selector found leads and actual submit exceptions occurred (HTTP 4xx/5xx or raises).
+        # Selector found leads and all submit chunks raised.
         notes = (
             f"selector returned {selector_total_returned} leads but all "
             f"{submit_exception_count} submit attempts raised — see logs for exception details"
@@ -1929,134 +1921,6 @@ async def job_daily_cost_report() -> dict:
         "balance_alerts_sent": balance_alerts,
         "duration_seconds": round(duration, 3),
     }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Job 9 — Hourly Campaign Stats Sync (every 60 minutes)
-# Pulls RI campaign stats for configured (project, server) pairs — see
-# CAMPAIGN_SYNC_TARGETS at top of file. Adding a new project = 1 dict entry.
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def job_campaign_sync_hourly() -> dict:
-    """
-    Hourly campaign_performance sync.
-
-    For each target in CAMPAIGN_SYNC_TARGETS:
-      - SELECT rows matching (project, reachinbox_server, status IN statuses_to_sync)
-      - GET {api_base}/campaigns/{id}/status for each row
-      - Update sent/opened/replied/bounced/unsubscribed + status + last_synced_at
-
-    Config-driven; no code changes needed to add projects/servers.
-    Non-blocking on per-campaign failure (logs and continues).
-    """
-    job_name = "campaign_sync_hourly"
-    logger.info(f"[{job_name}] Starting...")
-    t_start = time.monotonic()
-
-    from ..config import settings
-
-    db = get_db()
-    total_synced = 0
-    total_failed = 0
-    per_target = []
-
-    for tgt in CAMPAIGN_SYNC_TARGETS:
-        project  = tgt["project"]
-        server   = tgt["reachinbox_server"]
-        api_base = tgt["api_base"]
-        api_key  = getattr(settings, tgt["api_key_attr"], "") or ""
-        statuses = tgt["statuses_to_sync"]
-
-        if not api_key:
-            reason = f"no API key for settings.{tgt['api_key_attr']}"
-            logger.warning(f"[{job_name}] target {project}/{server} skipped — {reason}")
-            per_target.append({
-                "project": project, "server": server, "candidates": 0,
-                "synced": 0, "failed": 0, "skipped": reason,
-            })
-            continue
-
-        try:
-            rows = (
-                db.table("campaign_performance")
-                .select("id, reachinbox_campaign_id")
-                .eq("project", project)
-                .eq("reachinbox_server", server)
-                .in_("status", statuses)
-                .not_.is_("reachinbox_campaign_id", "null")
-                .execute().data or []
-            )
-        except Exception as e:
-            logger.error(f"[{job_name}] {project}/{server} fetch failed: {e}")
-            per_target.append({
-                "project": project, "server": server, "candidates": 0,
-                "synced": 0, "failed": 0, "error": str(e)[:200],
-            })
-            continue
-
-        synced = 0
-        failed = 0
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            for row in rows:
-                cid = row["reachinbox_campaign_id"]
-                try:
-                    r = await client.get(f"{api_base}/campaigns/{cid}/status", headers=headers)
-                    if r.status_code != 200:
-                        failed += 1
-                        logger.warning(f"[{job_name}] {project}/{server} campaign {cid} HTTP {r.status_code}")
-                        continue
-                    data = (r.json() or {}).get("data") or {}
-                    update_payload = {
-                        "sent_count":         _safe_int(data.get("totalEmailSent")),
-                        "opened_count":       _safe_int(data.get("totalUniqueEmailOpened")),
-                        "replied_count":      _safe_int(data.get("totalEmailReplied")),
-                        "bounced_count":      _safe_int(data.get("totalBounces")),
-                        "unsubscribed_count": _safe_int(data.get("totalUnsubscribes")),
-                        "last_synced_at":     _now_iso(),
-                    }
-                    mapped = _map_ri_status(data.get("status"))
-                    if mapped:
-                        update_payload["status"] = mapped
-                    db.table("campaign_performance").update(update_payload).eq("id", row["id"]).execute()
-                    synced += 1
-                except Exception as e:
-                    failed += 1
-                    logger.error(f"[{job_name}] {project}/{server} campaign {cid} error: {e}")
-
-        total_synced += synced
-        total_failed += failed
-        per_target.append({
-            "project": project, "server": server,
-            "candidates": len(rows), "synced": synced, "failed": failed,
-        })
-
-    duration = time.monotonic() - t_start
-    notes = f"synced={total_synced}, failed={total_failed}, targets={len(CAMPAIGN_SYNC_TARGETS)}"
-    status = (
-        "partial" if total_failed > 0 and total_synced > 0
-        else ("failed" if total_failed > 0 and total_synced == 0 else "success")
-    )
-
-    await _log_job(
-        job_name,
-        leads_processed=total_synced,
-        duration_seconds=duration,
-        status=status,
-        notes=notes,
-    )
-
-    result = {
-        "job":              job_name,
-        "synced":           total_synced,
-        "failed":           total_failed,
-        "per_target":       per_target,
-        "duration_seconds": round(duration, 3),
-        "status":           status,
-    }
-    logger.info(f"[{job_name}] Done. {result}")
-    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4020,6 +3884,126 @@ async def job_pipeline_watchdog_digest():
         raise
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# job_tz_backfill_nightly — drain leads.timezone NULL rows
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def job_tz_backfill_nightly() -> dict:
+    """
+    Drain leads.timezone = NULL for active US leads using tz_backfill.
+    Runs until the chunk returns assigned==0 (fully drained) or hits a
+    10-minute time cap. Idempotent — safe to run repeatedly.
+    """
+    from ..lib.tz_backfill import run_tz_backfill_chunk
+
+    job_name = "tz_backfill_nightly"
+    logger.info(f"[{job_name}] Starting...")
+    t_start = time.monotonic()
+    max_seconds = 600.0  # 10-minute cap
+    db = get_db()
+
+    total_assigned = 0
+    total_skipped  = 0
+    chunks         = 0
+
+    while True:
+        if time.monotonic() - t_start >= max_seconds:
+            logger.info(f"[{job_name}] Time cap reached — stopping (assigned={total_assigned})")
+            break
+        result = run_tz_backfill_chunk(db, chunk_size=20_000)
+        total_assigned += result.get("assigned", 0)
+        total_skipped  += result.get("skipped", 0)
+        chunks         += 1
+        if result.get("assigned", 0) == 0:
+            logger.info(f"[{job_name}] No more rows to fill — done")
+            break
+
+    elapsed = time.monotonic() - t_start
+    summary = (
+        f"tz_backfill complete: assigned={total_assigned}, "
+        f"skipped={total_skipped}, chunks={chunks}, elapsed={elapsed:.1f}s"
+    )
+    logger.info(f"[{job_name}] {summary}")
+    await _log_job(job_name, leads_processed=total_assigned, duration_seconds=elapsed,
+                   status="success", notes=summary)
+    return {"job": job_name, "assigned": total_assigned, "skipped": total_skipped, "elapsed_seconds": round(elapsed, 1)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# job_refresh_leads_email_stats — write leads email metrics to stats_cache
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def job_refresh_leads_email_stats() -> dict:
+    """
+    Write leads email-clean throughput/backlog stats into stats_cache so the
+    job_heartbeat.py probe can read from cache instead of running a full-table
+    COUNT on 1.26M rows every 15 minutes (was up to 200s per run).
+    Keys written:
+      'leads_email_clean_stats' — {throughput_1440m, backlog, last_output_at}
+    """
+    job_name = "refresh_leads_email_stats"
+    db = get_db()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    cutoff_1440 = (datetime.now(timezone.utc) - timedelta(minutes=1440)).isoformat()
+    cutoff_60   = (datetime.now(timezone.utc) - timedelta(minutes=60)).isoformat()
+
+    try:
+        # Build stats using multiple small targeted queries rather than one
+        # monster aggregate. Each query uses existing partial indexes.
+        rows_1440 = (
+            db.table("leads")
+            .select("id", count="exact")
+            .not_.is_("email", "null").neq("email", "")
+            .gt("email_cleaned_at", cutoff_1440)
+            .limit(1)
+            .execute()
+        )
+        throughput_1440 = rows_1440.count or 0
+
+        rows_60 = (
+            db.table("leads")
+            .select("id", count="exact")
+            .not_.is_("email", "null").neq("email", "")
+            .gt("email_cleaned_at", cutoff_60)
+            .limit(1)
+            .execute()
+        )
+        throughput_60 = rows_60.count or 0
+
+        # last_output_at: most recent email_cleaned_at
+        last_rows = (
+            db.table("leads")
+            .select("email_cleaned_at")
+            .not_.is_("email_cleaned_at", "null")
+            .order("email_cleaned_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        last_output_at = (last_rows.data or [{}])[0].get("email_cleaned_at")
+
+        stats_data = {
+            "throughput_1440m": throughput_1440,
+            "throughput_60m":   throughput_60,
+            "last_output_at":   last_output_at,
+            "refreshed_at":     now_iso,
+        }
+
+        db.table("stats_cache").upsert(
+            {"key": "leads_email_clean_stats", "data": stats_data, "refreshed_at": now_iso},
+            on_conflict="key",
+        ).execute()
+
+        logger.info(
+            f"[{job_name}] updated stats_cache: throughput_1440={throughput_1440}, "
+            f"throughput_60={throughput_60}"
+        )
+        return {"job": job_name, "status": "ok", **stats_data}
+    except Exception as exc:
+        logger.error(f"[{job_name}] failed: {exc}", exc_info=True)
+        return {"job": job_name, "status": "error", "error": str(exc)[:200]}
+
+
 JOB_FUNCTIONS = {
     "classify_segments":    job_classify_segments,
     "enrich_stage1":        job_enrich_stage1,
@@ -4031,7 +4015,6 @@ JOB_FUNCTIONS = {
     # STUBBED 2026-07-19 (Jim): Firecrawl deep-enrichment obsolete post pain-scoring redesign — owner/services/areas unused. Left intact but unscheduled. Re-enable by uncommenting.
     # "enrich_stage4_nightly": job_enrich_stage4_nightly,
     "daily_cost_report":    job_daily_cost_report,
-    "campaign_sync_hourly": job_campaign_sync_hourly,
     "fed_dnc_refresh_monthly": job_fed_dnc_refresh_monthly,
     "nanpa_refresh_monthly":   job_nanpa_refresh_monthly,
     "tcpa_refresh_weekly":     job_tcpa_refresh_weekly,
@@ -4059,10 +4042,10 @@ def setup_scheduler() -> AsyncIOScheduler:
 
     # Job 1: classify_segments — every 6 hours, phased to :05 past the hour.
     # Previously a bare IntervalTrigger(hours=6), which phases off app-boot
-    # time and had drifted onto the same :34-:36 minute as campaign_sync_hourly
-    # and email_clean_poll_batches. Concurrent heavy UPDATEs on `leads` at
-    # that shared minute caused repeated statement_timeout failures (2026-09-12
-    # incident). CronTrigger pins the minute so it can't drift back onto theirs.
+    # time and had drifted onto the same :34-:36 minute as email_clean_poll_batches.
+    # Concurrent heavy UPDATEs on `leads` at that shared minute caused repeated
+    # statement_timeout failures (2026-09-12 incident). CronTrigger pins the
+    # minute so it can't drift back.
     scheduler.add_job(
         job_classify_segments,
         trigger=CronTrigger(hour="0,6,12,18", minute=5),
@@ -4148,18 +4131,6 @@ def setup_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
         misfire_grace_time=1800,
     )
-
-    # DISABLED 2026-09-25: ReachInbox retired; repoint to CampaignEnginez when its stats API is ready.
-    # Job 9: campaign_sync_hourly — every 60 minutes
-    # Pulls campaign stats from RI for configured (project, server) pairs
-    # scheduler.add_job(
-    #     job_campaign_sync_hourly,
-    #     trigger=IntervalTrigger(minutes=60),
-    #     id="campaign_sync_hourly",
-    #     name="Hourly Campaign Stats Sync",
-    #     replace_existing=True,
-    #     misfire_grace_time=600,
-    # )
 
     # Job 10: fed_dnc_refresh_monthly — 1st of every month @ 04:00 UTC
     # Rebuilds fed_dnc_list from /opt/fed_dnc_latest.zip. Until Jim's FCC
@@ -4300,6 +4271,37 @@ def setup_scheduler() -> AsyncIOScheduler:
         name="Pipeline Health Digest (daily 08:45 America/Los_Angeles)",
         replace_existing=True,
         misfire_grace_time=1800,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Job 20: tz_backfill_nightly — daily at 05:00 UTC
+    # Drains leads.timezone=NULL for active US leads. Runs between axe_scan
+    # (04:00) and website_audit (05:30); 10-min cap so it finishes well clear.
+    # Idempotent: becomes a no-op once all rows are filled.
+    scheduler.add_job(
+        job_tz_backfill_nightly,
+        trigger=CronTrigger(hour=5, minute=0),
+        id="tz_backfill_nightly",
+        name="Nightly Timezone Backfill",
+        replace_existing=True,
+        misfire_grace_time=1800,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Job 21: refresh_leads_email_stats — every 25 minutes
+    # Writes leads email-clean throughput/backlog into stats_cache so the
+    # job_heartbeat.py probe_leads_nightly_clean can read cached metrics
+    # instead of running a full-table COUNT (was up to 200s).
+    # 25-min interval fits between the 30-min email_clean_poll_batches runs.
+    scheduler.add_job(
+        job_refresh_leads_email_stats,
+        trigger=IntervalTrigger(minutes=25),
+        id="refresh_leads_email_stats",
+        name="Refresh Leads Email Stats Cache (25min)",
+        replace_existing=True,
+        misfire_grace_time=300,
         max_instances=1,
         coalesce=True,
     )

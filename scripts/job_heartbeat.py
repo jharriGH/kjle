@@ -184,28 +184,78 @@ def probe_contacts_classify(conn, row: dict) -> dict:
 def probe_leads_nightly_clean(conn, row: dict) -> dict:
     window_min   = int(row.get("window_minutes") or 1440)
     min_expected = int(row.get("min_expected")   or 1000)
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT
-              COUNT(*) FILTER (WHERE email_cleaned_at > now() - (%s * interval '1 minute'))
-                AS throughput,
-              COUNT(*) FILTER (WHERE email_status = 'unvalidated') AS backlog,
-              MAX(email_cleaned_at) AS last_output_at
-            FROM leads
-            WHERE email IS NOT NULL AND email <> ''
-        """, (window_min,))
-        throughput, backlog, last_output_at = cur.fetchone()
-    throughput = int(throughput or 0)
-    backlog    = int(backlog    or 0)
+
+    # Fast path: read from stats_cache (written by job_refresh_leads_email_stats
+    # every 25 min). Avoids full-table COUNT on 1.26M leads (was up to 200s).
+    # Cache row is fresh if refreshed_at < 45 min ago; fall back to live if stale.
+    throughput = None
+    backlog = None
+    last_output_at = None
+    used_cache = False
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT data, refreshed_at FROM stats_cache WHERE key = 'leads_email_clean_stats' LIMIT 1"
+            )
+            cache_row = cur.fetchone()
+        if cache_row:
+            data, refreshed_at = cache_row
+            # Accept cache if refreshed in the last 45 minutes
+            age_s = seconds_since(refreshed_at)
+            if age_s is not None and age_s < 2700:
+                # data is a dict (psycopg2 returns jsonb as dict)
+                if isinstance(data, str):
+                    import json as _json
+                    data = _json.loads(data)
+                # Use the right window key
+                throughput     = int(data.get("throughput_1440m", 0) if window_min >= 1440 else data.get("throughput_60m", 0))
+                last_output_at = data.get("last_output_at")
+                used_cache = True
+                log.debug(f"[probe_leads_nightly_clean] cache hit age={age_s:.0f}s")
+    except Exception as e:
+        log.warning(f"[probe_leads_nightly_clean] stats_cache read failed (falling back to live): {e}")
+
+    # Backlog: always live — it's a small indexed query on email_status='unvalidated'
+    # (much cheaper than the aggregate COUNT above)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM leads WHERE email IS NOT NULL AND email <> '' AND email_status = 'unvalidated'"
+            )
+            backlog = int(cur.fetchone()[0] or 0)
+    except Exception as e:
+        log.warning(f"[probe_leads_nightly_clean] backlog query failed: {e}")
+        backlog = 0
+
+    # Live fallback if cache miss/stale
+    if throughput is None:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                      COUNT(*) FILTER (WHERE email_cleaned_at > now() - (%s * interval '1 minute'))
+                        AS throughput,
+                      MAX(email_cleaned_at) AS last_output_at
+                    FROM leads
+                    WHERE email IS NOT NULL AND email <> ''
+                """, (window_min,))
+                throughput, last_output_at = cur.fetchone()
+            throughput = int(throughput or 0)
+            log.info(f"[probe_leads_nightly_clean] live fallback used (cache miss/stale)")
+        except Exception as e:
+            log.error(f"[probe_leads_nightly_clean] live fallback failed: {e}")
+            throughput = 0
 
     stalled = throughput < min_expected and backlog > 0
     status = "stalled" if stalled else ("healthy" if backlog == 0 else "ok")
+    cache_flag = " (cache)" if used_cache else " (live)"
     return {
         "status":            status,
         "throughput_window": throughput,
         "backlog":           backlog,
         "last_output_at":    _iso(last_output_at),
-        "detail":            f"throughput={throughput} last {window_min}m (min={min_expected}), backlog={backlog}",
+        "detail":            f"throughput={throughput}{cache_flag} last {window_min}m (min={min_expected}), backlog={backlog}",
     }
 
 
@@ -539,6 +589,102 @@ def maybe_restart(row: dict, conn) -> str | None:
         return f"restart_failed: {e}"
 
 
+# ── KJSupportz key-liveness probe (once per day) ─────────────────────────────
+
+def probe_key_liveness():
+    """
+    Hits KJSupportz /admin/key_liveness once per calendar day.
+    Gate: marker file /tmp/kjle-keyprobe-YYYYMMDD. Skip if it exists.
+    Alerts Jim only on any_dead==true. Inconclusive (5xx/timeout) is silent.
+    Never echoes credentials or full provider error bodies.
+    """
+    api_key = os.environ.get("KJSUPPORTZ_API_SECRET_KEY", "")
+    if not api_key:
+        log.warning("[key_liveness] KJSUPPORTZ_API_SECRET_KEY not set — skipping probe")
+        return
+
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    marker = f"/tmp/kjle-keyprobe-{today}"
+    if os.path.exists(marker):
+        log.info("[key_liveness] daily marker present — skipping")
+        return
+
+    url = "https://kjsupportz-api.onrender.com/kjsupportz/v1/admin/key_liveness"
+    try:
+        r = httpx.get(
+            url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=20.0,
+        )
+    except Exception as e:
+        log.warning(f"[key_liveness] request error: {e}")
+        brain_log_entry(
+            f"key_liveness inconclusive: request exception {str(e)[:200]}",
+            tags=["key_liveness", "inconclusive"],
+        )
+        # Create marker so a transient error doesn't re-run every 15 min all day
+        open(marker, "w").close()
+        return
+
+    if r.status_code >= 500:
+        snippet = r.text[:200]
+        log.warning(f"[key_liveness] server error {r.status_code}: {snippet}")
+        brain_log_entry(
+            f"key_liveness inconclusive: HTTP {r.status_code} {snippet}",
+            tags=["key_liveness", "inconclusive"],
+        )
+        open(marker, "w").close()
+        return
+
+    if r.status_code == 401 or r.status_code == 403:
+        # Auth failure means the key itself may be dead
+        brain_log_entry(
+            f"key_liveness alert: HTTP {r.status_code} — bearer rejected by admin endpoint",
+            tags=["key_liveness", "alert"],
+        )
+        brain_notify(
+            "KJSupportz key-liveness probe: admin bearer rejected (HTTP "
+            f"{r.status_code}) — key may be dead or rotated",
+            severity="warn",
+        )
+        open(marker, "w").close()
+        return
+
+    try:
+        body = r.json()
+    except Exception:
+        snippet = r.text[:200]
+        brain_log_entry(
+            f"key_liveness inconclusive: non-JSON response HTTP {r.status_code} {snippet}",
+            tags=["key_liveness", "inconclusive"],
+        )
+        open(marker, "w").close()
+        return
+
+    any_dead = body.get("any_dead", False)
+
+    if any_dead:
+        dead_providers = body.get("dead_providers", [])
+        providers_str = ", ".join(str(p) for p in dead_providers) if dead_providers else "unknown"
+        brain_log_entry(
+            f"key_liveness alert: any_dead=true, dead_providers=[{providers_str}]",
+            tags=["key_liveness", "alert"],
+        )
+        brain_notify(
+            f"KJSupportz DEAD API KEY(S): {providers_str} — check Render env vars. DO NOT auto-rotate.",
+            severity="warn",
+        )
+        log.warning(f"[key_liveness] DEAD KEY(S): {providers_str}")
+    else:
+        brain_log_entry(
+            "key_liveness ok: all_ok=true, no dead providers",
+            tags=["key_liveness", "ok"],
+        )
+        log.info("[key_liveness] all ok")
+
+    open(marker, "w").close()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -626,6 +772,12 @@ def main():
     # HTTP health probes (web-layer outage detection)
     print(f"[HB] running API health probes")
     run_api_health_probes(conn, now)
+
+    # Key-liveness probe (once per day, independent of job checks)
+    try:
+        probe_key_liveness()
+    except Exception as e:
+        log.error(f"probe_key_liveness raised: {e}", exc_info=True)
 
     summary = ", ".join(summary_parts)
     log.info(f"=== job_heartbeat done: {summary} ===")

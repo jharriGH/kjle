@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import os
+import random
 import signal
 import socket
 import sys
@@ -31,6 +32,8 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+
+import httpx
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -603,8 +606,53 @@ def _claim_job(db: Client, job_id: int, attempts: int) -> bool:
         return False
 
 
+# 2026-11-10 fix: bounded retry for the connection-class failures actually
+# observed live on 2026-11-09 (journal, 17:08-17:29Z, 29 jobs on
+# wcstylez.com/mobilewebmds.com -- most pages, most exposure to a transient
+# window that a short run barely touches). In every one of those cases the
+# axe-core scan had already SUCCEEDED -- the result was computed and sat in
+# memory -- and the write failed. Zero retries meant that work was thrown
+# away permanently every time.
+_INSERT_RESULT_MAX_ATTEMPTS = 3
+_INSERT_RESULT_BACKOFF_BASE_S = 0.5
+
+
 def _insert_result(db: Client, job: dict, scan: dict) -> int | None:
-    """Append-only INSERT into scan_results. Never upsert."""
+    """Append-only INSERT into scan_results. Never upsert.
+
+    Retries up to _INSERT_RESULT_MAX_ATTEMPTS times, but ONLY on the two
+    connection-class exceptions the live journal actually produced -- traced
+    to their exact classes from this venv's own installed source (httpx
+    0.28.1, httpcore 1.0.9, h2 4.3.0), not assumed from the error text:
+
+      "EOF occurred in violation of protocol (_ssl.c:2417)"
+        ssl.SSLEOFError mid-read/write on an open connection. httpcore's
+        ReadError/WriteError are both subclasses of httpcore.NetworkError
+        (httpcore/_exceptions.py); httpx maps httpcore.NetworkError to its
+        own httpx.NetworkError (httpx/_transports/default.py,
+        HTTPCORE_EXC_MAP).
+
+      "<ConnectionTerminated error_code:9, last_stream_id:9,
+      additional_data:None>"
+        error_code 9 = h2.errors.ErrorCodes.COMPRESSION_ERROR (h2/errors.py)
+        on the daemon's single shared HTTP/2 connection (db = _make_db() is
+        called exactly once in main() and handed to every SCAN_CONCURRENCY
+        worker thread). httpcore's HTTP/2 implementation raises this as
+        RemoteProtocolError(self._connection_terminated) verbatim
+        (httpcore/_sync/http2.py:355) -- str() on that exception prints the
+        h2 event's own repr, which is why the journal shows angle brackets.
+        httpx maps httpcore.RemoteProtocolError 1:1 to httpx.
+        RemoteProtocolError.
+
+    Deliberately NOT a broad except Exception around the retry loop: a
+    constraint violation, a schema error, or bad data is not a transport
+    failure (postgrest.APIError on a genuine 4xx/5xx, or a programming
+    error) and must fail immediately and loudly on the first attempt --
+    retrying those would waste the job's time budget hiding a real bug
+    behind "it worked the 3rd time." That path is unchanged below: caught,
+    logged as insert_result_error, returns None on attempt one, same as
+    before this fix.
+    """
     row = {
         "lead_id": job.get("lead_id"),
         "client_id": job.get("client_id"),
@@ -625,14 +673,30 @@ def _insert_result(db: Client, job: dict, scan: dict) -> int | None:
         "score_formula_version": scan.get("score_formula_version"),
         "metadata": {"worker_id": WORKER_ID},
     }
-    try:
-        resp = db.table("scan_results").insert(row).execute()
-        if resp.data:
-            return resp.data[0]["id"]
-    except Exception as e:
-        _log("insert_result_error", level=logging.ERROR,
-             url=job["url"], error=str(e))
-    return None
+    for attempt in range(1, _INSERT_RESULT_MAX_ATTEMPTS + 1):
+        try:
+            resp = db.table("scan_results").insert(row).execute()
+            if resp.data:
+                return resp.data[0]["id"]
+            return None
+        except (httpx.NetworkError, httpx.RemoteProtocolError) as e:
+            if attempt < _INSERT_RESULT_MAX_ATTEMPTS:
+                backoff = _INSERT_RESULT_BACKOFF_BASE_S * (2 ** (attempt - 1))
+                backoff += random.uniform(0, backoff * 0.5)  # jitter
+                _log("insert_result_retry", level=logging.WARNING,
+                     url=job["url"], attempt=attempt,
+                     max_attempts=_INSERT_RESULT_MAX_ATTEMPTS,
+                     error=str(e), backoff_s=round(backoff, 2))
+                time.sleep(backoff)
+                continue
+            _log("insert_result_exhausted", level=logging.ERROR,
+                 url=job["url"], attempts=attempt, error=str(e))
+            return None
+        except Exception as e:
+            _log("insert_result_error", level=logging.ERROR,
+                 url=job["url"], error=str(e))
+            return None
+    return None  # unreachable — loop always returns
 
 
 def _finish_job(

@@ -23,13 +23,8 @@ topIssues: top-3 plain-English violation labels, severity-ranked (critical first
   violationCount, criticalCount, and accessibilityScore are populated from the
   leads table directly (no extra round-trips).
 
-DNC/contactable guards: replicates fetch_kjle_leads (reachinbox.py):
-  is_active=True, email_valid=True, email IS NOT NULL, plus email_suppressions
-  table scrub. Suppressed addresses are never included.
-
-Protected imports (read-only, never modified):
-  - reachinbox.map_lead_to_ri  — maps lead dict to RI payload shape
-  - reachinbox.ri_post         — RI HTTP POST (only called when dry_run=False)
+DNC/contactable guards: is_active=True, email_valid=True, email IS NOT NULL, plus
+  email_suppressions table scrub. Suppressed addresses are never included.
 
 HYGIENE PASS (Slice 19)
   Applied after freshness gate, before building output. Controlled by request flags:
@@ -51,13 +46,12 @@ import logging
 import os
 import re
 from datetime import datetime, timezone, timedelta
-from typing import Literal, Optional
+from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 
 from ..database import get_db
-from .reachinbox import map_lead_to_ri, ri_post
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -330,9 +324,7 @@ class CampaignPrepRequest(BaseModel):
     state: Optional[str] = None
     limit: int = 500
     reverify_stale_days: int = 7
-    output: Literal["csv", "reachinbox_payload"] = "csv"
     dry_run: bool = True
-    campaign_id: Optional[int] = None  # required for output=reachinbox_payload + dry_run=False
     dedupe_email: bool = True
     dedupe_domain: bool = True
     require_domain_match: bool = False
@@ -514,14 +506,8 @@ async def campaign_prep(body: CampaignPrepRequest):
     Pulls hot ADA leads (accessibility_score < max_score), freshness-gates them
     (enqueue stale for re-scan and exclude), runs contact-data hygiene (email
     dedupe, domain dedupe, domain-match annotation), enriches with merge tags,
-    and returns CSV data or ReachInbox payloads + stats.
+    and returns CSV data + stats.
     """
-    if body.output == "reachinbox_payload" and not body.dry_run and not body.campaign_id:
-        raise HTTPException(
-            status_code=400,
-            detail="campaign_id is required when output=reachinbox_payload and dry_run=false",
-        )
-
     limit = min(body.limit, _HARD_CAP)
     # Fetch 2x to absorb hygiene drops and still return close to the requested count.
     fetch_limit = min(limit * 2, _HARD_CAP)
@@ -663,14 +649,12 @@ async def campaign_prep(body: CampaignPrepRequest):
     # ── Steps 5 + 6: Enrich for merge tags (PURL via CE_PURL_BASE) ──────────
     enriched: list = []
     for lead in surviving:
-        ri_payload = map_lead_to_ri(lead)  # protected import — not reimplemented
-        # Bug 1: KJLE leads are businesses, never addressed by first name.
-        # map_lead_to_ri splits business_name into firstName/lastName — remove both
-        # so the payload only carries companyName (in attributes) as the merge token.
-        ri_payload.pop("firstName", None)
-        ri_payload.pop("lastName", None)
-        ri_payload = _enrich_attrs(lead, ri_payload, top_issues_map)
-        enriched.append((lead, ri_payload))
+        payload = {
+            "email": lead.get("email") or "",
+            "attributes": {"companyName": lead.get("business_name") or ""},
+        }
+        payload = _enrich_attrs(lead, payload, top_issues_map)
+        enriched.append((lead, payload))
 
     # Stats block — always returned regardless of output mode
     stats = {
@@ -694,71 +678,40 @@ async def campaign_prep(body: CampaignPrepRequest):
 
     # ── Step 7: Output ────────────────────────────────────────────────────────
 
-    # CSV output: return JSON with embedded csv_data string + stats so the
-    # operator can inspect stats and save the CSV without a separate request.
-    if body.output == "csv":
-        csv_cols = [
-            "lead_id", "companyName", "email", "website",
-            "accessibility_score", "accessibility_violations", "accessibility_critical",
-            "topIssues", "purlLink", "domainMatch", "nameVerified",
-        ]
-        buf = io.StringIO()
-        writer = csv.DictWriter(buf, fieldnames=csv_cols, lineterminator="\n")
-        writer.writeheader()
-        for lead, ri in enriched:
-            attrs = ri.get("attributes", {})
-            writer.writerow({
-                "lead_id":                  lead["id"],
-                "companyName":              attrs.get("companyName") or "",
-                "email":                    lead.get("email") or "",
-                "website":                  lead.get("website") or "",
-                "accessibility_score":      attrs.get("accessibilityScore") or "",
-                "accessibility_violations": attrs.get("violationCount") or "",
-                "accessibility_critical":   attrs.get("criticalCount") or "",
-                "topIssues":                attrs.get("topIssues") or "",
-                "purlLink":                 attrs.get("purlLink") or "",
-                "domainMatch":              attrs.get("domainMatch", True),
-                "nameVerified":             attrs.get("nameVerified"),
-            })
-        buf.seek(0)
-        csv_str = buf.getvalue()
-        filename = f"kjle_ada_{now_dt.strftime('%Y%m%d_%H%M%S')}.csv"
-        return {
-            "status":      "success",
-            "dry_run":     body.dry_run,
-            "stats":       stats,
-            "csv_columns": csv_cols,
-            "csv_data":    csv_str,
-            "filename":    filename,
-        }
-
-    # reachinbox_payload output
-    payload_list = [ri for _, ri in enriched]
-
-    if not body.dry_run and body.campaign_id:
-        leads_pushed = 0
-        leads_failed = 0
-        for i in range(0, len(payload_list), 100):
-            batch = payload_list[i:i + 100]
-            try:
-                await ri_post("/leads/add", {"campaignId": body.campaign_id, "leads": batch})
-                leads_pushed += len(batch)
-            except Exception as e:
-                leads_failed += len(batch)
-                logger.warning(f"[campaign_prep] RI push batch {i} failed: {e}")
-        return {
-            "status":       "success",
-            "dry_run":      False,
-            "campaign_id":  body.campaign_id,
-            "leads_pushed": leads_pushed,
-            "leads_failed": leads_failed,
-            "stats":        stats,
-            "payloads":     payload_list,
-        }
-
+    # ── Step 7: Output — always CSV ───────────────────────────────────────────
+    # Returns JSON with embedded csv_data string + stats so the operator can
+    # inspect stats and save the CSV without a separate request.
+    csv_cols = [
+        "lead_id", "companyName", "email", "website",
+        "accessibility_score", "accessibility_violations", "accessibility_critical",
+        "topIssues", "purlLink", "domainMatch", "nameVerified",
+    ]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=csv_cols, lineterminator="\n")
+    writer.writeheader()
+    for lead, payload in enriched:
+        attrs = payload.get("attributes", {})
+        writer.writerow({
+            "lead_id":                  lead["id"],
+            "companyName":              attrs.get("companyName") or "",
+            "email":                    lead.get("email") or "",
+            "website":                  lead.get("website") or "",
+            "accessibility_score":      attrs.get("accessibilityScore") or "",
+            "accessibility_violations": attrs.get("violationCount") or "",
+            "accessibility_critical":   attrs.get("criticalCount") or "",
+            "topIssues":                attrs.get("topIssues") or "",
+            "purlLink":                 attrs.get("purlLink") or "",
+            "domainMatch":              attrs.get("domainMatch", True),
+            "nameVerified":             attrs.get("nameVerified"),
+        })
+    buf.seek(0)
+    csv_str = buf.getvalue()
+    filename = f"kjle_ada_{now_dt.strftime('%Y%m%d_%H%M%S')}.csv"
     return {
-        "status":   "success",
-        "dry_run":  True,
-        "stats":    stats,
-        "payloads": payload_list,
+        "status":      "success",
+        "dry_run":     body.dry_run,
+        "stats":       stats,
+        "csv_columns": csv_cols,
+        "csv_data":    csv_str,
+        "filename":    filename,
     }

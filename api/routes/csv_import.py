@@ -7,6 +7,7 @@ import csv
 import hashlib
 import io
 import logging
+import os
 import re
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -84,7 +85,11 @@ def _purge_expired_uploads(db) -> None:
 def _store_upload(db, upload_id: str, data: dict) -> None:
     """Persist an upload to the shared Supabase store so any worker can read it."""
     _purge_expired_uploads(db)
-    db.table("csv_uploads").insert({"upload_id": upload_id, "payload": data}).execute()
+    db.table("csv_uploads").insert({
+        "upload_id":  upload_id,
+        "payload":    data,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }).execute()
 
 
 def _fetch_upload(db, upload_id: str) -> Optional[dict]:
@@ -136,6 +141,53 @@ def _valid_email(raw: str) -> bool:
     return "@" in (raw or "") and "." in (raw or "").split("@")[-1]
 
 
+_FREE_DOMAINS: frozenset = frozenset({
+    "gmail.com", "googlemail.com", "yahoo.com", "ymail.com", "rocketmail.com",
+    "hotmail.com", "hotmail.co.uk", "hotmail.fr", "hotmail.de", "hotmail.es",
+    "outlook.com", "outlook.co.uk", "live.com", "live.co.uk", "live.ca",
+    "live.fr", "live.de", "msn.com", "aol.com", "icloud.com", "me.com",
+    "comcast.net", "verizon.net", "sbcglobal.net", "att.net",
+    "yahoo.co.uk", "yahoo.fr", "yahoo.de", "yahoo.es", "yahoo.it",
+    "yahoo.com.au", "yahoo.ca", "protonmail.com", "protonmail.ch", "pm.me",
+})
+
+
+def _domain_to_name(domain: str) -> Optional[str]:
+    """Strip www, drop TLD, replace separators with spaces, Title Case."""
+    domain = domain.lower().strip()
+    if domain.startswith("www."):
+        domain = domain[4:]
+    base = domain.rsplit(".", 1)[0]
+    name = re.sub(r"[-_.]", " ", base).strip()
+    return name.title() if name else None
+
+
+def _derive_business_name(website: Optional[str], email: Optional[str]) -> Optional[str]:
+    """
+    Derive a business_name from website or email when the source is blank.
+    Priority: (a) website domain  (b) email domain if not freemail
+              (c) email local-part  (d) None → caller skips the row.
+    """
+    if website:
+        m = re.search(r"https?://([^/?#:]+)", website)
+        raw_host = m.group(1) if m else website
+        name = _domain_to_name(raw_host)
+        if name:
+            return name
+
+    if email and "@" in email:
+        domain = email.split("@", 1)[1].lower().strip()
+        if domain not in _FREE_DOMAINS:
+            name = _domain_to_name(domain)
+            if name:
+                return name
+        local = re.sub(r"[-_.]", " ", email.split("@", 1)[0]).strip()
+        if local:
+            return local.title()
+
+    return None
+
+
 def _compute_fingerprint(phone: str, business_name: str) -> Optional[str]:
     """Canonical fingerprint: sha256(phone10:normname)[:32]. Returns None if no valid 10-digit phone."""
     digits = re.sub(r"\D", "", phone or "")
@@ -164,6 +216,10 @@ def _parse_csv_bytes(content: bytes) -> tuple[List[str], List[dict]]:
 async def upload_csv(file: UploadFile = File(...), db=Depends(get_db)):
     """Upload a CSV file, preview first 5 rows, return suggested field mappings."""
 
+    if os.getenv("CSV_INGEST_ENABLED", "true").lower() in {"false", "0", "no", "off"}:
+        logger.info("csv ingest paused via CSV_INGEST_ENABLED")
+        return {"status": "ingestion_paused", "rows_processed": 0}
+
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only .csv files are accepted.")
 
@@ -187,12 +243,16 @@ async def upload_csv(file: UploadFile = File(...), db=Depends(get_db)):
     preview = rows[:PREVIEW_ROWS]
     suggested = _suggest_mappings(headers)
 
-    _store_upload(db, upload_id, {
-        "filename": file.filename,
-        "headers": headers,
-        "rows": rows,
-        "uploaded_at": datetime.now(timezone.utc).isoformat(),
-    })
+    try:
+        _store_upload(db, upload_id, {
+            "filename": file.filename,
+            "headers": headers,
+            "rows": rows,
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        logger.warning(f"[csv-import] csv_uploads insert failed — upload not stored: {e}")
+        raise HTTPException(status_code=503, detail="upload_store_unavailable: could not persist upload session")
 
     return {
         "upload_id": upload_id,
@@ -366,6 +426,19 @@ async def import_csv(upload_id: str, opts: ImportOptions, db=Depends(get_db)):
             # ── strip empty strings ───────────────────────────────────────
             lead = {k: v for k, v in lead.items() if v != "" and v is not None}
 
+            # ── derive business_name when source is blank ─────────────────
+            if not lead.get("business_name"):
+                derived = _derive_business_name(lead.get("website"), lead.get("email"))
+                if derived:
+                    lead["business_name"] = derived
+                    fp = _compute_fingerprint(clean_phone, derived)
+                else:
+                    logger.info(
+                        f"[csv-import] row {row_num}: no derivable business_name — skipping"
+                    )
+                    skipped_invalid += 1
+                    continue
+
             # ── pipeline-consistent fields ────────────────────────────────
             lead["fingerprint"] = fp  # may be None for un-parseable phones
             lead["source_file"] = filename
@@ -382,26 +455,47 @@ async def import_csv(upload_id: str, opts: ImportOptions, db=Depends(get_db)):
             logger.error(f"[csv-import] Failed row {row_num}: {e}")
             failed_rows.append({"row": row_num, "data": row, "reason": str(e)})
 
-    # ── bulk insert: one round-trip per 500 rows instead of one per row ─────
-    # (per-row inserts were ~100ms each → ~51s/500 rows; bulk is <1s/500 rows)
+    # ── bulk upsert: ON CONFLICT (fingerprint) DO NOTHING ────────────────────
+    # Already-present rows are silently skipped; only genuinely new rows land.
+    # res.data contains only inserted rows, so len(res.data) = actual inserts
+    # and len(batch) - len(res.data) = DB-level duplicate skips.
     BULK_BATCH = 500
     for i in range(0, len(to_insert), BULK_BATCH):
         pair_batch = to_insert[i:i + BULK_BATCH]
         lead_batch = [lead for (_rn, lead) in pair_batch]
         try:
-            db.table("leads").insert(lead_batch).execute()
-            imported += len(lead_batch)
+            res = db.table("leads").upsert(
+                lead_batch, on_conflict="fingerprint", ignore_duplicates=True
+            ).execute()
+            n_inserted = len(res.data) if res.data else 0
+            imported += n_inserted
+            skipped_duplicate += len(lead_batch) - n_inserted
         except Exception as bulk_err:
             # One bad row shouldn't sink the batch — fall back to per-row for this batch only
-            logger.warning(f"[csv-import] Bulk insert failed at offset {i}, retrying per-row: {bulk_err}")
+            logger.warning(f"[csv-import] Bulk upsert failed at offset {i}, retrying per-row: {bulk_err}")
             for rnum, lead in pair_batch:
                 try:
-                    db.table("leads").insert(lead).execute()
-                    imported += 1
+                    res = db.table("leads").upsert(
+                        [lead], on_conflict="fingerprint", ignore_duplicates=True
+                    ).execute()
+                    if res.data:
+                        imported += 1
+                    else:
+                        skipped_duplicate += 1
                 except Exception as row_err:
-                    failed += 1
-                    logger.error(f"[csv-import] Failed row {rnum} insert: {row_err}")
-                    failed_rows.append({"row": rnum, "data": lead, "reason": str(row_err)})
+                    err_str = str(row_err)
+                    if "23505" in err_str or "duplicate key" in err_str.lower():
+                        skipped_duplicate += 1
+                    else:
+                        failed += 1
+                        logger.error(f"[csv-import] Failed row {rnum} insert: {row_err}")
+                        failed_rows.append({"row": rnum, "data": lead, "reason": str(row_err)})
+
+    logger.info(
+        f"[csv-import] {filename}: {imported} inserted, "
+        f"{skipped_duplicate} skipped-duplicate, "
+        f"{skipped_invalid} skipped-invalid"
+    )
 
     total_rows = len(rows)
     skipped_total = skipped_duplicate + skipped_invalid

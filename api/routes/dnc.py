@@ -25,7 +25,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from ..database import get_db
@@ -38,20 +38,51 @@ from ..lib.phone_utils import normalize_phone
 from ..lib.tcpa_check import is_tcpa_litigator
 
 logger = logging.getLogger(__name__)
-router = APIRouter()
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 API_SECRET_KEY = os.environ.get("API_SECRET_KEY", "kjle-prod-2026-secret")
+# DNC_REQUIRE_AUTH=true → 401 on missing/invalid key (enforcement mode).
+# Default false → warn-only: unauthenticated requests are logged but still served.
+_DNC_REQUIRE_AUTH = os.environ.get("DNC_REQUIRE_AUTH", "false").lower() == "true"
 
 
-def verify_api_key(x_api_key: str = Header(...)):
-    if x_api_key != API_SECRET_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+def _dnc_auth(request: Request, x_api_key: Optional[str] = Header(None)) -> None:
+    """Shared auth dependency applied to every /dnc/* route via APIRouter.
 
+    Evaluated before the request body is parsed. Correctly-keyed callers
+    always pass regardless of DNC_REQUIRE_AUTH. When the key is absent or
+    invalid: enforce=true → 401; enforce=false → WARNING log + serve response.
+    """
+    if x_api_key == API_SECRET_KEY:
+        return
+    if _DNC_REQUIRE_AUTH:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    logger.warning(
+        "dnc warn-mode: unauthenticated path=%s source=%s key_present=%s",
+        request.url.path,
+        request.query_params.get("source", "none"),
+        "true" if x_api_key is not None else "false",
+    )
+
+
+router = APIRouter(dependencies=[Depends(_dnc_auth)])
 
 # ── Constants ────────────────────────────────────────────────────────────────
 SEARCHBUG_COST_PER_LOOKUP_USD = 0.0214
 SCRUB_BATCH_MAX               = 100
+
+# Suppression reasons the whitelist short-circuit is allowed to override.
+# Anything not in this set (or not containing these keywords) is PROTECTED
+# (real consumer opt-out) and must block the whitelist — fail-safe default.
+_WHITELIST_TEST_REASONS = frozenset({
+    "manual_test", "dnc_test", "probe", "whitelist_verification",
+})
+_WHITELIST_TEST_KEYWORDS = ("verif", "test", "probe")
+
+
+def _is_test_probe_suppression(reason: str) -> bool:
+    r = (reason or "").lower().strip()
+    return r in _WHITELIST_TEST_REASONS or any(kw in r for kw in _WHITELIST_TEST_KEYWORDS)
 
 # Hard state-level suppression — calls into FL/OK/TX are categorically
 # blocked regardless of federal/provider status. State derived from
@@ -136,6 +167,9 @@ def _audit(
     error: Optional[str] = None,
     metadata: Optional[dict] = None,
 ) -> None:
+    # Coerce empty/blank uuid fields to None — Postgres rejects "" as a UUID (22P02).
+    if not (requesting_lead_id or "").strip():
+        requesting_lead_id = None
     try:
         db = get_db()
         db.table("dnc_audit_log").insert({
@@ -151,7 +185,7 @@ def _audit(
         }).execute()
     except Exception as e:
         # Auditing must never break the request path.
-        logger.error(f"dnc: audit insert failed: {e}")
+        logger.warning(f"dnc: audit insert failed: {e}")
 
 
 def _serialize_response(
@@ -205,20 +239,35 @@ async def _perform_check(
     db = get_db()
     src = source or "unknown"
 
-    # 0. Whitelist short-circuit — overrides suppressions, cache, budget cap,
-    #    and provider. A whitelist hit means "always allow this number."
+    # 0. Whitelist short-circuit — overrides ONLY test/probe suppressions.
+    #    A real consumer opt-out (do_not_call_request, replied_stop, stop_keyword,
+    #    or any unrecognized reason) takes precedence and must NOT be overridden.
+    #    When a protected suppression is present, fall through so step 1 returns
+    #    is_dnc=True with the real reason and logs it to dnc_audit_log.
     try:
         wl = db.table("dnc_whitelist").select("phone").eq("phone", phone).execute()
         if wl.data:
-            _audit(
-                phone=phone, source=src, result="whitelist",
-                is_dnc=False, requesting_lead_id=lead_id,
-            )
-            return _serialize_response(
-                result_source="whitelist",
-                phone_normalized=phone, is_dnc=False,
-                reason="whitelisted",
-            )
+            _has_protected = False
+            try:
+                _sc = db.table("dnc_suppressions").select("reason").eq("phone", phone).execute()
+                for _sr in (_sc.data or []):
+                    if not _is_test_probe_suppression(_sr.get("reason") or ""):
+                        _has_protected = True
+                        break
+            except Exception as _e_sc:
+                logger.warning(f"dnc: whitelist suppression pre-check failed for {phone}: {_e_sc}")
+                _has_protected = True  # fail-safe: don't short-circuit on lookup error
+            if not _has_protected:
+                _audit(
+                    phone=phone, source=src, result="whitelist",
+                    is_dnc=False, requesting_lead_id=lead_id,
+                )
+                return _serialize_response(
+                    result_source="whitelist",
+                    phone_normalized=phone, is_dnc=False,
+                    reason="whitelisted",
+                )
+            # Protected suppression present — fall through; step 1 returns the real result.
     except Exception as e:
         logger.warning(f"dnc: whitelist read failed for {phone}: {e}")
         # Fall through — better to consult suppressions/cache/provider than 500.
@@ -659,8 +708,7 @@ async def dnc_check_path(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/dnc/add")
-async def dnc_add(body: AddSuppressionRequest, x_api_key: str = Header(...)):
-    verify_api_key(x_api_key)
+async def dnc_add(body: AddSuppressionRequest):
 
     phone = normalize_phone(body.phone)
     if not phone:
@@ -713,8 +761,7 @@ async def dnc_add(body: AddSuppressionRequest, x_api_key: str = Header(...)):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/dnc/scrub-batch")
-async def dnc_scrub_batch(body: ScrubBatchRequest, x_api_key: str = Header(...)):
-    verify_api_key(x_api_key)
+async def dnc_scrub_batch(body: ScrubBatchRequest):
 
     if not body.phones:
         raise HTTPException(status_code=400, detail="phones list is empty")
@@ -763,8 +810,7 @@ async def dnc_scrub_batch(body: ScrubBatchRequest, x_api_key: str = Header(...))
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/dnc/stats")
-async def dnc_stats(x_api_key: str = Header(...)):
-    verify_api_key(x_api_key)
+async def dnc_stats():
 
     db = get_db()
     now = datetime.now(timezone.utc)
@@ -1103,11 +1149,9 @@ def per_consumer_breakdown(period_hours: int) -> dict:
 
 @router.get("/dnc/stats/by-consumer")
 async def dnc_stats_by_consumer(
-    x_api_key:    str = Header(...),
     period_hours: int = Query(24, ge=1, le=BY_CONSUMER_PERIOD_HOURS_MAX,
                               description="Window length, hours. Max 720 (30d)."),
 ):
-    verify_api_key(x_api_key)
     return per_consumer_breakdown(period_hours)
 
 
@@ -1148,13 +1192,11 @@ def _mask_phone_last4(raw: Optional[str]) -> Optional[str]:
 
 @router.get("/dnc/suppressions/list")
 async def dnc_suppressions_list(
-    x_api_key: str           = Header(...),
     limit:     int           = Query(50, ge=1),
     offset:    int           = Query(0,  ge=0),
     source:    Optional[str] = Query(None),
     reason:    Optional[str] = Query(None),
 ):
-    verify_api_key(x_api_key)
     _enforce_list_limit(limit)
 
     db = get_db()
@@ -1202,11 +1244,9 @@ async def dnc_suppressions_list(
 
 @router.get("/dnc/tcpa/list")
 async def dnc_tcpa_list(
-    x_api_key: str = Header(...),
     limit:     int = Query(50, ge=1),
     offset:    int = Query(0,  ge=0),
 ):
-    verify_api_key(x_api_key)
     _enforce_list_limit(limit)
 
     db = get_db()
@@ -1249,14 +1289,12 @@ async def dnc_tcpa_list(
 
 @router.get("/dnc/cache/list")
 async def dnc_cache_list(
-    x_api_key: str            = Header(...),
     limit:     int            = Query(50, ge=1),
     offset:    int            = Query(0,  ge=0),
     is_dnc:    Optional[bool] = Query(None),
     line_type: Optional[str]  = Query(None,
                                       description="mobile/landline/voip/unknown"),
 ):
-    verify_api_key(x_api_key)
     _enforce_list_limit(limit)
 
     db = get_db()
@@ -1311,13 +1349,11 @@ AUDIT_RECENT_LIMIT_MAX = 500
 
 @router.get("/dnc/audit/recent")
 async def dnc_audit_recent(
-    x_api_key: str = Header(...),
     hours:     int = Query(24,  ge=1, le=AUDIT_RECENT_HOURS_MAX,
                            description="Window length, hours. Max 720 (30d)."),
     limit:     int = Query(100, ge=1, le=AUDIT_RECENT_LIMIT_MAX,
                            description="Max rows returned. Max 500."),
 ):
-    verify_api_key(x_api_key)
 
     db = get_db()
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()

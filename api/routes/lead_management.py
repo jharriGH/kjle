@@ -247,7 +247,7 @@ _ELIGIBLE_KNOWN_PARAMS = frozenset({
     "require_email_valid", "require_name_verified", "audited_after",
     "min_word_count", "min_internal_pages", "email_provider", "email_trust",
     "product", "exclude_already_contacted", "cooldown_days", "include_total",
-    "city", "has_chatbot", "website_reachable", "quality_tier",
+    "city", "has_chatbot", "website_reachable", "quality_tier", "include_ambiguous",
 })
 
 
@@ -275,6 +275,7 @@ async def eligible_for_campaign(
     cooldown_days: Optional[int] = Query(None, description="Exclude leads whose last_contacted_at is within this many days."),
     include_total: bool = Query(False, description="Compute the total count (expensive on broad filters); default False returns total=null"),
     city: Optional[str] = Query(None, description="Case-insensitive exact city match (whitespace trimmed). Omit to skip."),
+    include_ambiguous: bool = Query(False, description="When false (default), excludes leads where email_ambiguous=true (free-mail mapped to multiple businesses)."),
     x_api_key: str = Header(...),
 ):
     verify_api_key(x_api_key)
@@ -345,6 +346,10 @@ async def eligible_for_campaign(
     if require_email_valid:
         query = query.eq("email_status", "valid").eq("email_valid", True)
         count_query = count_query.eq("email_status", "valid").eq("email_valid", True)
+
+    if not include_ambiguous:
+        query = query.eq("email_ambiguous", False)
+        count_query = count_query.eq("email_ambiguous", False)
 
     # ── dnc_status ─────────────────────────────────────────────────────────────
     blocked_csv = ",".join(_DNC_STATUS_BLOCKED)
@@ -525,31 +530,16 @@ async def eligible_for_campaign(
                     datetime.now(timezone.utc) - timedelta(days=cooldown_days_attach)
                 ).isoformat()
 
-                cp_res = (
-                    supabase.table("campaign_performance")
-                    .select("reachinbox_campaign_id")
-                    .in_("status", ["active", "paused"])
+                cla_res = (
+                    supabase.table("campaign_lead_attachments")
+                    .select("email")
+                    .in_("email", list(unique_emails))
+                    .gte("attached_at", attach_cutoff)
                     .execute()
                 )
-                active_ids = {
-                    r["reachinbox_campaign_id"]
-                    for r in (cp_res.data or [])
-                    if r.get("reachinbox_campaign_id")
+                attached_emails = {
+                    r["email"] for r in (cla_res.data or []) if r.get("email")
                 }
-
-                attached_emails: set = set()
-                if active_ids:
-                    cla_res = (
-                        supabase.table("campaign_lead_attachments")
-                        .select("email")
-                        .in_("email", list(unique_emails))
-                        .gte("attached_at", attach_cutoff)
-                        .in_("reachinbox_campaign_id", list(active_ids))
-                        .execute()
-                    )
-                    attached_emails = {
-                        r["email"] for r in (cla_res.data or []) if r.get("email")
-                    }
 
                 if attached_emails:
                     rows = [r for r in rows if r.get("email") not in attached_emails]

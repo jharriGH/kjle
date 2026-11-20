@@ -14,8 +14,7 @@ Until the dashboard webhook is wired, the poller in scheduler.py
 this receiver is a ready-to-accept shim, not a blocker.
 
 Auth: ?secret=<TRUELIST_WEBHOOK_SECRET> query parameter, constant-time
-compared against settings.TRUELIST_WEBHOOK_SECRET. Modeled on the
-ReachInbox pattern in dnc_webhooks.py — URL secrecy IS the boundary.
+compared against settings.TRUELIST_WEBHOOK_SECRET. Uses query-param secret auth — URL secrecy IS the boundary.
 Fail-closed when the env var is unset (no empty=empty acceptance).
 
 Expected Truelist payload shape (assumed; verify when configured):

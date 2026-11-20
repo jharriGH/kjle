@@ -61,11 +61,11 @@ async def lead_overlap(
     Check whether an email is attached to any active or paused campaign within
     the cooldown window.
 
-    overlap=true  → lead is in-flight; do not add to another campaign.
+    overlap=true  → lead was recently attached to a campaign; do not add to another.
     overlap=false → safe to target.
 
-    Status is resolved live by joining reachinbox_campaign_id →
-    campaign_performance.status; only 'active' and 'paused' count as overlap.
+    Checks campaign_lead_attachments within the cooldown window. Any attachment
+    within the window counts as overlap.
     """
     verify_api_key(x_api_key)
     supabase = get_supabase()
@@ -74,26 +74,10 @@ async def lead_overlap(
     cutoff = (datetime.now(timezone.utc) - timedelta(days=cooldown_days)).isoformat()
 
     try:
-        # ── Resolve currently active/paused campaign IDs ──────────────────────
-        cp_res = (
-            supabase.table("campaign_performance")
-            .select("reachinbox_campaign_id, campaign_name, status")
-            .in_("status", ["active", "paused"])
-            .execute()
-        )
-        active_campaigns = {
-            r["reachinbox_campaign_id"]: r
-            for r in (cp_res.data or [])
-            if r.get("reachinbox_campaign_id")
-        }
-
-        if not active_campaigns:
-            return {"overlap": False, "matching_campaigns": []}
-
         # ── Pull attachment rows for this email within the cooldown window ─────
         cla_query = (
             supabase.table("campaign_lead_attachments")
-            .select("reachinbox_campaign_id")
+            .select("campaign_name, attached_at")
             .eq("email", email)
             .gte("attached_at", cutoff)
         )
@@ -103,23 +87,15 @@ async def lead_overlap(
         cla_res = cla_query.execute()
         attachment_rows = cla_res.data or []
 
-        # ── Filter to campaigns that are still active or paused ───────────────
-        matched_ids = {
-            r["reachinbox_campaign_id"]
-            for r in attachment_rows
-            if r.get("reachinbox_campaign_id") in active_campaigns
-        }
-
-        if not matched_ids:
+        if not attachment_rows:
             return {"overlap": False, "matching_campaigns": []}
 
         matching_campaigns = [
             {
-                "id": rid,
-                "name": active_campaigns[rid].get("campaign_name"),
-                "status": active_campaigns[rid].get("status"),
+                "name": r.get("campaign_name"),
+                "attached_at": r.get("attached_at"),
             }
-            for rid in matched_ids
+            for r in attachment_rows
         ]
 
         return {"overlap": True, "matching_campaigns": matching_campaigns}

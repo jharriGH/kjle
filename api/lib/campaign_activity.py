@@ -47,12 +47,12 @@ def get_kjle_campaign_activity_summary(since_utc: datetime) -> List[Dict]:
     for daily_report.py — do not change.
 
     Column mapping (campaign_performance → contract):
-        reachinbox_campaign_id → campaign_id
-        campaign_name          → campaign_name
-        sent_count             → sent
-        opened_count           → opened
-        replied_count          → replied
-        demo_booked_count      → booked
+        campaign_name     → campaign_id (used as surrogate when no ext id)
+        campaign_name     → campaign_name
+        sent_count        → sent
+        opened_count      → opened
+        replied_count     → replied
+        demo_booked_count → booked
 
     Scope: project='kjle' only (telehealth/other projects excluded from KJE digest).
     Activity filter: updated_at >= since_utc AND sent_count > 0.
@@ -63,7 +63,7 @@ def get_kjle_campaign_activity_summary(since_utc: datetime) -> List[Dict]:
         res = (
             db.table("campaign_performance")
             .select(
-                "reachinbox_campaign_id, campaign_name, "
+                "campaign_name, "
                 "sent_count, opened_count, replied_count, demo_booked_count"
             )
             .eq("project", "kjle")
@@ -79,10 +79,10 @@ def get_kjle_campaign_activity_summary(since_utc: datetime) -> List[Dict]:
 
     out: List[Dict] = []
     for r in rows:
-        cid = r.get("reachinbox_campaign_id") or ""
+        cname = r.get("campaign_name") or "(unnamed)"
         out.append({
-            "campaign_id":   cid,
-            "campaign_name": r.get("campaign_name") or cid or "(unnamed)",
+            "campaign_id":   cname,
+            "campaign_name": cname,
             "sent":          int(r.get("sent_count")        or 0),
             "opened":        int(r.get("opened_count")      or 0),
             "replied":       int(r.get("replied_count")     or 0),

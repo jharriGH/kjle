@@ -13,6 +13,11 @@ class Settings(BaseSettings):
     SUPABASE_URL: str
     SUPABASE_SERVICE_KEY: str
 
+    # ── Direct Postgres connection (for startup DDL migrator via psycopg2) ───
+    # Optional. If set, startup_migrations.py runs ALTER TABLE / CREATE INDEX.
+    # Format: postgresql://postgres:[password]@[host]:5432/postgres
+    DATABASE_URL: str = ""
+
     # ── App Security ──────────────────────────────────────────────────────────
     API_SECRET_KEY: str = "change-me-in-production"
 
@@ -25,11 +30,9 @@ class Settings(BaseSettings):
     OUTSCRAPER_API_KEY: str = ""
     FIRECRAWL_API_KEY: str = ""
     PAGESPEED_API_KEY: str = ""
-    REACHINBOX_API_KEY: str = ""
     ANTHROPIC_API_KEY: str = ""     # Commander still reads os.environ directly; typed here for visibility
     RESEND_API_KEY: str = ""        # Daily cost report email — kjle@kjreportz.com
     SEARCHBUG_API_KEY: str = ""     # DNC provider PASS field; CO_CODE sourced from admin_settings.dnc_searchbug_co_code
-    REACHINBOX_WEBHOOK_SECRET: str = ""  # Shared secret for /dnc/webhooks/reachinbox?secret=... query-param auth
 
     # ── Truelist.io — email cleaning ──────────────────────────────────────────
     # Optional fallback — preferred source is admin_settings table key 'truelist_api_key'
