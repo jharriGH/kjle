@@ -34,7 +34,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import APIRouter, HTTPException, Query
 
-from ..database import get_db
+from ..database import get_db, get_db_batch
 from ..lib import cost_guard
 from .segments_engine import _classify_lead
 from .enrichment import _extract_schema_types
@@ -120,9 +120,12 @@ AXE_SCAN_NIGHTLY_MAX_SECONDS = 300     # 5-minute ceiling (OFFSET makes this fas
 AXE_SCAN_FETCH_CHUNK      = 2_000   # leads fetched per chunk
 
 # Provider classify nightly — TIER-1 string-match, no DNS
-# Reduced from 20k to 5k: each SELECT page must finish within PostgREST's
-# 30s statement timeout. With idx_leads_provider_classify_candidate the scan
-# is fast, but the safety buffer prevents 57014 on cold-cache planner runs.
+# Reduced from 20k to 5k as a batch-size safety buffer. KJLE_SCHEDULER_FIX
+# (2026-11-19): this job's TRUST SELECT/UPDATE statements were still hitting
+# 57014 at 5k rows/batch even with idx_leads_provider_classify_candidate (an
+# index prune Nov 17 + a matched-index attempt Nov 18 did not fix it) — the
+# real ceiling was service_role's statement_timeout, now raised to 600s via
+# ALTER ROLE, paired with get_db_batch()'s matching client-side timeout.
 PROVIDER_CLASSIFY_BATCH_SIZE   = 5_000    # rows per SELECT (bounded)
 PROVIDER_CLASSIFY_UPDATE_CHUNK = 500      # IDs per UPDATE .in_() call
 PROVIDER_CLASSIFY_MAX_ITER     = 20       # iteration guard (~400k rows max)
@@ -361,7 +364,12 @@ async def job_classify_segments() -> dict:
     logger.info(f"[{job_name}] Starting (chunked-UPDATE mode, chunk={CHUNK_SIZE})...")
     t_start = time.monotonic()
 
-    db = get_db()
+    # KJLE_SCHEDULER_FIX (2026-11-19): the HOT SELECT chunk 0 / chunked UPDATE
+    # here were hitting 57014 on cold-cache planner runs over leads (1.26M
+    # rows). service_role's DB-side statement_timeout is now 600s (ALTER
+    # ROLE); get_db_batch() matches that client-side so it isn't aborted at
+    # the old 30s client timeout before the DB ceiling can be reached.
+    db = get_db_batch()
     now_iso = _now_iso()
     counts = {"hot": 0, "warm": 0, "cold": 0}
 
@@ -798,7 +806,12 @@ async def job_provider_classify_nightly() -> dict:
     job_name = "provider_classify_nightly"
     logger.info(f"[{job_name}] Starting...")
     t_start = time.monotonic()
-    db = get_db()
+    # KJLE_SCHEDULER_FIX (2026-11-19): TRUST SELECT/UPDATE statements here were
+    # hitting 57014 on the 1.26M-row leads table under the old 30s client-side
+    # PostgREST timeout. service_role's DB-side statement_timeout is now 600s
+    # (ALTER ROLE); get_db_batch() uses a matching long client-side timeout so
+    # that ceiling can actually be reached instead of being client-aborted first.
+    db = get_db_batch()
 
     total_classified = 0
     failed = 0
@@ -1123,7 +1136,13 @@ async def job_email_clean_nightly() -> dict:
         if reval_enabled:
             remaining = batch_size - len(new_leads)
             if remaining > 0:
-                reval_leads = ec_select_revalidation_leads(db, remaining, reval_min_days)
+                # KJLE_SCHEDULER_FIX (2026-11-19): this specific query was hitting
+                # 57014 nightly on the 1.26M-row leads table under the 30s
+                # client-side PostgREST timeout. service_role's DB-side
+                # statement_timeout is now 600s (ALTER ROLE); get_db_batch()
+                # matches that client-side. Scoped to just this call — the
+                # rest of job_email_clean_nightly stays on the normal db client.
+                reval_leads = ec_select_revalidation_leads(get_db_batch(), remaining, reval_min_days)
                 # Safety dedup: sets are disjoint by query predicate, but guard by ID anyway.
                 new_ids = {l.get("id") for l in new_leads}
                 reval_leads = [l for l in reval_leads if l.get("id") not in new_ids]
@@ -3892,14 +3911,21 @@ async def job_tz_backfill_nightly() -> dict:
     """
     Drain leads.timezone = NULL for active US leads using tz_backfill.
     Runs until the chunk returns assigned==0 (fully drained) or hits a
-    10-minute time cap. Idempotent — safe to run repeatedly.
+    time cap. Idempotent — safe to run repeatedly, including from the
+    tz_backfill_catchup trigger below (same function, different schedule).
+
+    KJLE_SCHEDULER_FIX (2026-11-19): was capped at 10 minutes, which only
+    drained ~52k rows/night against a ~700k backlog. Raised to 50 minutes
+    plus catch-up runs every 3 hours so the backlog drains in 1-2 days
+    hands-off, then both the nightly and catch-up runs become near-instant
+    no-ops (first chunk returns assigned=0 immediately).
     """
     from ..lib.tz_backfill import run_tz_backfill_chunk
 
     job_name = "tz_backfill_nightly"
     logger.info(f"[{job_name}] Starting...")
     t_start = time.monotonic()
-    max_seconds = 600.0  # 10-minute cap
+    max_seconds = 3000.0  # 50-minute cap
     db = get_db()
 
     total_assigned = 0
@@ -4277,13 +4303,30 @@ def setup_scheduler() -> AsyncIOScheduler:
 
     # Job 20: tz_backfill_nightly — daily at 05:00 UTC
     # Drains leads.timezone=NULL for active US leads. Runs between axe_scan
-    # (04:00) and website_audit (05:30); 10-min cap so it finishes well clear.
+    # (04:00) and website_audit (05:30); 50-min cap (KJLE_SCHEDULER_FIX,
+    # 2026-11-19 — was 10 min) so it finishes well clear of 05:30.
     # Idempotent: becomes a no-op once all rows are filled.
     scheduler.add_job(
         job_tz_backfill_nightly,
         trigger=CronTrigger(hour=5, minute=0),
         id="tz_backfill_nightly",
         name="Nightly Timezone Backfill",
+        replace_existing=True,
+        misfire_grace_time=1800,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Job 20b: tz_backfill_catchup — every 3 hours, offset from the 05:00
+    # nightly slot (KJLE_SCHEDULER_FIX, 2026-11-19). Same function/cap as the
+    # nightly run — hours chosen (1,4,7,...) so neither this nor the nightly
+    # run ever starts while the other's 50-min window could still be active.
+    # No-ops (one cheap count query, no chunk work) once remaining=0.
+    scheduler.add_job(
+        job_tz_backfill_nightly,
+        trigger=CronTrigger(hour="1,4,7,10,13,16,19,22", minute=0),
+        id="tz_backfill_catchup",
+        name="Timezone Backfill Catch-up (every 3h)",
         replace_existing=True,
         misfire_grace_time=1800,
         max_instances=1,
