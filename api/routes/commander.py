@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 import os
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_API_URL = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/") + "/v1/messages"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 KJLE_BASE = "https://kjle-api.onrender.com/kjle/v1"
 KJLE_KEY = "kjle-prod-2026-secret"
