@@ -20,6 +20,7 @@ Error body: {error:{code, message, retryable}}
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from datetime import datetime, timedelta, timezone
@@ -44,7 +45,11 @@ def _outreach_auth(
     authorization: Optional[str] = Header(None),
     x_kje_service: Optional[str] = Header(None, alias="X-KJE-Service"),
 ) -> str:
-    """Bearer + X-KJE-Service auth for all outreach contract endpoints."""
+    """Bearer + X-KJE-Service auth for all outreach contract endpoints.
+
+    Accepts OUTREACH_API_KEY (env var, master) OR any active per-consumer key
+    stored in the api_keys table (issued via POST /kjle/v1/auth/keys).
+    """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=401,
@@ -52,10 +57,18 @@ def _outreach_auth(
         )
     token = authorization[7:].strip()
     if token != OUTREACH_API_KEY:
-        raise HTTPException(
-            status_code=401,
-            detail={"error": {"code": "unauthorized", "message": "Invalid Bearer token", "retryable": False}},
-        )
+        # Also accept active per-consumer keys from the api_keys table
+        # (one per consumer: outreachenginez, contactenginez, avacallz, etc.)
+        try:
+            key_hash = hashlib.sha256(token.encode()).hexdigest()
+            res = get_db().table("api_keys").select("id,is_active").eq("key_hash", key_hash).limit(1).execute()
+        except Exception:
+            res = None
+        if not (res and res.data and res.data[0].get("is_active")):
+            raise HTTPException(
+                status_code=401,
+                detail={"error": {"code": "unauthorized", "message": "Invalid Bearer token", "retryable": False}},
+            )
     if not x_kje_service:
         raise HTTPException(
             status_code=401,
