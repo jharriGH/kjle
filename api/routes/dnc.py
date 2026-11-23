@@ -41,6 +41,9 @@ logger = logging.getLogger(__name__)
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 API_SECRET_KEY = os.environ.get("API_SECRET_KEY", "kjle-prod-2026-secret")
+# Zero-downtime rotation window: set API_SECRET_KEY_NEXT to open the window.
+# Inert (no-op) when unset or empty — existing behavior is byte-identical.
+_API_SECRET_KEY_NEXT = os.environ.get("API_SECRET_KEY_NEXT", "")
 # DNC_REQUIRE_AUTH=true → 401 on missing/invalid key (enforcement mode).
 # Default false → warn-only: unauthenticated requests are logged but still served.
 _DNC_REQUIRE_AUTH = os.environ.get("DNC_REQUIRE_AUTH", "false").lower() == "true"
@@ -54,6 +57,8 @@ def _dnc_auth(request: Request, x_api_key: Optional[str] = Header(None)) -> None
     invalid: enforce=true → 401; enforce=false → WARNING log + serve response.
     """
     if x_api_key == API_SECRET_KEY:
+        return
+    if _API_SECRET_KEY_NEXT and x_api_key == _API_SECRET_KEY_NEXT:
         return
     if _DNC_REQUIRE_AUTH:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
