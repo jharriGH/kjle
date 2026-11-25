@@ -3910,49 +3910,30 @@ async def job_pipeline_watchdog_digest():
 async def job_tz_backfill_nightly() -> dict:
     """
     Drain leads.timezone = NULL for active US leads using tz_backfill.
-    Runs until the chunk returns assigned==0 (fully drained) or hits a
-    time cap. Idempotent — safe to run repeatedly, including from the
-    tz_backfill_catchup trigger below (same function, different schedule).
-
-    KJLE_SCHEDULER_FIX (2026-11-19): was capped at 10 minutes, which only
-    drained ~52k rows/night against a ~700k backlog. Raised to 50 minutes
-    plus catch-up runs every 3 hours so the backlog drains in 1-2 days
-    hands-off, then both the nightly and catch-up runs become near-instant
-    no-ops (first chunk returns assigned=0 immediately).
+    Keyset-paginates by id within a ~120s wall budget per run; the 3-hourly
+    tz_backfill_catchup trigger (same function) drains the backlog over 1-2
+    days hands-off. Idempotent.
     """
-    from ..lib.tz_backfill import run_tz_backfill_chunk
+    from ..lib.tz_backfill import run_tz_backfill
 
     job_name = "tz_backfill_nightly"
     logger.info(f"[{job_name}] Starting...")
     t_start = time.monotonic()
-    max_seconds = 3000.0  # 50-minute cap
     db = get_db()
 
-    total_assigned = 0
-    total_skipped  = 0
-    chunks         = 0
-
-    while True:
-        if time.monotonic() - t_start >= max_seconds:
-            logger.info(f"[{job_name}] Time cap reached — stopping (assigned={total_assigned})")
-            break
-        result = run_tz_backfill_chunk(db, chunk_size=20_000)
-        total_assigned += result.get("assigned", 0)
-        total_skipped  += result.get("skipped", 0)
-        chunks         += 1
-        if result.get("assigned", 0) == 0:
-            logger.info(f"[{job_name}] No more rows to fill — done")
-            break
-
+    result = run_tz_backfill(db, budget_seconds=120.0)
     elapsed = time.monotonic() - t_start
     summary = (
-        f"tz_backfill complete: assigned={total_assigned}, "
-        f"skipped={total_skipped}, chunks={chunks}, elapsed={elapsed:.1f}s"
+        f"tz_backfill complete: assigned={result['assigned']}, skipped={result['skipped']}, "
+        f"pages={result['pages']}, remaining={result['remaining']}, elapsed={elapsed:.1f}s"
     )
     logger.info(f"[{job_name}] {summary}")
-    await _log_job(job_name, leads_processed=total_assigned, duration_seconds=elapsed,
-                   status="success", notes=summary)
-    return {"job": job_name, "assigned": total_assigned, "skipped": total_skipped, "elapsed_seconds": round(elapsed, 1)}
+    await _log_job(job_name, leads_processed=result["assigned"], duration_seconds=elapsed,
+                   status="failed" if result.get("error") and not result["assigned"] else "success",
+                   notes=summary)
+    return {"job": job_name, "assigned": result["assigned"], "skipped": result["skipped"],
+            "pages": result["pages"], "remaining": result["remaining"],
+            "elapsed_seconds": round(elapsed, 1)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
