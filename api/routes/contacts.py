@@ -11,8 +11,10 @@ Business intel filters (money filters for campaign pulls):
 Money filters hit idx_contacts_money (niche_slug, seniority, linked_has_chatbot) directly —
 no RPC, no JOIN. Requires niche_slug (returns 400 otherwise) to stay on that index.
 """
+import hashlib
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from typing import List, Optional
@@ -28,6 +30,61 @@ API_SECRET_KEY = os.environ.get("API_SECRET_KEY", "kjle-prod-2026-secret")
 def verify_api_key(x_api_key: str = Header(...)):
     if x_api_key != API_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+CONTACTS_READ_SCOPE = "contacts:read"
+
+
+def verify_contacts_read_key(x_api_key: str, db) -> str:
+    """Master key, OR an active consumer key (api_keys table, hashed) whose scope
+    explicitly includes 'contacts:read'. Least privilege: a consumer key never
+    gets contacts access just because it has generic 'read' -- the scope must be
+    granted on purpose (2026-11-27, card 3068: OutreachEnginez REK pilot).
+    Used ONLY by GET /contacts/eligible-for-campaign; every other contacts route
+    stays master-key only. Returns the caller label for logging."""
+    if x_api_key == API_SECRET_KEY:
+        return "master"
+    key_hash = hashlib.sha256(x_api_key.encode()).hexdigest()
+    try:
+        rows = (
+            db.table("api_keys").select("id, label, scope, is_active")
+            .eq("key_hash", key_hash).limit(1).execute().data or []
+        )
+    except Exception as exc:
+        _logger.warning("contacts read-key lookup failed: %s", exc)
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    if not rows or not rows[0].get("is_active") or CONTACTS_READ_SCOPE not in (rows[0].get("scope") or []):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    try:
+        db.table("api_keys").update(
+            {"last_used_at": datetime.now(timezone.utc).isoformat()}
+        ).eq("id", rows[0]["id"]).execute()
+    except Exception:
+        pass
+    return rows[0].get("label") or "consumer"
+
+
+# Cross-system exclusion: CampaignEnginez send_queue lives in this same database.
+_MAX_EXCLUDE_CAMPAIGNS = 10
+
+
+def _recently_contacted_emails(db, campaign_ids: List[str], days: int) -> set:
+    """Lower-cased recipient emails CampaignEnginez sent (or attempted) for the
+    given campaigns in the last `days` days. Paged; a few thousand rows at most."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    out: set = set()
+    page, size = 0, 1000
+    while True:
+        rows = (
+            db.table("send_queue").select("to_email")
+            .in_("campaign_id", campaign_ids).in_("status", ["sent", "bounced"])
+            .gte("created_at", since)
+            .range(page * size, page * size + size - 1).execute().data or []
+        )
+        out.update((r.get("to_email") or "").strip().lower() for r in rows if r.get("to_email"))
+        if len(rows) < size:
+            return out
+        page += 1
 
 
 # business_id included so we can batch-lookup linked lead intel
@@ -310,7 +367,7 @@ _TITLE_IS_REALTOR_PATTERN = (
 _CONTACTS_ELIGIBLE_KNOWN_PARAMS = frozenset({
     "niche_slug", "title_is_realtor", "state", "city", "cities",
     "email_valid", "email_status", "email_trust", "limit", "offset", "include_total",
-    "include_ambiguous", "county",
+    "include_ambiguous", "county", "exclude_campaign_ids", "exclude_days",
 })
 
 _CONSUMER_DOMAINS = frozenset({
@@ -340,10 +397,12 @@ async def contacts_eligible_for_campaign(
     limit: int = Query(500, ge=1, le=2000),
     offset: int = Query(0, ge=0),
     include_total: bool = Query(False, description="When true, also compute an estimated total (extra DB round-trip on this 1.7M-row table)."),
+    exclude_campaign_ids: Optional[str] = Query(None, description="Comma-separated CampaignEnginez campaign ids (max 10). Contacts whose primary_email was sent by any of them within exclude_days are dropped from the page. e.g. rek_showcase_w1,rek_showcase_w2"),
+    exclude_days: int = Query(90, ge=1, le=365, description="Look-back window for exclude_campaign_ids"),
     x_api_key: str = Header(...),
 ):
-    verify_api_key(x_api_key)
     db = get_db()
+    caller = verify_contacts_read_key(x_api_key, db)
 
     skipped_filters: List[str] = []
     for _qk in request.query_params:
@@ -446,6 +505,21 @@ async def contacts_eligible_for_campaign(
         _logger.error(f"contacts_eligible_for_campaign fetch failed: {e}")
         raise HTTPException(status_code=500, detail=f"contact_query_failed: {e}")
 
+    excluded_recent = 0
+    if exclude_campaign_ids:
+        _camps = [c.strip() for c in exclude_campaign_ids.split(",") if c.strip()][:_MAX_EXCLUDE_CAMPAIGNS]
+        if _camps:
+            try:
+                _seen = _recently_contacted_emails(db, _camps, exclude_days)
+            except Exception as exc:
+                # Fail CLOSED: an exclusion we can't apply must never silently
+                # let already-contacted people through.
+                _logger.error("exclude_campaign_ids lookup failed: %s", exc)
+                raise HTTPException(status_code=503, detail="exclusion_lookup_failed")
+            _before = len(rows)
+            rows = [r for r in rows if (r.get("primary_email") or "").strip().lower() not in _seen]
+            excluded_recent = _before - len(rows)
+
     contacts_out = [
         {
             "id": r.get("id"),
@@ -469,6 +543,7 @@ async def contacts_eligible_for_campaign(
         "count": len(contacts_out),
         "count_degraded": total is None,
         "contacts": contacts_out,
+        "excluded_recent": excluded_recent,
         "skipped_filters": skipped_filters,
     }
 
